@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Client } from 'pg';
+import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
 
 function connection(name) {
   const value = process.env[name];
@@ -55,7 +56,7 @@ export async function migrate(client) {
   });
 }
 
-export async function seed(client,email) {
+export async function seed(client,email,live=resolveLiveUpstream()) {
   await inTransaction(client,async () => {
     await client.query('SELECT pg_advisory_xact_lock(961020031)');
     await client.query(`
@@ -71,6 +72,25 @@ export async function seed(client,email) {
             AS p(code,input,cached,output) JOIN gateway.models m ON m.code=p.code
         WHERE g.code='pilot' ON CONFLICT DO NOTHING;
     `);
+    if (live?.mode==='compatible') {
+      await client.query(`INSERT INTO gateway.models (code,upstream_model,max_context_tokens,max_output_tokens)
+        VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,[live.alias,live.model,live.maxContextTokens,live.maxOutputTokens]);
+      const {rows:[model]} = await client.query(`SELECT id,upstream_model,max_context_tokens,max_output_tokens
+        FROM gateway.models WHERE code=$1`,[live.alias]);
+      if (model.upstream_model!==live.model || model.max_context_tokens!==live.maxContextTokens ||
+        model.max_output_tokens!==live.maxOutputTokens) throw new Error('The compatible alias already belongs to a different model or context limit');
+      const {rows:[group]} = await client.query("SELECT id FROM gateway.pricing_groups WHERE code='pilot'");
+      const {rows:[current]} = await client.query(`SELECT id,input_micros_per_mtok::text AS input,
+        cached_input_micros_per_mtok::text AS cached,output_micros_per_mtok::text AS output,multiplier_bps
+        FROM gateway.model_rates WHERE group_id=$1 AND model_id=$2 AND closed_at IS NULL`,[group.id,model.id]);
+      if (!current || current.input!==live.inputMicros || current.cached!==live.cacheMicros ||
+        current.output!==live.outputMicros || current.multiplier_bps!==10000) {
+        if (current) await client.query('UPDATE gateway.model_rates SET closed_at=now(),updated_at=now() WHERE id=$1',[current.id]);
+        await client.query(`INSERT INTO gateway.model_rates
+          (group_id,model_id,input_micros_per_mtok,cached_input_micros_per_mtok,output_micros_per_mtok,multiplier_bps)
+          VALUES ($1,$2,$3,$4,$5,10000)`,[group.id,model.id,live.inputMicros,live.cacheMicros,live.outputMicros]);
+      }
+    }
     if (!email) return;
     const { rows } = await client.query('SELECT id FROM auth.users WHERE lower(email)=lower($1) AND email_confirmed_at IS NOT NULL',[email]);
     if (rows.length!==1) throw new Error('PILOT_EMAIL must identify one verified Supabase Auth user');

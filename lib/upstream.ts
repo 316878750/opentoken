@@ -1,9 +1,10 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import * as z from 'zod';
+import { resolveLiveUpstream } from './upstream-config.mjs';
 
-export const upstreamModel = 'gpt-5.4-mini-2026-03-17';
-export const openAiAlias = 'openai-mini';
+export { upstreamModel } from './upstream-config.mjs';
 export const mockModel = 'mock-text';
+type LiveUpstream = NonNullable<ReturnType<typeof resolveLiveUpstream>>;
 
 export type CompletionInput = {
   model: string;
@@ -28,7 +29,8 @@ export class UpstreamError extends Error {
 }
 
 const responseSchema = z.object({
-  model: z.literal(upstreamModel),
+  id: z.string().optional(),
+  model: z.string(),
   choices: z.array(z.object({
     index: z.int().nonnegative(), finish_reason: z.string(),
     message: z.object({ role:z.literal('assistant'), content:z.string().nullable(), refusal:z.string().nullish() }),
@@ -36,36 +38,51 @@ const responseSchema = z.object({
   usage: z.object({
     prompt_tokens: z.int().nonnegative(),
     completion_tokens: z.int().nonnegative(),
+    prompt_cache_hit_tokens: z.int().nonnegative().optional(),
+    prompt_cache_miss_tokens: z.int().nonnegative().optional(),
     prompt_tokens_details: z.object({ cached_tokens: z.int().nonnegative().optional() }).nullish(),
   }),
 });
 
 export async function openAiCompletion(
-  input: CompletionInput, apiKey: string, fetcher: typeof fetch = fetch,
+  input: CompletionInput, upstream: LiveUpstream, fetcher: typeof fetch = fetch,
 ): Promise<Completion> {
   let response: Response;
   try {
-    response = await fetcher('https://api.openai.com/v1/chat/completions',{
-      method:'POST',headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},
-      body:JSON.stringify({model:upstreamModel,messages:input.messages,max_completion_tokens:input.max_completion_tokens,
-        reasoning_effort:'none',service_tier:'default',stream:false,store:false}),
+    response = await fetcher(upstream.endpoint,{
+      method:'POST',headers:{Authorization:'Bearer '+upstream.apiKey,'Content-Type':'application/json'},
+      body:JSON.stringify({model:upstream.model,messages:input.messages,[upstream.tokenField]:input.max_completion_tokens,
+        stream:false,...(upstream.mode==='official' ? {reasoning_effort:'none',service_tier:'default',store:false} : {})}),
       redirect:'error',signal:AbortSignal.timeout(25000),
     });
   } catch {
     throw new UpstreamError('review',null);
   }
   const header = response.headers.get('x-request-id');
-  const requestId = header && /^[\w-]{1,128}$/.test(header) ? header : null;
+  const chosenId = (value?:string|null) => value && /^[\w.:-]{1,128}$/.test(value) && !value.includes(upstream.apiKey) ? value : null;
+  const headerId = chosenId(header);
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
-    throw new UpstreamError([400,401,403,404,422,429].includes(response.status) ? 'release' : 'review',requestId);
+    const confirmedRejection = upstream.mode==='official' && [400,401,403,404,422,429].includes(response.status);
+    throw new UpstreamError(confirmedRejection ? 'release' : 'review',headerId);
   }
   const parsed = responseSchema.safeParse(await response.json().catch(() => null));
-  if (!parsed.success) throw new UpstreamError('review',requestId);
+  if (!parsed.success) throw new UpstreamError('review',headerId);
+  const requestId = headerId ?? chosenId(parsed.data.id);
+  if (parsed.data.model!==upstream.responseModel) throw new UpstreamError('review',requestId);
   const usage = parsed.data.usage;
-  const tokens = {input:usage.prompt_tokens,cached:usage.prompt_tokens_details?.cached_tokens ?? 0,output:usage.completion_tokens};
-  if (tokens.cached>tokens.input || tokens.output>input.max_completion_tokens) throw new UpstreamError('review',requestId);
-  return {choices:parsed.data.choices,tokens,requestId};
+  const cached = [usage.prompt_tokens_details?.cached_tokens,usage.prompt_cache_hit_tokens,
+    usage.prompt_cache_miss_tokens===undefined ? undefined : usage.prompt_tokens-usage.prompt_cache_miss_tokens]
+    .filter((count): count is number=>count!==undefined);
+  if (new Set(cached).size>1 || (!cached.length && upstream.mode==='compatible' && upstream.cacheMicros!==upstream.inputMicros)) {
+    throw new UpstreamError('review',requestId);
+  }
+  const tokens = {input:usage.prompt_tokens,cached:cached[0] ?? 0,output:usage.completion_tokens};
+  if (tokens.cached<0 || tokens.cached>tokens.input || tokens.output>input.max_completion_tokens) throw new UpstreamError('review',requestId);
+  const hideKey = (value: string|null|undefined) => value?.replaceAll(upstream.apiKey,'[redacted]') ?? value;
+  const choices = parsed.data.choices.map(choice=>({...choice,finish_reason:hideKey(choice.finish_reason)!,message:{...choice.message,
+    content:hideKey(choice.message.content) ?? null,refusal:hideKey(choice.message.refusal)}}));
+  return {choices,tokens,requestId};
 }
 
 export async function mockCompletion(input: CompletionInput): Promise<Completion> {
@@ -74,8 +91,4 @@ export async function mockCompletion(input: CompletionInput): Promise<Completion
     tokens:{input:375,cached:0,output:Math.min(48,input.max_completion_tokens)},requestId:null,
     choices:[{index:0,message:{role:'assistant',content:'本地模拟调用已完成。'},finish_reason:'stop'}],
   };
-}
-
-export function liveKey() {
-  return process.env.ENABLE_OPENAI==='1' ? process.env.OPENAI_API_KEY?.trim() || null : null;
 }

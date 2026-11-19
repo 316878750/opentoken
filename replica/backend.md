@@ -1,6 +1,6 @@
 # OpenToken 后端接入
 
-本阶段沿用 [架构](architecture.md) 中的流水、金额与用量结构。常规运行依赖真实 Supabase Auth 和 PostgreSQL。`mock-text` 和官方 `openai-mini` 使用同一个钱包、限额、预占、结算和报表路径。PGlite 仅在测试中提供隔离的 PostgreSQL 协议服务。
+本阶段沿用 [架构](architecture.md) 中的流水、金额与用量结构。常规运行依赖真实 Supabase Auth 和 PostgreSQL。模拟、官方 OpenAI 与 OpenAI 兼容上游使用同一个钱包、限额、预占、结算和报表路径。PGlite 仅在测试中提供隔离的 PostgreSQL 协议服务。
 
 ## 配置和迁移
 
@@ -20,19 +20,24 @@
    ```
 
 5. 执行 `pnpm db:migrate` 创建带版本记录的 `gateway` 私有 schema 并授权；执行 `pnpm db:check` 核对应用角色。保持 `gateway` 不在 Supabase Data API 的公开 schema 列表。运行账户按表授予最小权限，费率只读，钱包流水只允许读与插入。
-6. 将试点用户邮件填入 `PILOT_EMAIL`，执行 `pnpm db:seed`。命令导入两个目录模型，并对这个已验证用户发放一次 USD 10.00 内部额度，重复执行不会重复入账。未设置邮箱时只导入目录。其他用户首次登录创建零余额钱包。
+6. 将试点用户邮件填入 `PILOT_EMAIL`，执行 `pnpm db:seed`。命令导入模型目录，并对这个已验证用户发放一次 USD 10.00 内部额度，重复执行不会重复入账。未设置邮箱时只导入目录。其他用户首次登录创建零余额钱包。
 
-## 官方 OpenAI 和真实验收
+## 上游与真实验收
 
-官方模型固定使用 `gpt-5.4-mini-2026-03-17`，应用模型代号为 `openai-mini`，适配 `https://api.openai.com/v1/chat/completions`。启用需要 `ENABLE_OPENAI=1` 和自有项目的 `OPENAI_API_KEY`。密钥只在服务端读取，目标 URL 固定，不跟随重定向。请求用非流式文本，关闭存储选项，并使用默认服务层。应用结算按目录费率快照和 OpenAI 返回的输入、缓存读取、输出 Token 计算。 [官方模型和费率](https://developers.openai.com/api/docs/models/gpt-5.4-mini) · [Chat Completions 文档](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+使用 `ENABLE_OPENAI=1` 启用真实模型，并显式选择 `UPSTREAM_MODE`。服务端把密钥发送到对应 HTTPS 端点，禁止重定向。模式或配置缺失时直接失败。
 
-每次调用先在事务里冻结费率和保守预占。本次验收只允许 16 个输出 Token。官方模型使用完整上下文上限估算，按种子价预占 USD 0.300072。结算写入一笔扣费流水并释放剩余预占。上游明确拒绝时释放预占，超时、回包缺少用量或账本结果不确定时保留预占，将请求标为待核对。服务进程意外退出后，运营可用 `pnpm db:review-stale` 把超过 2 分钟的在途记录标为待核对。该命令保留原有预占，人工核对规则和自动调度仍待完善。
+- `official` 模式的应用代号为 `openai-mini`，固定调用官方 `gpt-5.4-mini-2026-03-17`。设置使用自己 OpenAI 项目的 `OPENAI_API_KEY`。 [官方模型和费率](https://developers.openai.com/api/docs/models/gpt-5.4-mini) · [Chat Completions 文档](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+- `compatible` 模式的应用代号为 `compatible-chat`。在 `.env.local` 设置第三方专用的 `COMPATIBLE_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`，以及三项每百万 Token 的 USD 费率 `UPSTREAM_INPUT_USD_PER_MTOK`、`UPSTREAM_CACHED_USD_PER_MTOK`、`UPSTREAM_OUTPUT_USD_PER_MTOK`。默认发送 `max_tokens`，如该供应商要求 `max_completion_tokens` 则设置 `UPSTREAM_MAX_TOKENS_FIELD`。响应中的模型名应等于请求模型，如服务商公开文档明示另一响应名称可设置 `OPENAI_RESPONSE_MODEL`。预占默认按 8192 个输入 Token 的本地报价上限，支持 `UPSTREAM_MAX_CONTEXT_TOKENS`。更改费率后重新运行 `pnpm db:seed`，旧请求仍关联原费率版本。
 
-执行 `pnpm verify:live` 前先确认试点账号有额度且没有其他活跃调用。验收命令从本机 `.env.local` 读取 `PILOT_EMAIL` 和 `PILOT_PASSWORD`，登录并创建专用临时密钥，通过网关发送一条固定短请求，之后撤销该密钥。它将用量记录、实际流水金额、账面余额变化和已结算费用变化对账。执行记录保存在已忽略的 `.demo-data/live-check.json`，防止重复付费调用；不会写入密码、OpenAI key 或模型正文。如果上游较快，仪表盘轮询可能错过处理中快照，脚本会单独报告该事实，并核对用量记录保留的预占凭据。控制台的人机验收使用与脚本相同的概览和用量接口。
+两个模式均发送非流式文本。费用由 OpenToken 根据上游返回的 Token 和冻结费率计算。兼容服务可以通过请求响应头或完成响应 ID 提供关联编号，缓存读取支持标准用量字段、`prompt_cache_hit_tokens` 和 `prompt_cache_miss_tokens`。输入和缓存单价不同时，缺少缓存拆分会进入待核对。模型、用量或预占约束不匹配同样进入待核对。服务商自己账户中的最终账单需另行核对。
+
+每次调用先在事务里冻结费率和保守预占。本次验收只允许 16 个输出 Token。官方模型使用完整上下文上限估算，按种子价预占 USD 0.300072。结算写入一笔扣费流水并释放剩余预占。官方上游明确拒绝时释放预占。兼容上游的非成功状态、超时、回包缺少用量或账本结果不确定时保留预占，将请求标为待核对。服务进程意外退出后，运营可用 `pnpm db:review-stale` 把超过 2 分钟的在途记录标为待核对。该命令保留原有预占，人工核对规则和自动调度仍待完善。
+
+执行 `pnpm verify:live` 前先确认试点账号有额度且没有其他活跃调用。验收命令从本机 `.env.local` 读取 `PILOT_EMAIL` 和 `PILOT_PASSWORD`，登录并创建专用临时密钥，通过网关发送一条固定短请求，之后撤销该密钥。它将用量记录、实际流水金额、账面余额及预占释放变化对账。执行记录保存在已忽略的 `.demo-data/live-check.json`，用来防止重复付费调用。记录只含用量、余额和关联编号。如果上游较快，仪表盘轮询可能错过处理中快照，脚本会单独报告该事实，并核对用量记录保留的预占凭据。控制台使用与脚本相同的概览和用量接口。
 
 ## 验证及边界
 
-本地构建、4 项隔离测试和生产依赖审计通过。隔离测试使用两个独立账号，以受限数据库角色执行读写，核对了模拟调用和 OpenAI 替身的预占、单笔流水、拒绝释放和结果不确定时的保留。已提供的 Supabase URL 和 publishable key 通过 Auth settings 只读检查。云数据库连接、云端账户登录及真实 OpenAI 扣费还需单独验收。
+本地构建、7 项隔离测试和生产依赖审计通过。隔离测试使用两个独立账号，以受限数据库角色执行读写，核对了模拟调用和兼容上游替身的预占、单笔扣费、剩余额度释放和结果不确定时的保留。已提供的 Supabase URL 和 publishable key 通过 Auth settings 只读检查。云数据库连接、云端账户登录及真实上游扣费还需单独验收。
 
 - [x] Auth 会话在服务端验证，钱包、密钥、用量与流水查询按账号限定。原始密钥仅在创建响应显示，摘要带服务端 HMAC。
 - [x] 网关限制请求大小并校验入参，执行钱包金额、密钥限额、每分钟调用数和可选幂等键检查。

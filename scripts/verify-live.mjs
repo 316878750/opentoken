@@ -4,17 +4,18 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir,writeFile } from 'node:fs/promises';
 import { setTimeout as wait } from 'node:timers/promises';
+import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
 
 const maxCompletion = 16;
-const model = 'openai-mini';
 
 function amount(rate,input,cached,output) {
   const raw = BigInt(input-cached)*BigInt(rate.inputMicros)+BigInt(cached)*BigInt(rate.cacheMicros)+BigInt(output)*BigInt(rate.outputMicros);
   return (raw*BigInt(rate.multiplierBps)+9_999_999_999n)/10_000_000_000n;
 }
 
-async function verify(origin) {
+async function verify(origin,upstream) {
   const url = new URL(origin);
+  const model = upstream.alias;
   let cookie, keyId;
 
   async function request(path,{method='GET',body,token,retry}={}) {
@@ -42,14 +43,21 @@ async function verify(origin) {
   cookie = login.headers.get('set-cookie')?.split(';')[0];
   assert.ok(cookie,'Login did not set the session cookie');
   const catalog = ok(await request('/api/catalog'),'Catalog');
-  const rate = catalog.rates.find(r=>r.model===model && r.upstream==='openai');
-  assert.ok(rate,'The official OpenAI model is unavailable in the selected instance');
+  const rate = catalog.rates.find(r=>r.model===model && r.upstream===(upstream.mode==='compatible' ? 'compatible' : 'openai'));
+  assert.ok(rate,'The configured upstream model is unavailable in the selected instance');
   assert.ok(Number.isSafeInteger(rate.maxContextTokens) && rate.maxContextTokens>0 && rate.maxOutputTokens>=maxCompletion,
     'Invalid model limits');
   const assumedCached = BigInt(rate.cacheMicros)>BigInt(rate.inputMicros) ? rate.maxContextTokens : 0;
   const reserved = amount(rate,rate.maxContextTokens,assumedCached,maxCompletion);
   const before = ok(await request('/api/dashboard'),'Before dashboard');
-  assert.ok(BigInt(before.availableMicros)>=reserved,'Pilot wallet needs enough available balance');
+  if (upstream.mode==='compatible') {
+    assert.equal(rate.inputMicros,upstream.inputMicros);
+    assert.equal(rate.cacheMicros,upstream.cacheMicros);
+    assert.equal(rate.outputMicros,upstream.outputMicros);
+    assert.equal(rate.maxContextTokens,upstream.maxContextTokens);
+    assert.equal(rate.multiplierBps,10000);
+  }
+  assert.ok(reserved>0n && BigInt(before.availableMicros)>=reserved,'Pilot wallet needs enough available balance');
   assert.equal(before.heldMicros,'0','Use a pilot wallet without other active requests');
   await mkdir('.demo-data',{recursive:true});
   const marker = '.demo-data/live-check.json';
@@ -86,12 +94,12 @@ async function verify(origin) {
     if (outcome.error) throw outcome.error;
     const responseId = outcome.result.headers.get('x-request-id');
     if (responseId) await writeFile(marker,JSON.stringify({status:'response_received',retry,keyId,requestId:responseId},null,2)+'\n');
-    const result = ok(outcome.result,'One OpenAI request');
+    const result = ok(outcome.result,'One upstream request');
     const id = responseId;
     assert.match(id,/^[0-9a-f-]{36}$/);
     const {items:[row]} = ok(await request('/api/usage?request_id='+id),'Usage record');
     const after = ok(await request('/api/dashboard'),'After dashboard');
-    assert.ok(row?.upstreamRequestId,'No OpenAI request identifier was recorded');
+    assert.ok(row?.upstreamRequestId,'No upstream request or completion identifier was recorded');
     assert.equal(row.status,'settled');
     assert.equal(row.reservedMicros,reserved.toString());
     assert.equal(row.inputTokens,result.usage.prompt_tokens);
@@ -104,7 +112,13 @@ async function verify(origin) {
     assert.equal(BigInt(before.balanceMicros)-BigInt(after.balanceMicros),charged);
     assert.equal(BigInt(after.chargedMicros)-BigInt(before.chargedMicros),charged);
     assert.equal(after.heldMicros,before.heldMicros);
-    const evidence = {status:'verified',requestId:id,upstreamRequestId:row.upstreamRequestId,
+    const released = reserved-charged;
+    assert.ok(released>=0n);
+    assert.equal(row.releasedMicros,released.toString());
+    assert.equal(BigInt(before.availableMicros)-BigInt(after.availableMicros),charged);
+    if (inFlight) assert.equal(BigInt(after.availableMicros)-BigInt(inFlight.availableMicros),released);
+    const evidence = {status:'verified',upstreamMode:upstream.mode,upstreamModel:upstream.model,
+      requestId:id,upstreamRequestId:row.upstreamRequestId,releasedMicros:released.toString(),
       reservedMicros:row.reservedMicros,chargedMicros:row.chargedMicros,ledgerDeltaMicros:row.ledgerDeltaMicros,
       inFlightDashboardObserved:Boolean(inFlight),tokens:result.usage,balanceBefore:before.balanceMicros,balanceAfter:after.balanceMicros};
     await writeFile(marker,JSON.stringify(evidence,null,2)+'\n');
@@ -118,11 +132,12 @@ async function verify(origin) {
 }
 
 async function run() {
-  const missing = ['PILOT_EMAIL','PILOT_PASSWORD','OPENAI_API_KEY','SUPABASE_URL','SUPABASE_PUBLISHABLE_KEY','DATABASE_URL','GATEWAY_SECRET']
+  const missing = ['PILOT_EMAIL','PILOT_PASSWORD','SUPABASE_URL','SUPABASE_PUBLISHABLE_KEY','DATABASE_URL','GATEWAY_SECRET']
     .filter(name=>!process.env[name]?.trim());
   if (process.env.ENABLE_OPENAI!=='1') missing.push('ENABLE_OPENAI=1');
   if (missing.length) throw new Error('Missing live configuration: '+missing.join(', '));
-  const serverEnv = {...process.env,APP_ORIGIN:'',PILOT_PASSWORD:'',MIGRATION_DATABASE_URL:'',NEXT_TELEMETRY_DISABLED:'1'};
+  const upstream = resolveLiveUpstream();
+  const serverEnv = {...process.env,APP_ORIGIN:'',NODE_OPTIONS:'',PILOT_PASSWORD:'',MIGRATION_DATABASE_URL:'',NEXT_TELEMETRY_DISABLED:'1'};
   const server = spawn(process.execPath,['node_modules/next/dist/bin/next','start','--hostname','127.0.0.1','--port','0'],
     {windowsHide:true,stdio:['ignore','pipe','ignore'],env:serverEnv});
   const exited = once(server,'exit');
@@ -140,7 +155,7 @@ async function run() {
       } catch (error) {
         if (error.name!=='TimeoutError' && error.cause?.code!=='ECONNREFUSED') throw error;
       }
-      if (ready) return await verify(origin);
+      if (ready) return await verify(origin,upstream);
       await wait(200);
     }
     throw new Error('OpenToken failed to start. Run pnpm build before verification.');

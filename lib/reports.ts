@@ -28,6 +28,8 @@ export async function usage(user: string, f: UsageFilter) {
   const { db } = await store();
   const { rows } = await db.query<{ id:string }>(`SELECT u.id,u.key_id AS "keyId",k.public_prefix AS prefix,m.code AS model,u.status,
     u.reserved_micros::text AS "reservedMicros",u.standard_micros::text AS "standardMicros",u.charged_micros::text AS "chargedMicros",
+    (CASE WHEN u.status='settled' THEN u.reserved_micros-u.charged_micros
+      WHEN u.status='released' THEN u.reserved_micros END)::text AS "releasedMicros",
     u.input_tokens AS "inputTokens",u.cached_input_tokens AS "cachedTokens",u.output_tokens AS "outputTokens",
     u.created_at AS "createdAt",u.updated_at AS "updatedAt",entry.delta_micros::text AS "ledgerDeltaMicros",
     u.upstream_request_id AS "upstreamRequestId"

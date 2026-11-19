@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 
-type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'};
+type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible'};
 type KeyRow = {id:string;name:string;prefix:string;status:string;groupName:string;rpm:number;capMicros:string|null};
-type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;standardMicros:string|null;
+type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;releasedMicros:string|null;standardMicros:string|null;
   chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string;upstreamRequestId:string|null};
 type Wallet = {balanceMicros:string;heldMicros:string;availableMicros:string;asOf:string;activeKeys:number;
   requests:number;todayRequests:number;tokens:string;todayTokens:string;chargedMicros:string;standardMicros:string;
@@ -131,7 +131,7 @@ export function Pricing() {
     <ErrorNote error={error} />{error && <button onClick={refresh}>重试</button>}
     {data ? <section className="panel table-wrap"><table><thead><tr>
       <th>模型</th><th>分组</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th>
-    </tr></thead><tbody>{data.rates.map(r => <tr key={r.groupId+r.model}><td><code>{r.model}</code> · {r.upstream==='mock'?'模拟':'OpenAI'}</td><td>{r.groupName}</td>
+    </tr></thead><tbody>{data.rates.map(r => <tr key={r.groupId+r.model}><td><code>{r.model}</code> · {r.upstream==='mock'?'模拟':r.upstream==='compatible'?'兼容上游':'OpenAI'}</td><td>{r.groupName}</td>
       <td>{money(r.inputMicros)}</td><td>{money(r.cacheMicros)}</td><td>{money(r.outputMicros)}</td><td>{r.multiplierBps/10000}×</td></tr>)}</tbody></table></section>
       : <Placeholder error={error} />}
   </>;
@@ -359,6 +359,7 @@ export function Usage() {
           catch {setCopyNotice('复制失败，可选中编号后手动复制。');}
         }}>复制请求编号</button>
         <p>{row.status==='settled' || row.status==='released' ? '原预占' : '预占'} {money(row.reservedMicros)}</p>
+        {row.releasedMicros!==null && <p>释放预占 {money(row.releasedMicros)}</p>}
         {row.status==='settled' && <><p>标准费用 {money(row.standardMicros)} · 输入 {row.inputTokens} · 缓存读取 {row.cachedTokens} · 输出 {row.outputTokens}</p>
           {row.ledgerDeltaMicros!==null && <p>账本已入账，扣除 {money(String(-BigInt(row.ledgerDeltaMicros)))}</p>}</>}
         {row.status==='review' && <p className="muted">这次请求的费用仍在核对，预留额度会在核对完成后更新。</p>}

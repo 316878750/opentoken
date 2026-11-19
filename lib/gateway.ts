@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { digest, store, transaction } from './data';
-import { liveKey, mockCompletion, mockModel, openAiCompletion, upstreamModel, UpstreamError, type CompletionInput } from './upstream';
+import { mockCompletion, mockModel, openAiCompletion, UpstreamError, type CompletionInput } from './upstream';
+import { resolveLiveUpstream } from './upstream-config.mjs';
 
 export class Fault extends Error {
   constructor(public status: number, public code: string, message: string, public requestId?: string) { super(message); }
@@ -18,15 +19,16 @@ const rateQuery = `SELECT r.id AS rate_id, m.id AS model_id, g.id AS group_id, m
   r.output_micros_per_mtok::text AS output_rate, r.multiplier_bps AS multiplier
   FROM gateway.model_rates r JOIN gateway.models m ON m.id=r.model_id JOIN gateway.pricing_groups g ON g.id=r.group_id
   WHERE r.closed_at IS NULL AND m.enabled AND g.enabled
-    AND (m.upstream_model='${mockModel}' OR ($1::boolean AND m.upstream_model='${upstreamModel}'))`;
+    AND ((m.code='${mockModel}' AND m.upstream_model='${mockModel}') OR (m.code=$1 AND m.upstream_model=$2))`;
 
 export async function catalog() {
   const { db } = await store();
-  const { rows } = await db.query<Rate>(rateQuery,[Boolean(liveKey())]);
+  const live = resolveLiveUpstream();
+  const { rows } = await db.query<Rate>(rateQuery,[live?.alias ?? null,live?.model ?? null]);
   return rows.map(r => ({ groupId:r.group_id, groupName:r.group_name, model:r.model, inputMicros:r.input_rate,
     cacheMicros:r.cache_rate, outputMicros:r.output_rate, multiplierBps:r.multiplier,
     maxContextTokens:r.max_context_tokens,maxOutputTokens:r.max_output_tokens,
-    upstream:r.upstream_model===mockModel ? 'mock' : 'openai' }));
+    upstream:r.model===mockModel ? 'mock' : live?.mode==='compatible' ? 'compatible' : 'openai' }));
 }
 
 export async function createKey(user: string, name: string, groupId: string, rpm: number, cap: string | null) {
@@ -74,9 +76,10 @@ async function findKey(header: string | null) {
 export async function models(header: string | null) {
   const key = await findKey(header);
   const { db } = await store();
-  const { rows } = await db.query<Rate>(rateQuery + ' AND g.id=$2',[Boolean(liveKey()),key.group_id]);
+  const live = resolveLiveUpstream();
+  const { rows } = await db.query<Rate>(rateQuery + ' AND g.id=$3',[live?.alias ?? null,live?.model ?? null,key.group_id]);
   return { object:'list', data:rows.map(r => ({ id:r.model, object:'model', created:0,
-    owned_by:r.upstream_model===mockModel ? 'opentoken-mock' : 'openai' })) };
+    owned_by:r.model===mockModel ? 'opentoken-mock' : live?.mode==='compatible' ? 'compatible' : 'openai' })) };
 }
 
 function price(rate: Rate, input: number, cache: number, output: number, multiplier: number) {
@@ -90,7 +93,7 @@ export async function complete(header: string | null, body: CompletionInput, ret
   const key = await findKey(header);
   const { db } = await store();
   const fingerprint = retry ? (await digest('request-body',JSON.stringify(body))).toString('hex') : null;
-  const officialKey = liveKey();
+  const live = resolveLiveUpstream();
   const started = Date.now();
   const { id, rate, hold } = await transaction(async tx => {
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros)::text AS available
@@ -103,10 +106,15 @@ export async function complete(header: string | null, body: CompletionInput, ret
       if (existing) throw new Fault(409,existing.fingerprint === fingerprint ? 'duplicate_request' : 'idempotency_conflict',
         existing.fingerprint === fingerprint ? `请求已受理（${existing.status}），请查看使用记录。` : '该幂等键已用于其他请求。',existing.id);
     }
-    const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$2 AND m.code=$3',[Boolean(officialKey),key.group_id,body.model]);
+    const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$3 AND m.code=$4',[live?.alias ?? null,live?.model ?? null,key.group_id,body.model]);
     if (!quote || body.max_completion_tokens > quote.max_output_tokens) {
       throw new Fault(400,'unsupported_model_or_limit','请选择可用模型，并将输出上限设为 1 至 128。');
     }
+    if (quote.model!==mockModel && live?.mode==='compatible' && (
+      quote.max_context_tokens!==live.maxContextTokens || quote.max_output_tokens!==live.maxOutputTokens ||
+      quote.input_rate!==live.inputMicros || quote.cache_rate!==live.cacheMicros || quote.output_rate!==live.outputMicros ||
+      quote.multiplier!==10000
+    )) throw new Fault(503,'seed_config_mismatch','兼容模型与种子费率不一致，请同步后再调用。');
     const assumedCached = BigInt(quote.cache_rate)>BigInt(quote.input_rate) ? quote.max_context_tokens : 0;
     const reserve = price(quote,quote.max_context_tokens,assumedCached,body.max_completion_tokens,quote.multiplier);
     if (BigInt(wallet.available) < reserve) throw new Fault(402,'insufficient_balance','可用余额不足以预留本次费用。');
@@ -146,7 +154,7 @@ export async function complete(header: string | null, body: CompletionInput, ret
 
   let result: Awaited<ReturnType<typeof openAiCompletion>>;
   try {
-    result = rate.upstream_model===mockModel ? await mockCompletion(body) : await openAiCompletion(body,officialKey!);
+    result = rate.model===mockModel ? await mockCompletion(body) : await openAiCompletion(body,live!);
   } catch (error) {
     const providerId = error instanceof UpstreamError ? error.requestId : null;
     if (error instanceof UpstreamError && error.disposition==='release') {

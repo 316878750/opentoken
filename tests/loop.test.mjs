@@ -7,10 +7,17 @@ import test from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
 import { check,migrate,seed } from '../scripts/database.mjs';
+import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
 
 const primary = '30000000-0000-4000-8000-000000000001';
 const secondary = '30000000-0000-4000-8000-000000000002';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary]]);
+const upstreamEnv = {
+  ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
+  COMPATIBLE_API_KEY:'fixture-key',OPENAI_MODEL:'vendor/text-model',OPENAI_RESPONSE_MODEL:'',
+  UPSTREAM_INPUT_USD_PER_MTOK:'0.20',UPSTREAM_CACHED_USD_PER_MTOK:'0.04',UPSTREAM_OUTPUT_USD_PER_MTOK:'0.60',
+  UPSTREAM_MAX_CONTEXT_TOKENS:'8192',UPSTREAM_MAX_TOKENS_FIELD:'max_tokens',
+};
 let base;
 let cookie;
 let server, serverExit, socket, database, auth;
@@ -59,8 +66,8 @@ test.before(async () => {
   }};
   await migrate(admin);
   await migrate(admin);
-  await seed(admin,'pilot-a@example.test');
-  await seed(admin,'pilot-a@example.test');
+  await seed(admin,'pilot-a@example.test',resolveLiveUpstream(upstreamEnv));
+  await seed(admin,'pilot-a@example.test',resolveLiveUpstream(upstreamEnv));
   await database.exec('SET ROLE opentoken_app');
   await check(admin);
   await assert.rejects(database.query('UPDATE gateway.wallet_entries SET delta_micros=0'),{code:'42501'});
@@ -74,7 +81,7 @@ test.before(async () => {
     windowsHide:true,stdio:['ignore','pipe','inherit'],env:{...process.env,NEXT_TELEMETRY_DISABLED:'1',
       DATABASE_URL:'postgresql://opentoken_app@'+socket.getServerConn()+'/postgres',
       SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
-      GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',ENABLE_OPENAI:'1',OPENAI_API_KEY:'fixture-key'},
+      GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',...upstreamEnv},
   });
   serverExit = once(server,'exit');
   let logs = '';
@@ -172,11 +179,11 @@ test('mock call settles once, hides the API key and isolates independent users',
   assert.equal((await request('/api/dashboard',{sessionOverride})).data.balanceMicros,'0');
 });
 
-test('OpenAI fixture uses one ledger debit; rejection releases and uncertainty holds',async () => {
+test('compatible upstream settles one debit, releases the remainder and handles missing billing evidence',async () => {
   const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
   cookie = login.headers.get('set-cookie').split(';')[0];
-  const price = (await request('/api/catalog')).data.rates.find(row=>row.model==='openai-mini');
-  assert.equal(price.upstream,'openai');
+  const price = (await request('/api/catalog')).data.rates.find(row=>row.model==='compatible-chat');
+  assert.equal(price.upstream,'compatible');
   const key = await request('/api/keys',{method:'POST',body:{name:'provider fixture',groupId:price.groupId,rpm:20}});
   assert.equal(key.status,201);
   const call = content => request('/v1/chat/completions',{method:'POST',token:key.data.secret,session:false,
@@ -187,25 +194,29 @@ test('OpenAI fixture uses one ledger debit; rejection releases and uncertainty h
   const id = result.headers.get('x-request-id');
   const {items:[settled]} = (await request('/api/usage?request_id='+id)).data;
   assert.equal(settled.upstreamRequestId,'fixture-provider-request');
-  assert.equal(settled.reservedMicros,'300072');
-  assert.equal(settled.chargedMicros,'17');
-  assert.equal(settled.ledgerDeltaMicros,'-17');
+  assert.equal(settled.reservedMicros,'1648');
+  assert.equal(settled.chargedMicros,'4');
+  assert.equal(settled.releasedMicros,'1644');
+  assert.equal(settled.ledgerDeltaMicros,'-4');
   const paid = (await request('/api/dashboard')).data;
-  assert.equal(BigInt(dashboardBefore.balanceMicros)-BigInt(paid.balanceMicros),17n);
+  assert.equal(BigInt(dashboardBefore.balanceMicros)-BigInt(paid.balanceMicros),4n);
   assert.equal(paid.heldMicros,dashboardBefore.heldMicros);
+  assert.equal(BigInt(paid.availableMicros)-(BigInt(dashboardBefore.availableMicros)-1648n),1644n);
   const rejected = await call('fixture rejection');
-  assert.equal(rejected.status,502);
-  const {items:[released]} = (await request('/api/usage?request_id='+rejected.data.error.request_id)).data;
-  assert.equal(released.status,'released');
-  assert.equal(released.ledgerDeltaMicros,null);
-  assert.equal((await request('/api/dashboard')).data.balanceMicros,paid.balanceMicros);
+  assert.equal(rejected.status,503);
+  const {items:[unconfirmed]} = (await request('/api/usage?request_id='+rejected.data.error.request_id)).data;
+  assert.equal(unconfirmed.status,'review');
+  assert.equal(unconfirmed.releasedMicros,null);
+  assert.equal(unconfirmed.ledgerDeltaMicros,null);
+  assert.equal((await request('/api/dashboard')).data.heldMicros,'1648');
   const failed = await call('fixture uncertain');
   assert.equal(failed.status,503);
   const {items:[review]} = (await request('/api/usage?request_id='+failed.data.error.request_id)).data;
   assert.equal(review.status,'review');
+  assert.equal(review.releasedMicros,null);
   assert.equal(review.ledgerDeltaMicros,null);
   const held = (await request('/api/dashboard')).data;
-  assert.equal(held.heldMicros,'300072');
+  assert.equal(held.heldMicros,'3296');
   assert.equal(held.balanceMicros,paid.balanceMicros);
   const logout = await request('/api/session/logout',{method:'POST'});
   assert.equal(logout.status,204);

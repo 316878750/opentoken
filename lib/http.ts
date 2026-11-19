@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
+import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, updateKey } from './gateway';
 import { dashboard, usage } from './reports';
-import { newSession, sessionCookie, sessionSeconds, sessionUser, validLogin } from './session';
+import { appOrigin, endSession, loginSession, sessionCookie, sessionUser, setSession } from './session';
 
 const date = z.iso.datetime({ offset:true });
 const usageFilter = z.object({
@@ -54,8 +55,8 @@ async function body(req: NextRequest) {
 
 export async function handle(req: NextRequest) {
   try {
-    const host = req.headers.get('host') || '';
-    if (!/^127\.0\.0\.1(?::\d{1,5})?$/.test(host)) throw new Fault(403,'local_only','请使用本机回环地址访问。');
+    const origin = appOrigin(req);
+    if (!origin) throw new Fault(403,'invalid_host','请使用配置的应用地址访问。');
     const path = req.nextUrl.pathname, method = req.method;
     const route = method + ' ' + path;
     const bearer = req.headers.get('authorization');
@@ -65,30 +66,36 @@ export async function handle(req: NextRequest) {
       const retry = req.headers.get('idempotency-key');
       if (retry !== null && !/^[!-~]{1,128}$/.test(retry)) throw new Fault(400,'bad_idempotency_key','幂等键须为 1 至 128 个可见 ASCII 字符。');
       if (Buffer.byteLength(requestBody.messages.map(m => m.content).join(''),'utf8')>3000) {
-        throw new Fault(400,'input_too_long','模拟接口限 3,000 字节文本输入。');
+        throw new Fault(400,'input_too_long','首发接口限 3,000 字节文本输入。');
       }
       const result = await complete(bearer,requestBody,retry);
       const response = json(result);
       response.headers.set('x-request-id',result.id);
       return response;
     }
-    if (method !== 'GET' && req.headers.get('origin') !== 'http://' + host) {
-      throw new Fault(403,'invalid_origin','请从本机控制台发起操作。');
+    if (method !== 'GET' && req.headers.get('origin') !== origin) {
+      throw new Fault(403,'invalid_origin','请从当前控制台发起操作。');
     }
     if (route === 'POST /api/session/login') {
       const input = parse(z.object({email:z.email().max(254),password:z.string().min(1).max(256)}),await body(req));
-      if (!validLogin(input.email,input.password)) throw new Fault(401,'invalid_login','邮箱或密码有误。');
+      const {data,error} = await loginSession(input.email,input.password);
+      if (error?.status===429) throw new Fault(429,'login_rate_limit','尝试次数较多，请稍后再登录。');
+      if (error && (!error.status || error.status>=500)) throw new Fault(503,'auth_unavailable','身份服务暂时无法使用。');
+      if (!data.session || !data.user) throw new Fault(401,'invalid_login','邮箱或密码有误，或账号尚未验证。');
+      await ensureWallet(data.user.id);
       const response = json({ok:true});
-      response.cookies.set(sessionCookie,await newSession(),{path:'/',httpOnly:true,sameSite:'strict',maxAge:sessionSeconds});
+      setSession(response,origin,data.session.access_token,data.session.expires_in);
       return response;
     }
-    const user = await sessionUser(req.cookies.get(sessionCookie)?.value);
-    if (!user) throw new Fault(401,'session_required','请先登录。');
+    const token = req.cookies.get(sessionCookie)?.value;
     if (route === 'POST /api/session/logout') {
+      await endSession(token).catch(() => console.error('Supabase session revoke failed'));
       const response = new NextResponse(null,{status:204,headers:{'cache-control':'no-store'}});
-      response.cookies.set(sessionCookie,'',{path:'/',httpOnly:true,sameSite:'strict',maxAge:0});
+      setSession(response,origin);
       return response;
     }
+    const user = await sessionUser(token);
+    if (!user) throw new Fault(401,'session_required','请先登录。');
     if (route === 'GET /api/catalog') return json({rates:await catalog()});
     if (route === 'GET /api/keys') return json({items:await listKeys(user)});
     if (route === 'POST /api/keys') {

@@ -1,27 +1,47 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { digest, userId } from './data';
+import { createClient } from '@supabase/supabase-js';
+import type { NextRequest, NextResponse } from 'next/server';
 
-export const sessionCookie = 'model_gateway_demo';
-export const sessionSeconds = 8 * 60 * 60;
+export const sessionCookie = 'opentoken_session';
 
-function equal(a: string, b: string) {
-  const sha = (value: string) => createHash('sha256').update(value).digest();
-  return timingSafeEqual(sha(a),sha(b));
+function client() {
+  const { SUPABASE_URL:base, SUPABASE_PUBLISHABLE_KEY:key } = process.env;
+  if (!base || !key) throw new Error('Supabase Auth is not configured');
+  const url = new URL(base);
+  if (url.protocol!=='https:' && (url.protocol!=='http:' || url.hostname!=='127.0.0.1')) {
+    throw new Error('Supabase Auth requires HTTPS');
+  }
+  return createClient(url.origin,key,{auth:{autoRefreshToken:false,persistSession:false,detectSessionInUrl:false},
+    global:{fetch:(input,init) => fetch(input,{...init,cache:'no-store',redirect:'error',signal:AbortSignal.timeout(8000)})}});
 }
 
-export function validLogin(email: string, password: string) {
-  return email.trim().toLowerCase() === (process.env.DEMO_EMAIL || 'demo@example.test').toLowerCase() &&
-    equal(password,process.env.DEMO_PASSWORD || 'local-demo-only');
+export async function loginSession(email: string,password: string) {
+  return client().auth.signInWithPassword({email,password});
 }
 
-export async function newSession() {
-  const payload = `${Math.floor(Date.now()/1000)+sessionSeconds}.${randomBytes(16).toString('hex')}`;
-  return payload + '.' + (await digest('session',payload)).toString('base64url');
+export async function sessionUser(token: string | undefined) {
+  if (!token || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) return null;
+  const {data,error} = await client().auth.getUser(token);
+  if (error && (!error.status || error.status>=500)) throw new Error('Supabase Auth is temporarily unavailable');
+  return data.user?.id ?? null;
 }
 
-export async function sessionUser(value: string | undefined) {
-  const match = /^(\d{10})\.([0-9a-f]{32})\.([a-zA-Z0-9_-]{43})$/.exec(value || '');
-  if (!match || Number(match[1]) <= Math.floor(Date.now()/1000)) return null;
-  const expected = (await digest('session',match[1]+'.'+match[2])).toString('base64url');
-  return equal(match[3],expected) ? userId : null;
+export async function endSession(token: string | undefined) {
+  if (token && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) {
+    const {error} = await client().auth.admin.signOut(token,'local');
+    if (error && (!error.status || error.status>=500)) console.error('Supabase session revoke temporarily unavailable');
+  }
+}
+
+export function appOrigin(req: NextRequest) {
+  const host = req.headers.get('host') || '';
+  if (process.env.APP_ORIGIN) {
+    const configured = new URL(process.env.APP_ORIGIN);
+    return configured.host===host && (configured.protocol==='https:' || configured.hostname==='127.0.0.1')
+      ? configured.origin : null;
+  }
+  return /^127\.0\.0\.1(?::\d{1,5})?$/.test(host) ? 'http://'+host : null;
+}
+
+export function setSession(response: NextResponse,origin: string,token = '',maxAge = 0) {
+  response.cookies.set(sessionCookie,token,{path:'/',httpOnly:true,sameSite:'strict',secure:origin.startsWith('https:'),maxAge});
 }

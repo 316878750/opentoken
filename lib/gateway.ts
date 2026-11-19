@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { setTimeout as delay } from 'node:timers/promises';
-import { digest, store } from './data';
+import { digest, store, transaction } from './data';
+import { liveKey, mockCompletion, mockModel, openAiCompletion, upstreamModel, UpstreamError, type CompletionInput } from './upstream';
 
 export class Fault extends Error {
   constructor(public status: number, public code: string, message: string, public requestId?: string) { super(message); }
@@ -17,13 +17,16 @@ const rateQuery = `SELECT r.id AS rate_id, m.id AS model_id, g.id AS group_id, m
   r.input_micros_per_mtok::text AS input_rate, r.cached_input_micros_per_mtok::text AS cache_rate,
   r.output_micros_per_mtok::text AS output_rate, r.multiplier_bps AS multiplier
   FROM gateway.model_rates r JOIN gateway.models m ON m.id=r.model_id JOIN gateway.pricing_groups g ON g.id=r.group_id
-  WHERE r.closed_at IS NULL AND m.enabled AND g.enabled`;
+  WHERE r.closed_at IS NULL AND m.enabled AND g.enabled
+    AND (m.upstream_model='${mockModel}' OR ($1::boolean AND m.upstream_model='${upstreamModel}'))`;
 
 export async function catalog() {
   const { db } = await store();
-  const { rows } = await db.query<Rate>(rateQuery);
+  const { rows } = await db.query<Rate>(rateQuery,[Boolean(liveKey())]);
   return rows.map(r => ({ groupId:r.group_id, groupName:r.group_name, model:r.model, inputMicros:r.input_rate,
-    cacheMicros:r.cache_rate, outputMicros:r.output_rate, multiplierBps:r.multiplier }));
+    cacheMicros:r.cache_rate, outputMicros:r.output_rate, multiplierBps:r.multiplier,
+    maxContextTokens:r.max_context_tokens,maxOutputTokens:r.max_output_tokens,
+    upstream:r.upstream_model===mockModel ? 'mock' : 'openai' }));
 }
 
 export async function createKey(user: string, name: string, groupId: string, rpm: number, cap: string | null) {
@@ -71,8 +74,9 @@ async function findKey(header: string | null) {
 export async function models(header: string | null) {
   const key = await findKey(header);
   const { db } = await store();
-  const { rows } = await db.query<Rate>(rateQuery + ' AND g.id=$1',[key.group_id]);
-  return { object:'list', data:rows.map(r => ({ id:r.model, object:'model', created:0, owned_by:'local-demo' })) };
+  const { rows } = await db.query<Rate>(rateQuery + ' AND g.id=$2',[Boolean(liveKey()),key.group_id]);
+  return { object:'list', data:rows.map(r => ({ id:r.model, object:'model', created:0,
+    owned_by:r.upstream_model===mockModel ? 'opentoken-mock' : 'openai' })) };
 }
 
 function price(rate: Rate, input: number, cache: number, output: number, multiplier: number) {
@@ -82,14 +86,13 @@ function price(rate: Rate, input: number, cache: number, output: number, multipl
   return (weighted*BigInt(multiplier) + denominator-1n)/denominator;
 }
 
-export type CompletionInput = { model: string; messages: { role: string; content: string }[]; max_completion_tokens: number };
-
 export async function complete(header: string | null, body: CompletionInput, retry: string | null) {
   const key = await findKey(header);
   const { db } = await store();
   const fingerprint = retry ? (await digest('request-body',JSON.stringify(body))).toString('hex') : null;
+  const officialKey = liveKey();
   const started = Date.now();
-  const { id, rate, hold } = await db.transaction(async tx => {
+  const { id, rate, hold } = await transaction(async tx => {
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros)::text AS available
       FROM gateway.wallets WHERE user_id=$1 FOR UPDATE`,[key.user_id]);
     const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE id=$1 FOR UPDATE`,[key.id]);
@@ -100,7 +103,7 @@ export async function complete(header: string | null, body: CompletionInput, ret
       if (existing) throw new Fault(409,existing.fingerprint === fingerprint ? 'duplicate_request' : 'idempotency_conflict',
         existing.fingerprint === fingerprint ? `请求已受理（${existing.status}），请查看使用记录。` : '该幂等键已用于其他请求。',existing.id);
     }
-    const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$1 AND m.code=$2',[key.group_id,body.model]);
+    const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$2 AND m.code=$3',[Boolean(officialKey),key.group_id,body.model]);
     if (!quote || body.max_completion_tokens > quote.max_output_tokens) {
       throw new Fault(400,'unsupported_model_or_limit','请选择可用模型，并将输出上限设为 1 至 128。');
     }
@@ -122,20 +125,57 @@ export async function complete(header: string | null, body: CompletionInput, ret
     return { id:entry.id, rate:quote, hold:reserve };
   });
 
-  // Fixed usage gives repeatable accounting and the delay makes the hold visible.
-  await delay(Math.min(30_000, Math.max(1_000, Number(process.env.DEMO_DELAY_MS) || 12_000)));
-  const input = 375, cached = 0, output = Math.min(48, body.max_completion_tokens);
+  async function markReview(providerId: string | null, reason: string) {
+    try {
+      await db.query(`UPDATE gateway.usage_requests SET status='review',terminal_reason=$2,
+        upstream_request_id=$3,updated_at=now() WHERE id=$1 AND status='dispatched'`,[id,reason,providerId]);
+    } catch { console.error('Unable to record pending reconciliation',id); }
+  }
+
+  async function release(providerId: string | null) {
+    await transaction(async tx => {
+      await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[key.user_id]);
+      await tx.query('SELECT 1 FROM gateway.api_keys WHERE id=$1 FOR UPDATE',[key.id]);
+      const { rowCount } = await tx.query(`UPDATE gateway.usage_requests SET status='released',terminal_reason='upstream_rejected',
+        upstream_request_id=$2,finalized_at=now(),updated_at=now() WHERE id=$1 AND status='dispatched'`,[id,providerId]);
+      if (!rowCount) throw new Error('Request was already resolved');
+      await tx.query('UPDATE gateway.wallets SET held_micros=held_micros-$2,updated_at=now() WHERE user_id=$1',[key.user_id,hold.toString()]);
+      await tx.query('UPDATE gateway.api_keys SET held_micros=held_micros-$2,updated_at=now() WHERE id=$1',[key.id,hold.toString()]);
+    });
+  }
+
+  let result: Awaited<ReturnType<typeof openAiCompletion>>;
+  try {
+    result = rate.upstream_model===mockModel ? await mockCompletion(body) : await openAiCompletion(body,officialKey!);
+  } catch (error) {
+    const providerId = error instanceof UpstreamError ? error.requestId : null;
+    if (error instanceof UpstreamError && error.disposition==='release') {
+      try { await release(providerId); }
+      catch {
+        await markReview(providerId,'release_uncertain');
+        throw new Fault(503,'billing_review','费用待核对，请按请求编号查看记录。',id);
+      }
+      throw new Fault(502,'upstream_rejected',error.message,id);
+    }
+    await markReview(providerId,'upstream_uncertain');
+    throw new Fault(503,'billing_review','费用待核对，请按请求编号查看记录。',id);
+  }
+  const {input,cached,output} = result.tokens;
   const standard = price(rate,input,cached,output,10_000);
   const charged = price(rate,input,cached,output,rate.multiplier);
+  if (charged>hold || input>rate.max_context_tokens || output>body.max_completion_tokens) {
+    await markReview(result.requestId,'usage_outside_quote');
+    throw new Fault(503,'billing_review','费用待核对，请按请求编号查看记录。',id);
+  }
   try {
-    await db.transaction(async tx => {
+    await transaction(async tx => {
       await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[key.user_id]);
       await tx.query('SELECT 1 FROM gateway.api_keys WHERE id=$1 FOR UPDATE',[key.id]);
       const { rows:[pending] } = await tx.query<{status:string}>('SELECT status FROM gateway.usage_requests WHERE id=$1 FOR UPDATE',[id]);
       if (pending.status !== 'dispatched') throw new Error('Request cannot be settled from its current status');
       await tx.query(`UPDATE gateway.usage_requests SET status='settled',input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
-        standard_micros=$5,charged_micros=$6,duration_ms=$7,finalized_at=now(),updated_at=now() WHERE id=$1`,
-        [id,input,cached,output,standard.toString(),charged.toString(),Date.now()-started]);
+        standard_micros=$5,charged_micros=$6,duration_ms=$7,upstream_request_id=$8,finalized_at=now(),updated_at=now() WHERE id=$1`,
+        [id,input,cached,output,standard.toString(),charged.toString(),Date.now()-started,result.requestId]);
       await tx.query("INSERT INTO gateway.wallet_entries (user_id,request_id,kind,delta_micros) VALUES ($1,$2,'usage',$3)",
         [key.user_id,id,(-charged).toString()]);
       await tx.query('UPDATE gateway.wallets SET balance_micros=balance_micros-$2,held_micros=held_micros-$3,updated_at=now() WHERE user_id=$1',
@@ -144,12 +184,12 @@ export async function complete(header: string | null, body: CompletionInput, ret
         [key.id,charged.toString(),hold.toString()]);
     });
   } catch {
-    await db.query("UPDATE gateway.usage_requests SET status='review',terminal_reason='settlement_uncertain',updated_at=now() WHERE id=$1 AND status='dispatched'",[id]);
+    await markReview(result.requestId,'settlement_uncertain');
     throw new Fault(503,'billing_review','费用待核对，请按请求编号查看记录。',id);
   }
   return {
     id, object:'chat.completion', created:Math.floor(started/1000), model:body.model,
-    choices:[{ index:0, message:{role:'assistant',content:'本地模拟调用已完成。'}, finish_reason:'stop' }],
+    choices:result.choices,
     usage:{ prompt_tokens:input, completion_tokens:output, total_tokens:input+output, prompt_tokens_details:{cached_tokens:cached} },
   };
 }

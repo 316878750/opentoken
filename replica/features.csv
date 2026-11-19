@@ -1,5 +1,5 @@
 feature,area,priority,original,clone,notes
-未登录时从仪表盘跳到登录页,账户,must,yes,yes,S12 支持本地会话及站内返回路径
+未登录时从仪表盘跳到登录页,账户,must,yes,yes,S12 支持 Supabase Auth 会话及站内返回路径
 账户余额和启用密钥数总览,仪表盘,must,yes,yes,S01 展示账面余额 可用余额 预占与启用密钥数
 请求数及今日和累计用量汇总,仪表盘,must,yes,yes,S01 展示今日和累计请求与已结算 Token
 费用总览并列实际和标准口径,仪表盘,must,yes,yes,S01 展示累计实际扣费与标准费
@@ -9,8 +9,8 @@ RPM TPM 与平均响应指标,仪表盘,should,yes,no,S01 已见有数据
 平台限额用量,仪表盘,could,yes,no,S01 已见未配置态
 最近使用区域,仪表盘,should,yes,no,S01 已见标题
 核心业务快捷入口,仪表盘,should,yes,partial,S01 已接入密钥管理和用量链接 兑换延期
-按模型查看计费方式和输入输出缓存读取单价,模型与计费,must,yes,yes,S03 展示本地演示模型的按 Token 计费和三项价格
-按分组查看平台和倍率,模型与计费,must,yes,partial,S03 仅有一个本地上游和分组 已展示倍率
+按模型查看计费方式和输入输出缓存读取单价,模型与计费,must,yes,yes,S03 显示已启用的模拟与官方 OpenAI 模型的三项单价
+按分组查看平台和倍率,模型与计费,must,yes,partial,S03 单试点分组 展示模型的上游和分组倍率
 搜索模型名称或价格并按平台浏览,模型与计费,should,yes,no,S03 已见搜索与平台分类控件
 查看与复制 API 接入端点,API 接入,must,yes,yes,S04 显示可复制的本机端点
 按名称或密钥搜索与分页,API 接入,should,yes,no,S04 已见控件与列表

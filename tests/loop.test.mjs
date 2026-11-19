@@ -1,21 +1,80 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
+import { PGlite } from '@electric-sql/pglite';
+import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
+import { check,migrate,seed } from '../scripts/database.mjs';
 
-let base = process.env.TEST_URL;
+const primary = '30000000-0000-4000-8000-000000000001';
+const secondary = '30000000-0000-4000-8000-000000000002';
+const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary]]);
+let base;
 let cookie;
-let server, serverExit, temporaryData;
+let server, serverExit, socket, database, auth;
+
+function fakeAuth() {
+  const activeTokens = new Map();
+  return createServer(async (request,response) => {
+    const json = (status,payload) => {
+      response.writeHead(status,{'Content-Type':'application/json'});
+      response.end(JSON.stringify(payload));
+    };
+    const makeUser = (id,email) => ({id,email,aud:'authenticated',role:'authenticated',
+      app_metadata:{provider:'email'},user_metadata:{},created_at:new Date().toISOString()});
+    if (request.method==='POST' && request.url==='/auth/v1/token?grant_type=password') {
+      let raw = '';
+      for await (const chunk of request) raw += chunk;
+      const {email,password} = JSON.parse(raw);
+      if (!identities.has(email) || password!=='fixture-test-password') {
+        return json(400,{code:'invalid_credentials',msg:'Invalid credentials'});
+      }
+      const id = identities.get(email);
+      const token = 'eyJhbGciOiJIUzI1NiJ9.'+Buffer.from(JSON.stringify({sub:id,exp:Date.now()/1000+3600})).toString('base64url')+'.fixture';
+      const user = makeUser(id,email);
+      activeTokens.set(token,user);
+      return json(200,{access_token:token,refresh_token:'unused',expires_in:3600,token_type:'bearer',user});
+    }
+    const token = request.headers.authorization?.slice('Bearer '.length);
+    if (request.method==='GET' && request.url==='/auth/v1/user' && activeTokens.has(token)) return json(200,activeTokens.get(token));
+    if (request.method==='POST' && request.url?.startsWith('/auth/v1/logout')) {
+      return json(204,null);
+    }
+    return json(401,{code:'bad_jwt',msg:'Invalid session'});
+  });
+}
+
 test.before(async () => {
-  if (process.env.TEST_URL) return;
-  temporaryData = await mkdtemp(join(tmpdir(),'model-gateway-test-'));
-  server = spawn(process.execPath,['node_modules/next/dist/bin/next','start','--hostname','127.0.0.1','--port','0'],{
+  database = await PGlite.create();
+  await database.exec(`CREATE SCHEMA auth;
+    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz);
+    CREATE ROLE opentoken_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;`);
+  for (const [email,id] of identities) await database.query('INSERT INTO auth.users VALUES ($1,$2,now())',[id,email]);
+  const admin = {query:async (sql,params) => {
+    if (!params && sql.trim().replace(/;$/,'').includes(';')) return database.exec(sql);
+    const result = await database.query(sql,params);
+    return {...result,rowCount:result.rows.length || result.affectedRows || 0};
+  }};
+  await migrate(admin);
+  await migrate(admin);
+  await seed(admin,'pilot-a@example.test');
+  await seed(admin,'pilot-a@example.test');
+  await database.exec('SET ROLE opentoken_app');
+  await check(admin);
+  await assert.rejects(database.query('UPDATE gateway.wallet_entries SET delta_micros=0'),{code:'42501'});
+  await assert.rejects(database.query('SELECT * FROM auth.users'),{code:'42501'});
+  socket = new PGLiteSocketServer({db:database,host:'127.0.0.1',port:0,maxConnections:5});
+  await socket.start();
+  auth = fakeAuth();
+  auth.listen(0,'127.0.0.1');
+  await once(auth,'listening');
+  server = spawn(process.execPath,['--import','./tests/openai-fixture.mjs','node_modules/next/dist/bin/next','start','--hostname','127.0.0.1','--port','0'],{
     windowsHide:true,stdio:['ignore','pipe','inherit'],env:{...process.env,NEXT_TELEMETRY_DISABLED:'1',
-      DEMO_DATA_DIR:temporaryData,DEMO_DELAY_MS:'5000',DEMO_EMAIL:'demo@example.test',DEMO_PASSWORD:'local-demo-only'},
+      DATABASE_URL:'postgresql://opentoken_app@'+socket.getServerConn()+'/postgres',
+      SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
+      GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',ENABLE_OPENAI:'1',OPENAI_API_KEY:'fixture-key'},
   });
   serverExit = once(server,'exit');
   let logs = '';
@@ -34,13 +93,16 @@ test.before(async () => {
 });
 test.after(async () => {
   if (server) { server.kill(); await serverExit; }
-  if (temporaryData) await rm(temporaryData,{recursive:true,force:true});
+  if (auth) await new Promise(resolve=>auth.close(resolve));
+  if (socket) await socket.stop();
+  if (database) await database.close();
 });
-async function request(path, { method = 'GET', body, token, retry, session = true } = {}) {
+async function request(path, { method = 'GET', body, token, retry, session = true, sessionOverride } = {}) {
   const r = await fetch(base + path, {
     method, headers: {
-      ...(body ? { 'content-type': 'application/json', origin: base } : {}),
-      ...(session && cookie ? { cookie } : {}),
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...(method!=='GET' ? {origin:base} : {}),
+      ...(session && (sessionOverride || cookie) ? {cookie:sessionOverride || cookie} : {}),
       ...(token ? { authorization: 'Bearer ' + token } : {}),
       ...(retry ? { 'idempotency-key': retry } : {}),
     }, body: body ? JSON.stringify(body) : undefined,
@@ -48,14 +110,17 @@ async function request(path, { method = 'GET', body, token, retry, session = tru
   return { status: r.status, headers: r.headers, data: r.status === 204 ? null : await r.json() };
 }
 
-test('mock call reserves funds, settles once and hides API key after creation', async () => {
+const loginPayload = (email,password='fixture-test-password') => ({method:'POST',body:{email,password}});
+
+test('mock call settles once, hides the API key and isolates independent users', async () => {
   assert.equal((await request('/api/keys', {session:false})).status, 401);
-  assert.equal((await request('/api/session/login', { method:'POST', body:{email:'demo@example.test',password:'wrong'} })).status, 401);
-  const login = await request('/api/session/login', { method:'POST', body:{email:'demo@example.test',password:'local-demo-only'} });
+  assert.equal((await request('/api/session/login',loginPayload('pilot-a@example.test','wrong'))).status,401);
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
   assert.equal(login.status, 200);
   cookie = login.headers.get('set-cookie').split(';')[0];
   const { data: catalog } = await request('/api/catalog');
   const { data: start } = await request('/api/dashboard');
+  assert.equal(start.balanceMicros,'10000000');
   const key = await request('/api/keys', { method:'POST', body:{name:'integration',groupId:catalog.rates[0].groupId,rpm:20} });
   assert.equal(key.status, 201);
   assert.match(key.headers.get('cache-control'), /no-store/);
@@ -99,4 +164,52 @@ test('mock call reserves funds, settles once and hides API key after creation', 
   assert.equal(blocked.status,402);
   assert.equal(blocked.data.error.code,'key_budget_exceeded');
   assert.equal((await request('/api/dashboard')).data.heldMicros,'0');
+  const otherLogin = await request('/api/session/login',loginPayload('pilot-b@example.test'));
+  const sessionOverride = otherLogin.headers.get('set-cookie').split(';')[0];
+  assert.deepEqual((await request('/api/keys',{sessionOverride})).data.items,[]);
+  assert.deepEqual((await request('/api/usage?request_id='+pending.id,{sessionOverride})).data.items,[]);
+  assert.equal((await request('/api/keys/'+key.data.id,{method:'DELETE',sessionOverride})).status,404);
+  assert.equal((await request('/api/dashboard',{sessionOverride})).data.balanceMicros,'0');
+});
+
+test('OpenAI fixture uses one ledger debit; rejection releases and uncertainty holds',async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  cookie = login.headers.get('set-cookie').split(';')[0];
+  const price = (await request('/api/catalog')).data.rates.find(row=>row.model==='openai-mini');
+  assert.equal(price.upstream,'openai');
+  const key = await request('/api/keys',{method:'POST',body:{name:'provider fixture',groupId:price.groupId,rpm:20}});
+  assert.equal(key.status,201);
+  const call = content => request('/v1/chat/completions',{method:'POST',token:key.data.secret,session:false,
+    retry:crypto.randomUUID(),body:{model:price.model,messages:[{role:'user',content}],max_completion_tokens:16,stream:false}});
+  const dashboardBefore = (await request('/api/dashboard')).data;
+  const result = await call('fixture success');
+  assert.equal(result.status,200);
+  const id = result.headers.get('x-request-id');
+  const {items:[settled]} = (await request('/api/usage?request_id='+id)).data;
+  assert.equal(settled.upstreamRequestId,'fixture-provider-request');
+  assert.equal(settled.reservedMicros,'300072');
+  assert.equal(settled.chargedMicros,'17');
+  assert.equal(settled.ledgerDeltaMicros,'-17');
+  const paid = (await request('/api/dashboard')).data;
+  assert.equal(BigInt(dashboardBefore.balanceMicros)-BigInt(paid.balanceMicros),17n);
+  assert.equal(paid.heldMicros,dashboardBefore.heldMicros);
+  const rejected = await call('fixture rejection');
+  assert.equal(rejected.status,502);
+  const {items:[released]} = (await request('/api/usage?request_id='+rejected.data.error.request_id)).data;
+  assert.equal(released.status,'released');
+  assert.equal(released.ledgerDeltaMicros,null);
+  assert.equal((await request('/api/dashboard')).data.balanceMicros,paid.balanceMicros);
+  const failed = await call('fixture uncertain');
+  assert.equal(failed.status,503);
+  const {items:[review]} = (await request('/api/usage?request_id='+failed.data.error.request_id)).data;
+  assert.equal(review.status,'review');
+  assert.equal(review.ledgerDeltaMicros,null);
+  const held = (await request('/api/dashboard')).data;
+  assert.equal(held.heldMicros,'300072');
+  assert.equal(held.balanceMicros,paid.balanceMicros);
+  const logout = await request('/api/session/logout',{method:'POST'});
+  assert.equal(logout.status,204);
+  assert.match(logout.headers.get('set-cookie'),/Max-Age=0/i);
+  cookie = undefined;
+  assert.equal((await request('/api/keys')).status,401);
 });

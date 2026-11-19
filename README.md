@@ -1,32 +1,24 @@
-# Model Gateway 本地 MVP
+# OpenToken
 
-这个本地试点实现了登录、分组密钥签发、模拟模型调用和用量对账。需要 Node.js 22+ 和 pnpm。在项目根目录运行：
+受邀用户可登录、创建 API 密钥、调用模型，并在控制台核对预占和扣费。应用连接 Supabase Auth 和 PostgreSQL。模拟模型 `mock-text` 固定返回演示用量。启用官方上游后，`openai-mini` 可调用 OpenAI 的非流式文本接口。
+
+需要 Node.js 22.9+ 和 pnpm。将 [.env.example](.env.example) 复制到 `.env.local`，在后者配置 Supabase 项目、数据库连接和密钥。创建受邀测试用户后，从项目根目录运行：
 
 ```powershell
 pnpm install
+pnpm db:migrate
+pnpm db:check
+pnpm db:seed
 pnpm dev
 ```
 
-打开 [本机控制台](http://127.0.0.1:3000)。默认演示账号为 `demo@example.test`，密码为 `local-demo-only`。首次登录时会初始化本地数据库，可能比后续登录慢。服务只绑定本机回环地址，从同一地址访问浏览器与 API。演示账号、余额和密钥只用于本机测试。
+打开[本机控制台](http://127.0.0.1:3000)并使用 Supabase 测试账号登录。进入 **API 密钥 → 创建密钥**，在弹窗保存完整密钥。点“模拟调用一次”，并在概览和使用记录查看预占和结算。给试点用户发放一次 USD 10.00 内部演示额度后，首笔模拟请求会预占 USD 2.00、实际扣 USD 0.75。
 
-1. 登录后进入 **API 密钥 → 创建密钥**，填名称并使用演示分组。保存一次性显示的密钥。
-2. 在弹窗先打开“在新标签页看余额”和“在新标签页看请求”。回到密钥弹窗，点击“模拟调用一次”。默认处理时间约 12 秒，可切到另外两个标签页观察预占。
-3. 新数据库初始账面余额为 USD 10.00。默认示例调用预占 USD 2.00，可用余额降为 USD 8.00。结算后预占归零，账面和可用余额均为 USD 9.25，使用记录显示实际扣费 USD 0.75。后续调用继续从当前余额扣减。
-4. 勾选“我已保存密钥”并完成。刷新密钥页后只显示前缀。
-
-也可用保存好的密钥调用 `POST http://127.0.0.1:3000/v1/chat/completions`。此示例假定你已把本机密钥放到 `DEMO_API_KEY` 环境变量。
-
-```powershell
-$headers = @{ Authorization = "Bearer $env:DEMO_API_KEY"; 'Idempotency-Key' = [guid]::NewGuid().ToString() }
-$body = @{ model = 'mock-text'; messages = @(@{ role = 'user'; content = 'ping' }); max_completion_tokens = 128 } | ConvertTo-Json -Depth 4
-Invoke-RestMethod -Uri 'http://127.0.0.1:3000/v1/chat/completions' -Method Post -Headers $headers -ContentType 'application/json' -Body $body
-```
-
-PGlite 使用 [架构 SQL](replica/schema.sql)，持久化数据默认位于 `.demo-data/`。请只运行一个进程访问同一数据目录。要从全新演示余额开始，可把 `DEMO_DATA_DIR` 指向新的目录。可用 `DEMO_EMAIL`、`DEMO_PASSWORD` 修改演示账号，用 `DEMO_DELAY_MS` 修改模拟等待时间。架构里的 Supabase 登录、真实上游、兑换与运营对账属于后续阶段。
+真实验收需显式设置 `ENABLE_OPENAI=1`，并在 `.env.local` 填入 OpenAI API key 与试点账号。执行 `pnpm build` 再执行 `pnpm verify:live`，验收脚本会启动自己的本机进程并只提交一次真实请求，然后校验上游 Token、预占、使用记录、钱包流水和仪表盘余额。详见[数据库、环境变量与真实验收步骤](replica/backend.md)。
 
 ```powershell
 pnpm build
 pnpm test
 ```
 
-测试启动独立的本机进程和临时数据库，检查认证、一次性密钥、在途预占、结算、账本金额、幂等和密钥限额。
+自动化用例运行在隔离的本机环境，通过 `pg` 连接 PostgreSQL 协议测试服务器。身份与上游由测试替身提供。

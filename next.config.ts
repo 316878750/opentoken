@@ -1,7 +1,7 @@
 import type { NextConfig } from 'next';
 
 const config: NextConfig = {
-  serverExternalPackages: ['@electric-sql/pglite'],
+  serverExternalPackages: ['pg'],
   poweredByHeader: false,
   devIndicators: false,
   agentRules: false,

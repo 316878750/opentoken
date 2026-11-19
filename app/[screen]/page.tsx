@@ -14,8 +14,8 @@ export default async function Screen({ params }: { params:Promise<{screen:string
   if (!user) redirect('/login?redirect=/' + screen);
   return <div className="shell">
     <aside>
-      <a className="brand" href="/dashboard">Model Gateway</a>
-      <span className="badge">本地试点</span>
+      <a className="brand" href="/dashboard">OpenToken</a>
+      <span className="badge">试点控制台</span>
       <nav aria-label="控制台">
         {screens.map((item,i) => <a key={item} href={'/'+item} aria-current={item===screen ? 'page' : undefined}>{labels[i]}</a>)}
       </nav>

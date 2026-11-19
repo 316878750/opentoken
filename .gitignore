@@ -3,6 +3,7 @@ node_modules/
 .demo-data/
 .pnpm-store/
 .env*
+!.env.example
 *.tsbuildinfo
 next-env.d.ts
 replica-skill-codex/

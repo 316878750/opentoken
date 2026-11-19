@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 
-type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number};
+type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'};
 type KeyRow = {id:string;name:string;prefix:string;status:string;groupName:string;rpm:number;capMicros:string|null};
 type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;standardMicros:string|null;
-  chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string};
+  chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string;upstreamRequestId:string|null};
 type Wallet = {balanceMicros:string;heldMicros:string;availableMicros:string;asOf:string;activeKeys:number;
   requests:number;todayRequests:number;tokens:string;todayTokens:string;chargedMicros:string;standardMicros:string;
   todayChargedMicros:string;reviewCount:number};
@@ -79,8 +79,7 @@ export function Login() {
     const form = new FormData(event.currentTarget);
     setBusy(true); setError('');
     try {
-      // Creating the first embedded PostgreSQL cluster on Windows can take over 12 seconds.
-      await api('/api/session/login',{method:'POST',body:JSON.stringify(Object.fromEntries(form)),signal:AbortSignal.timeout(45000)});
+      await api('/api/session/login',{method:'POST',body:JSON.stringify(Object.fromEntries(form)),signal:AbortSignal.timeout(22000)});
       const destination = new URLSearchParams(location.search).get('redirect');
       location.replace(destination && ['/dashboard','/pricing','/keys','/usage'].includes(destination) ? destination : '/dashboard');
     } catch (error) {
@@ -89,8 +88,8 @@ export function Login() {
     }
   }
   return <main className="login"><form className="panel" action="/api/session/login" method="post" onSubmit={submit}>
-    <span className="badge">本地试点</span><Heading title="登录控制台" description="使用演示账号查看模型接入和请求费用。" />
-    <label>邮箱<input type="email" name="email" autoComplete="username" placeholder="demo@example.test" required /></label>
+    <span className="badge">OpenToken</span><Heading title="登录控制台" description="使用受邀账号查看模型接入和请求费用。" />
+    <label>邮箱<input type="email" name="email" autoComplete="username" required /></label>
     <label>密码<input type="password" name="password" autoComplete="current-password" required /></label>
     <ErrorNote error={error} /><button className="primary" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
   </form></main>;
@@ -128,11 +127,11 @@ export function Dashboard() {
 
 export function Pricing() {
   const {data,error,refresh} = useData<{rates:Rate[]}>('/api/catalog');
-  return <><Heading title="模型价格" description="当前演示分组的费率。单价按每百万 Token 计。" />
+  return <><Heading title="模型价格" description="当前分组费率。单价按每百万 Token 计。" />
     <ErrorNote error={error} />{error && <button onClick={refresh}>重试</button>}
     {data ? <section className="panel table-wrap"><table><thead><tr>
       <th>模型</th><th>分组</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th>
-    </tr></thead><tbody>{data.rates.map(r => <tr key={r.groupId+r.model}><td><code>{r.model}</code></td><td>{r.groupName}</td>
+    </tr></thead><tbody>{data.rates.map(r => <tr key={r.groupId+r.model}><td><code>{r.model}</code> · {r.upstream==='mock'?'模拟':'OpenAI'}</td><td>{r.groupName}</td>
       <td>{money(r.inputMicros)}</td><td>{money(r.cacheMicros)}</td><td>{money(r.outputMicros)}</td><td>{r.multiplierBps/10000}×</td></tr>)}</tbody></table></section>
       : <Placeholder error={error} />}
   </>;
@@ -165,6 +164,7 @@ export function Keys() {
   const revokeDialog = useRef<HTMLDialogElement>(null);
   const revokeTrigger = useRef<HTMLButtonElement>(null);
   const [endpoint,setEndpoint] = useState('');
+  const groups = [...new Map(catalog.data?.rates.map(rate => [rate.groupId,rate])).values()];
   const clear = useCallback(() => {
     request.current?.abort();
     if (keyField.current) keyField.current.value = '';
@@ -259,7 +259,7 @@ export function Keys() {
     <section className="panel"><h2>接入地址</h2><p><code>{endpoint}</code></p>
       <button onClick={async () => {try { await navigator.clipboard.writeText(endpoint); setPageError(''); setNotice('已复制接入地址。'); }
         catch {setPageError('复制失败，可选中地址后手动复制。');}}}>复制接入地址</button>
-      <p className="muted">支持非流式文本调用，模型为 <code>mock-text</code>。</p>
+      <p className="muted">支持非流式文本调用。<code>mock-text</code> 用于演示，当前可用模型见 <a href="/pricing">模型价格</a>。</p>
       {!created && notice && <p role="status">{notice}</p>}
     </section>
     {keys.data ? <section className="panel table-wrap"><h2>密钥列表</h2>
@@ -275,7 +275,7 @@ export function Keys() {
       <form onSubmit={create} hidden={step!=='form'}>
         <p>完整密钥只在创建成功后显示一次。</p>
         <label>名称<input ref={nameField} name="name" required maxLength={80} placeholder="例如：本机测试" /></label>
-        <label>分组<select name="groupId" required>{catalog.data?.rates.map(rate =>
+        <label>分组<select name="groupId" required>{groups.map(rate =>
           <option key={rate.groupId} value={rate.groupId}>{rate.groupName}</option>)}</select></label>
         <p className="muted">更换分组需要新建密钥。</p>
         <label>累计额度（USD，可选）<input name="cap" inputMode="decimal" placeholder="留空时受钱包可用余额约束" /></label>
@@ -353,6 +353,7 @@ export function Usage() {
             row.status==='review'?'待确认':'结算中'}</strong>
         </summary>
         <p>请求编号 <code>{row.id}</code></p>
+        {row.upstreamRequestId && <p>上游请求编号 <code>{row.upstreamRequestId}</code></p>}
         <button onClick={async () => {
           try {await navigator.clipboard.writeText(row.id);setCopyNotice('已复制请求编号。');}
           catch {setCopyNotice('复制失败，可选中编号后手动复制。');}

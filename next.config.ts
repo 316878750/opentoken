@@ -1,0 +1,10 @@
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  serverExternalPackages: ['@electric-sql/pglite'],
+  poweredByHeader: false,
+  devIndicators: false,
+  agentRules: false,
+};
+
+export default config;

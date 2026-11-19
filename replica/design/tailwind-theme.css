@@ -1,0 +1,56 @@
+/* Import this file from the application global stylesheet. */
+@import "tailwindcss";
+@import "./tokens.css";
+
+@theme inline {
+  --color-bg: var(--zc-color-bg);
+  --color-surface: var(--zc-color-surface);
+  --color-border: var(--zc-color-border);
+  --color-border-input: var(--zc-color-border-input);
+  --color-text: var(--zc-color-text);
+  --color-muted: var(--zc-color-text-muted);
+  --color-accent: var(--zc-color-accent);
+  --color-accent-hover: var(--zc-color-accent-hover);
+  --color-on-accent: var(--zc-color-on-accent);
+  --color-danger: var(--zc-color-danger);
+  --color-danger-surface: var(--zc-color-danger-surface);
+  --color-success: var(--zc-color-success);
+  --color-success-surface: var(--zc-color-success-surface);
+  --color-warning: var(--zc-color-warning);
+  --color-warning-surface: var(--zc-color-warning-surface);
+  --color-focus: var(--zc-color-focus);
+  --color-chart: var(--zc-color-chart);
+  --font-sans: var(--zc-font-sans);
+  --font-mono: var(--zc-font-mono);
+  --radius-sm: var(--zc-radius-sm);
+  --radius-md: var(--zc-radius-md);
+  --radius-lg: var(--zc-radius-lg);
+  --radius-pill: var(--zc-radius-pill);
+  --shadow-card: var(--zc-shadow-card);
+  --shadow-pop: var(--zc-shadow-pop);
+  --text-xs: var(--zc-type-xs-size);
+  --text-xs--line-height: var(--zc-type-xs-line);
+  --text-xs--font-weight: var(--zc-type-xs-weight);
+  --text-sm: var(--zc-type-sm-size);
+  --text-sm--line-height: var(--zc-type-sm-line);
+  --text-sm--font-weight: var(--zc-type-sm-weight);
+  --text-base: var(--zc-type-base-size);
+  --text-base--line-height: var(--zc-type-base-line);
+  --text-base--font-weight: var(--zc-type-base-weight);
+  --text-lg: var(--zc-type-lg-size);
+  --text-lg--line-height: var(--zc-type-lg-line);
+  --text-lg--font-weight: var(--zc-type-lg-weight);
+  --text-xl: var(--zc-type-xl-size);
+  --text-xl--line-height: var(--zc-type-xl-line);
+  --text-xl--font-weight: var(--zc-type-xl-weight);
+  --text-display: var(--zc-type-display-size);
+  --text-display--line-height: var(--zc-type-display-line);
+  --text-display--font-weight: var(--zc-type-display-weight);
+  --breakpoint-sm: 40rem;
+  --breakpoint-lg: 64rem;
+  --container-content-max: var(--zc-layout-content-max);
+  --container-sidebar: var(--zc-layout-sidebar);
+  --container-header: var(--zc-layout-header);
+  --container-dialog-max: var(--zc-layout-dialog-max);
+  --spacing: var(--zc-space-4);
+}

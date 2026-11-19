@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>首发交互预览</title>
+<link rel="stylesheet" href="tokens.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--zc-color-bg); color: var(--zc-color-text); font: var(--zc-type-base-size)/var(--zc-type-base-line) var(--zc-font-sans); }
+  main { width: min(960px, 100% - 32px); margin: var(--zc-space-48) auto; }
+  h1 { font-size: var(--zc-type-xl-size); line-height: var(--zc-type-xl-line); margin: 0; }
+  h2 { font-size: var(--zc-type-lg-size); margin: 0 0 var(--zc-space-12); line-height: var(--zc-type-lg-line); }
+  p { margin: var(--zc-space-8) 0; }
+  .muted { color: var(--zc-color-text-muted); }
+  .panel { padding: var(--zc-space-24); margin-top: var(--zc-space-16); background: var(--zc-color-surface); border: 1px solid var(--zc-color-border); border-radius: var(--zc-radius-lg); box-shadow: var(--zc-shadow-card); }
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--zc-space-16); margin: var(--zc-space-12) 0; }
+  .metric { background: var(--zc-color-bg); border-radius: var(--zc-radius-md); padding: var(--zc-space-12); }
+  .metric dt { font-size: var(--zc-type-sm-size); color: var(--zc-color-text-muted); }
+  .metric dd { margin: 0; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .metric:first-child dd { font-size: var(--zc-type-lg-size); }
+  .actions { display: flex; gap: var(--zc-space-8); flex-wrap: wrap; align-items: center; }
+  button, input { font: inherit; min-height: 44px; border-radius: var(--zc-radius-sm); }
+  button { border: 1px solid var(--zc-color-border-input); background: var(--zc-color-surface); color: var(--zc-color-text); padding: var(--zc-space-8) var(--zc-space-12); cursor: pointer; }
+  button.primary, button[aria-pressed="true"] { background: var(--zc-color-accent); border-color: var(--zc-color-accent); color: var(--zc-color-on-accent); }
+  button.primary:hover, button[aria-pressed="true"]:hover { background: var(--zc-color-accent-hover); }
+  button:disabled { background: var(--zc-color-bg); border-color: var(--zc-color-border); color: var(--zc-color-text-muted); cursor: not-allowed; }
+  :focus-visible { outline: 2px solid var(--zc-color-focus); outline-offset: 2px; }
+  .status { display: inline-block; border-radius: var(--zc-radius-pill); padding: var(--zc-space-4) var(--zc-space-12); font-size: var(--zc-type-sm-size); background: var(--zc-color-bg); color: var(--zc-color-text-muted); }
+  .status[data-state="review"] { background: var(--zc-color-warning-surface); color: var(--zc-color-warning); }
+  .status[data-state="settled"] { background: var(--zc-color-success-surface); color: var(--zc-color-success); }
+  dialog { max-width: min(var(--zc-layout-dialog-max), 100% - 32px); padding: var(--zc-space-24); border: 1px solid var(--zc-color-border); border-radius: var(--zc-radius-lg); box-shadow: var(--zc-shadow-pop); color: var(--zc-color-text); background: var(--zc-color-surface); }
+  dialog::backdrop { background: rgb(26 20 39 / 55%); }
+  input[readonly] { width: 100%; border: 1px solid var(--zc-color-border-input); padding-inline: var(--zc-space-8); font-family: var(--zc-font-mono); background: var(--zc-color-surface); color: var(--zc-color-text); }
+  label[for="demo-key"] { display: block; margin-top: var(--zc-space-16); }
+  label.check { display: flex; align-items: center; gap: var(--zc-space-8); }
+  input[type="checkbox"] { min-height: auto; accent-color: var(--zc-color-accent); }
+  code { overflow-wrap: anywhere; font-family: var(--zc-font-mono); }
+  [hidden] { display: none !important; }
+  @media (max-width: 639px) { main { margin-block: var(--zc-space-24); } .panel { padding: var(--zc-space-16); } .grid { grid-template-columns: 1fr; gap: var(--zc-space-8); } }
+</style>
+<main>
+  <header>
+    <h1>首发交互预览</h1>
+    <p class="muted">以下为示例密钥、金额和请求，可切换状态查看界面变化。</p>
+  </header>
+  <section class="panel" aria-labelledby="key-title">
+    <h2 id="key-title">保存 API 密钥</h2>
+    <p>完整密钥只在创建成功后显示一次。</p>
+    <button class="primary" id="open-key">模拟创建成功</button>
+  </section>
+  <section class="panel" aria-labelledby="wallet-title">
+    <h2 id="wallet-title">余额</h2>
+    <dl class="grid">
+      <div class="metric"><dt>可用余额</dt><dd id="available">USD 8.00</dd></div>
+      <div class="metric"><dt>账面余额</dt><dd id="balance">USD 10.00</dd></div>
+      <div class="metric"><dt>预占金额</dt><dd id="held">USD 2.00</dd></div>
+    </dl>
+    <p id="wallet-note" class="muted">这笔额度暂留给处理中或待核对的请求。</p>
+  </section>
+  <section class="panel" aria-labelledby="bill-title">
+    <h2 id="bill-title">请求明细</h2>
+    <p><code>req_demo_042</code> <span class="status" id="request-state" data-state="review">待核对</span></p>
+    <p><strong>费用</strong> <span id="fee">待确认 · 已预留 USD 2.00</span></p>
+    <p id="bill-note" class="muted">这次请求的费用仍在核对，预留额度会在核对完成后更新。</p>
+    <div class="actions" aria-label="切换示例请求状态" role="group">
+      <button type="button" data-show="reserved" aria-pressed="false">处理中</button>
+      <button type="button" data-show="review" aria-pressed="true">待核对</button>
+      <button type="button" data-show="settled" aria-pressed="false">已结算</button>
+      <button type="button" data-show="released" aria-pressed="false">已释放</button>
+    </div>
+    <p id="state-feedback" role="status"></p>
+  </section>
+</main>
+<dialog id="key-dialog" aria-labelledby="dialog-title">
+  <h2 id="dialog-title" tabindex="-1">保存 API 密钥</h2>
+  <div id="key-details">
+    <p>离开后，完整密钥将无法再次查看。</p>
+    <label for="demo-key">示例密钥</label>
+    <input id="demo-key" readonly spellcheck="false" autocomplete="off">
+    <div class="actions">
+      <button id="copy-key">复制密钥</button>
+      <p id="copy-feedback" role="status"></p>
+    </div>
+    <label class="check"><input type="checkbox" id="saved"> 我已保存</label>
+    <div class="actions">
+      <button class="primary" id="finish" disabled>完成</button>
+      <button id="ask-close">关闭</button>
+    </div>
+  </div>
+  <div id="close-confirm" hidden>
+    <p>关闭后将无法再次查看这把密钥的完整值。</p>
+    <div class="actions">
+      <button class="primary" id="keep">继续保存</button>
+      <button id="hide-key">关闭并隐藏密钥</button>
+    </div>
+  </div>
+</dialog>
+<script>
+  const byId = id => document.getElementById(id);
+  const dialog = byId('key-dialog');
+  const key = byId('demo-key');
+  const saved = byId('saved');
+  const finish = byId('finish');
+  const title = byId('dialog-title');
+  const copyFeedback = byId('copy-feedback');
+  const details = byId('key-details');
+  const confirm = byId('close-confirm');
+  const openKey = byId('open-key');
+
+  function setConfirmation(visible) {
+    details.hidden = visible;
+    confirm.hidden = !visible;
+    title.textContent = visible ? '关闭密钥窗口？' : '保存 API 密钥';
+    (visible ? byId('keep') : title).focus();
+  }
+
+  function clearKey() {
+    key.value = '';
+    copyFeedback.textContent = '';
+    saved.checked = false;
+    finish.disabled = true;
+  }
+
+  function closeKey() {
+    clearKey();
+    dialog.close();
+  }
+
+  let demoNumber = 0;
+  openKey.addEventListener('click', () => {
+    demoNumber += 1;
+    key.value = 'demo_only_nonfunctional_key_' + demoNumber;
+    dialog.showModal();
+    setConfirmation(false);
+  });
+  saved.addEventListener('change', () => { finish.disabled = !saved.checked; });
+  finish.addEventListener('click', closeKey);
+  byId('ask-close').addEventListener('click', () => {
+    if (saved.checked) closeKey(); else setConfirmation(true);
+  });
+  byId('keep').addEventListener('click', () => setConfirmation(false));
+  byId('hide-key').addEventListener('click', closeKey);
+  dialog.addEventListener('cancel', event => {
+    event.preventDefault();
+    if (!confirm.hidden) setConfirmation(false);
+    else if (saved.checked) closeKey();
+    else setConfirmation(true);
+  });
+  dialog.addEventListener('close', () => { clearKey(); openKey.focus(); });
+  window.addEventListener('pagehide', () => { if (dialog.open) closeKey(); });
+  byId('copy-key').addEventListener('click', async () => {
+    const displayed = key.value;
+    try {
+      await navigator.clipboard.writeText(displayed);
+      if (dialog.open && key.value === displayed) copyFeedback.textContent = '已复制示例密钥';
+    } catch {
+      if (dialog.open && key.value === displayed) {
+        copyFeedback.textContent = '复制失败，已选中密钥，可手动复制。';
+        key.select();
+      }
+    }
+  });
+
+  const states = {
+    reserved: { label: '处理中', balance: '10.00', held: '2.00', available: '8.00', fee: '结算中 · 已预留 USD 2.00', note: '等待本次请求的用量。' },
+    review: { label: '待核对', balance: '10.00', held: '2.00', available: '8.00', fee: '待确认 · 已预留 USD 2.00', note: '这次请求的费用仍在核对，预留额度会在核对完成后更新。' },
+    settled: { label: '已结算', balance: '9.25', held: '0.00', available: '9.25', fee: '已扣 USD 0.75', note: '实际扣费已入账，未用的 USD 1.25 已释放。' },
+    released: { label: '已释放', balance: '10.00', held: '0.00', available: '10.00', fee: '无扣费', note: '本次预留的 USD 2.00 已全部释放。' }
+  };
+  const toggles = document.querySelectorAll('[data-show]');
+  for (const button of toggles) {
+    button.addEventListener('click', () => {
+      const state = states[button.dataset.show];
+      for (const toggle of toggles) toggle.setAttribute('aria-pressed', String(toggle === button));
+      for (const field of ['balance', 'held', 'available']) byId(field).textContent = 'USD ' + state[field];
+      byId('request-state').textContent = state.label;
+      byId('request-state').dataset.state = button.dataset.show;
+      byId('fee').textContent = state.fee;
+      byId('bill-note').textContent = state.note;
+      byId('wallet-note').textContent = state.held === '0.00' ? '当前没有预留额度。' : '这笔额度暂留给处理中或待核对的请求。';
+      byId('state-feedback').textContent = state.label + '，可用余额 USD ' + state.available;
+    });
+  }
+</script>
+</html>

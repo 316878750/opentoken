@@ -1,0 +1,71 @@
+/* CSS variables mirror tokens.json. */
+:root {
+  --zc-color-bg: #F6F5FA;
+  --zc-color-surface: #FFFFFF;
+  --zc-color-border: #DDD9E6;
+  --zc-color-border-input: #777183;
+  --zc-color-text: #211B2C;
+  --zc-color-text-muted: #585166;
+  --zc-color-accent: #503682;
+  --zc-color-accent-hover: #41296E;
+  --zc-color-on-accent: #FFFFFF;
+  --zc-color-danger: #962E44;
+  --zc-color-danger-surface: #FBEFF2;
+  --zc-color-success: #17634E;
+  --zc-color-success-surface: #E7F7EF;
+  --zc-color-warning: #6E460D;
+  --zc-color-warning-surface: #FFF2D6;
+  --zc-color-focus: #62429A;
+  --zc-color-chart: #60458F;
+  --zc-font-sans: system-ui, 'Microsoft YaHei UI', 'PingFang SC', sans-serif;
+  --zc-font-mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --zc-radius-sm: 6px;
+  --zc-radius-md: 10px;
+  --zc-radius-lg: 16px;
+  --zc-radius-pill: 999px;
+  --zc-shadow-card: 0 1px 2px rgb(33 27 44 / 8%);
+  --zc-shadow-pop: 0 16px 48px rgb(33 27 44 / 20%);
+  --zc-motion-fast: 120ms;
+  --zc-motion-base: 200ms;
+  --zc-motion-ease: ease-out;
+  --zc-layout-content-max: 1184px;
+  --zc-layout-sidebar: 224px;
+  --zc-layout-header: 64px;
+  --zc-layout-dialog-max: 480px;
+  --zc-breakpoint-sm: 640px;
+  --zc-breakpoint-lg: 1024px;
+  --zc-space-0: 0px;
+  --zc-space-4: 4px;
+  --zc-space-8: 8px;
+  --zc-space-12: 12px;
+  --zc-space-16: 16px;
+  --zc-space-24: 24px;
+  --zc-space-32: 32px;
+  --zc-space-48: 48px;
+  --zc-space-64: 64px;
+  --zc-type-xs-size: 12px;
+  --zc-type-xs-line: 16px;
+  --zc-type-xs-weight: 500;
+  --zc-type-sm-size: 14px;
+  --zc-type-sm-line: 22px;
+  --zc-type-sm-weight: 400;
+  --zc-type-base-size: 16px;
+  --zc-type-base-line: 24px;
+  --zc-type-base-weight: 400;
+  --zc-type-lg-size: 20px;
+  --zc-type-lg-line: 28px;
+  --zc-type-lg-weight: 650;
+  --zc-type-xl-size: 28px;
+  --zc-type-xl-line: 36px;
+  --zc-type-xl-weight: 700;
+  --zc-type-display-size: 40px;
+  --zc-type-display-line: 48px;
+  --zc-type-display-weight: 700;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --zc-motion-fast: 0ms;
+    --zc-motion-base: 0ms;
+  }
+}

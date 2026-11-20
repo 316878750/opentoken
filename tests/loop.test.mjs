@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
@@ -7,11 +8,14 @@ import test from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
 import { check,migrate,seed } from '../scripts/database.mjs';
+import { redeemCommand } from '../scripts/redeem.mjs';
 import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
 
 const primary = '30000000-0000-4000-8000-000000000001';
 const secondary = '30000000-0000-4000-8000-000000000002';
-const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary]]);
+const trial = '30000000-0000-4000-8000-000000000003';
+const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial]]);
+const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
   COMPATIBLE_API_KEY:'fixture-key',OPENAI_MODEL:'vendor/text-model',OPENAI_RESPONSE_MODEL:'',
@@ -68,9 +72,23 @@ test.before(async () => {
   await migrate(admin);
   await seed(admin,'pilot-a@example.test',resolveLiveUpstream(upstreamEnv));
   await seed(admin,'pilot-a@example.test',resolveLiveUpstream(upstreamEnv));
+  const expiry = new Date(Date.now()+3_600_000).toISOString();
+  for (const type of ['contest','funding','voided']) {
+    const issued = await redeemCommand(admin,['issue','3.00',expiry]);
+    assert.match(issued.code,/^otc_[A-Za-z0-9_-]{32}$/);
+    assert.equal(issued.amountMicros,'3000000');
+    trialCodes[type] = issued.code;
+    if (type==='voided') assert.equal((await redeemCommand(admin,['void',issued.id])).id,issued.id);
+  }
+  await database.query(`INSERT INTO gateway.redeem_codes (secret_digest,amount_micros,created_at,expires_at)
+    VALUES ($1,3000000,now()-interval '2 days',now()-interval '1 day')`,
+  [createHash('sha256').update(trialCodes.expired).digest()]);
   await database.exec('SET ROLE opentoken_app');
   await check(admin);
   await assert.rejects(database.query('UPDATE gateway.wallet_entries SET delta_micros=0'),{code:'42501'});
+  await assert.rejects(database.query(`INSERT INTO gateway.wallet_entries (user_id,redeem_code_id,kind,delta_micros)
+    VALUES ($1,gen_random_uuid(),'redemption',100)`,[primary]),{code:'42501'});
+  await assert.rejects(database.query('SELECT * FROM gateway.redeem_codes'),{code:'42501'});
   await assert.rejects(database.query('SELECT * FROM auth.users'),{code:'42501'});
   socket = new PGLiteSocketServer({db:database,host:'127.0.0.1',port:0,maxConnections:5});
   await socket.start();
@@ -223,4 +241,117 @@ test('compatible upstream settles one debit, releases the remainder and handles 
   assert.match(logout.headers.get('set-cookie'),/Max-Age=0/i);
   cookie = undefined;
   assert.equal((await request('/api/keys')).status,401);
+});
+
+test('concurrent requests on separate keys cannot over-reserve a shared wallet', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  cookie = login.headers.get('set-cookie').split(';')[0];
+  const {data:{rates}} = await request('/api/catalog');
+  const groupId = rates.find(rate=>rate.model==='mock-text').groupId;
+  const {data:before} = await request('/api/dashboard');
+  const reserved = 2_000_000n;
+  const admitted = Number(BigInt(before.availableMicros)/reserved);
+  assert.ok(admitted>0 && admitted<6,'Fixture must have a small, positive wallet balance');
+  const keys = await Promise.all(Array.from({length:admitted+1},(_,i)=>request('/api/keys',{
+    method:'POST',body:{name:'concurrent wallet '+i,groupId,rpm:10},
+  })));
+  assert.ok(keys.every(key=>key.status===201));
+  const calls = keys.map(key=>request('/v1/chat/completions',{method:'POST',token:key.data.secret,session:false,
+    body:{model:'mock-text',messages:[{role:'user',content:'Concurrent wallet test'}],max_completion_tokens:128}}));
+  const results = await Promise.all(calls);
+  assert.equal(results.filter(call=>call.status===200).length,admitted);
+  const denied = results.filter(call=>call.status===402);
+  assert.equal(denied.length,1);
+  assert.equal(denied[0].data.error.code,'insufficient_balance');
+  const {data:after} = await request('/api/dashboard');
+  assert.equal(after.heldMicros,before.heldMicros);
+  assert.equal(BigInt(before.balanceMicros)-BigInt(after.balanceMicros),BigInt(admitted)*750_000n);
+});
+
+test('a late authoritative response settles a request moved to review by the scanner', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  cookie = login.headers.get('set-cookie').split(';')[0];
+  const {data:{rates}} = await request('/api/catalog');
+  const groupId = rates.find(rate=>rate.model==='mock-text').groupId;
+  const {data:key} = await request('/api/keys',{method:'POST',body:{name:'delayed response',groupId,rpm:10}});
+  const pending = request('/v1/chat/completions',{method:'POST',token:key.secret,session:false,
+    body:{model:'mock-text',messages:[{role:'user',content:'Delayed reply'}],max_completion_tokens:128}});
+  let dispatched;
+  for(let attempt=0;attempt<40&&!dispatched;attempt++){
+    const {data} = await request('/api/usage?key_id='+key.id);
+    dispatched = data.items.find(row=>row.status==='dispatched');
+    if(!dispatched)await sleep(60);
+  }
+  assert.ok(dispatched);
+  await database.query(`UPDATE gateway.usage_requests SET status='review',terminal_reason='dispatch_interrupted'
+    WHERE id=$1 AND status='dispatched'`,[dispatched.id]);
+  assert.equal((await pending).status,200);
+  const {data:{items:[row]}} = await request('/api/usage?request_id='+dispatched.id);
+  assert.equal(row.status,'settled');
+  assert.equal(row.ledgerDeltaMicros,'-750000');
+});
+
+test('only one account can redeem a code and the winner can replay its original receipt', async () => {
+  const sessions = await Promise.all(['pilot-a@example.test','pilot-b@example.test'].map(async email => {
+    const result = await request('/api/session/login',loginPayload(email));
+    assert.equal(result.status,200);
+    return result.headers.get('set-cookie').split(';')[0];
+  }));
+  const useCode = (code,sessionOverride) => request('/api/redeem',{method:'POST',body:{code},sessionOverride});
+  assert.equal((await request('/api/redeem',{method:'POST',body:{code:trialCodes.contest},session:false})).status,401);
+  const starts = await Promise.all(sessions.map(sessionOverride=>request('/api/dashboard',{sessionOverride})));
+  const results = await Promise.all(sessions.map(session=>useCode(trialCodes.contest,session)));
+  assert.deepEqual(results.map(r=>r.status).sort(),[200,404]);
+  const winner = results.findIndex(r=>r.status===200);
+  const loser = 1-winner;
+  const receipt = results[winner].data;
+  assert.equal(receipt.receipt.amountMicros,'3000000');
+  assert.equal(receipt.replayed,false);
+  assert.equal(BigInt(receipt.wallet.balanceMicros)-BigInt(starts[winner].data.balanceMicros),3_000_000n);
+  assert.equal(receipt.wallet.heldMicros,starts[winner].data.heldMicros);
+  const replay = await useCode(trialCodes.contest,sessions[winner]);
+  assert.deepEqual(replay.data,{...receipt,replayed:true});
+  const activities = await Promise.all(sessions.map(sessionOverride=>request('/api/wallet/entries?kind=redemption',{sessionOverride})));
+  assert.equal(activities[winner].data.items.filter(item=>item.id===receipt.receipt.id).length,1);
+  assert.ok(activities[loser].data.items.every(item=>item.id!==receipt.receipt.id));
+  assert.ok(!JSON.stringify(activities).includes(trialCodes.contest));
+  assert.equal((await request('/api/dashboard',{sessionOverride:sessions[loser]})).data.balanceMicros,starts[loser].data.balanceMicros);
+  for (const code of [trialCodes.expired,trialCodes.voided,'invalid',trialCodes.expired]) {
+    const failed = await useCode(code,sessions[loser]);
+    assert.equal(failed.status,404);
+    assert.deepEqual(failed.data,results[loser].data);
+  }
+  const limited = await useCode(trialCodes.expired,sessions[loser]);
+  assert.equal(limited.status,429);
+  assert.ok(Number(limited.headers.get('retry-after'))>0);
+});
+
+test('a user with an empty wallet can redeem credit, call the mock model and reconcile the ledger', async () => {
+  assert.equal((await fetch(base+'/redeem',{redirect:'manual'})).headers.get('location'),'/login?redirect=/redeem');
+  const login = await request('/api/session/login',loginPayload('pilot-c@example.test'));
+  assert.equal(login.status,200);
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const page=await fetch(base+'/redeem',{headers:{Cookie:sessionOverride}});
+  assert.equal(page.status,200);
+  assert.match(await page.text(),/兑换额度/);
+  const {data:before} = await request('/api/dashboard',{sessionOverride});
+  assert.equal(before.balanceMicros,'0');
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const groupId=rates.find(rate=>rate.model==='mock-text').groupId;
+  const key = await request('/api/keys',{method:'POST',sessionOverride,body:{name:'funded trial',groupId,rpm:10}});
+  const call = () => request('/v1/chat/completions',{method:'POST',session:false,token:key.data.secret,
+    body:{model:'mock-text',messages:[{role:'user',content:'Trial credit fixture'}],max_completion_tokens:128,stream:false}});
+  assert.equal((await call()).status,402);
+  const credit = await request('/api/redeem',{method:'POST',sessionOverride,body:{code:trialCodes.funding}});
+  assert.equal(credit.status,200);
+  assert.equal(credit.data.wallet.availableMicros,'3000000');
+  const result=await call();
+  assert.equal(result.status,200);
+  const {data:after} = await request('/api/dashboard',{sessionOverride});
+  assert.equal(after.balanceMicros,'2250000');
+  assert.equal(after.heldMicros,'0');
+  const {data:{items}} = await request('/api/wallet/entries',{sessionOverride});
+  assert.deepEqual(items.map(row=>[row.kind,row.deltaMicros]),[['usage','-750000'],['redemption','3000000']]);
+  assert.equal(items[0].requestId,result.headers.get('x-request-id'));
+  assert.equal(items[1].id,credit.data.receipt.id);
 });

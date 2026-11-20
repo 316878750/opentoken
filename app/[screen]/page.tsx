@@ -1,10 +1,10 @@
 import { cookies } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
 import { sessionCookie, sessionUser } from '@/lib/session';
-import { Dashboard, Keys, Login, Pricing, Usage } from '../console';
+import { Dashboard, Keys, Login, Pricing, Redeem, Usage } from '../console';
 
-const screens = ['dashboard','pricing','keys','usage'] as const;
-const labels = ['概览','模型价格','API 密钥','使用记录'];
+const screens = ['dashboard','pricing','keys','usage','redeem'] as const;
+const labels = ['概览','模型价格','API 密钥','使用记录','兑换与流水'];
 
 export default async function Screen({ params }: { params:Promise<{screen:string}> }) {
   const { screen } = await params;
@@ -27,6 +27,7 @@ export default async function Screen({ params }: { params:Promise<{screen:string
         {screen==='keys' && <Keys />}
         {screen==='pricing' && <Pricing />}
         {screen==='usage' && <Usage />}
+        {screen==='redeem' && <Redeem />}
       </div>
     </main>
   </div>;

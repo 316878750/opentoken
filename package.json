@@ -13,6 +13,8 @@
     "db:seed": "node --env-file-if-exists=.env.local scripts/database.mjs seed",
     "db:check": "node --env-file-if-exists=.env.local scripts/database.mjs check",
     "db:review-stale": "node --env-file-if-exists=.env.local scripts/database.mjs review-stale",
+    "db:billing": "node --env-file-if-exists=.env.local scripts/database.mjs billing",
+    "db:redeem": "node --env-file-if-exists=.env.local scripts/database.mjs redeem",
     "verify:live": "node --env-file-if-exists=.env.local scripts/verify-live.mjs"
   },
   "dependencies": {

@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Client } from 'pg';
 import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
+import { billingCommand, scanBilling } from './billing.mjs';
+import { redeemCommand } from './redeem.mjs';
 
 function connection(name) {
   const value = process.env[name];
@@ -46,12 +48,21 @@ export async function migrate(client) {
       WHERE rolname='opentoken_app' AND rolcanlogin AND NOT rolsuper AND NOT rolcreaterole
         AND NOT rolcreatedb AND NOT rolinherit AND NOT rolbypassrls`);
     if (!rowCount) throw new Error('Create a restricted opentoken_app login role before migrating');
+    for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
+      ['004','004-trial-redemption.sql']]) {
+      if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
+      const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
+      await client.query(source);
+      await client.query('INSERT INTO gateway.schema_migrations(version) VALUES ($1)',[version]);
+    }
     await client.query(`
       REVOKE ALL ON SCHEMA gateway FROM PUBLIC;
       GRANT USAGE ON SCHEMA gateway TO opentoken_app;
       GRANT SELECT ON gateway.pricing_groups,gateway.models,gateway.model_rates TO opentoken_app;
       GRANT SELECT,INSERT,UPDATE ON gateway.wallets,gateway.api_keys,gateway.usage_requests TO opentoken_app;
-      GRANT SELECT,INSERT ON gateway.wallet_entries TO opentoken_app;
+      REVOKE INSERT ON gateway.wallet_entries FROM opentoken_app;
+      GRANT SELECT ON gateway.wallet_entries TO opentoken_app;
+      GRANT INSERT (user_id,request_id,kind,delta_micros) ON gateway.wallet_entries TO opentoken_app;
     `);
   });
 }
@@ -112,9 +123,20 @@ export async function check(client) {
     has_table_privilege(current_user,'gateway.wallets','SELECT') AS wallet_read,
     has_table_privilege(current_user,'gateway.wallets','INSERT') AS wallet_insert,
     has_table_privilege(current_user,'gateway.wallets','UPDATE') AS wallet_update,
-    has_table_privilege(current_user,'gateway.wallet_entries','INSERT') AS entry_insert,
+    (has_column_privilege(current_user,'gateway.wallet_entries','user_id','INSERT')
+      AND has_column_privilege(current_user,'gateway.wallet_entries','request_id','INSERT')
+      AND has_column_privilege(current_user,'gateway.wallet_entries','kind','INSERT')
+      AND has_column_privilege(current_user,'gateway.wallet_entries','delta_micros','INSERT')) AS entry_insert,
+    NOT has_column_privilege(current_user,'gateway.wallet_entries','redeem_code_id','INSERT') AS redemption_insert_private,
     NOT has_table_privilege(current_user,'gateway.wallet_entries','UPDATE,DELETE,TRUNCATE') AS entry_immutable,
     NOT has_table_privilege(current_user,'gateway.model_rates','INSERT,UPDATE,DELETE,TRUNCATE') AS rates_immutable,
+    NOT has_table_privilege(current_user,'gateway.billing_resolutions','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS resolutions_private,
+    NOT has_table_privilege(current_user,'gateway.billing_alerts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS alerts_private,
+    NOT has_function_privilege(current_user,'gateway.resolve_billing_request(uuid,text,text,text,integer,integer,integer)','EXECUTE') AS resolve_private,
+    NOT has_function_privilege(current_user,'gateway.run_billing_maintenance()','EXECUTE') AS maintenance_private,
+    has_function_privilege(current_user,'gateway.redeem_trial_credit(uuid,bytea)','EXECUTE') AS redemption_execute,
+    NOT has_table_privilege(current_user,'gateway.redeem_codes','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_codes_private,
+    NOT has_table_privilege(current_user,'gateway.redeem_attempts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_attempts_private,
     NOT coalesce((SELECT has_table_privilege(current_user,c.oid,'SELECT')
       FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
       WHERE n.nspname='auth' AND c.relname='users'),true) AS auth_private`);
@@ -124,25 +146,27 @@ export async function check(client) {
 }
 
 async function main() {
-  const action = process.argv[2];
-  if (!['migrate','seed','check','review-stale'].includes(action)) throw new Error('Expected migrate, seed, check, or review-stale');
+  const [, , action, ...args] = process.argv;
+  if (!['migrate','seed','check','review-stale','billing','redeem'].includes(action)) throw new Error('Expected migrate, seed, check, review-stale, billing, or redeem');
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migration 001 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–004 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');
     }
     if (action==='check') { await check(client); console.log('PostgreSQL role and table access checks passed.'); }
-    if (action==='review-stale') {
-      const { rowCount } = await client.query(`UPDATE gateway.usage_requests SET status='review',terminal_reason='dispatch_interrupted',updated_at=now()
-        WHERE status IN ('dispatched','reserved') AND updated_at<now()-interval '2 minutes'`);
-      console.log('Requests moved to review:',rowCount);
-    }
+    if (action==='review-stale') console.log(JSON.stringify(await scanBilling(client)));
+    if (action==='billing') console.log(JSON.stringify(await billingCommand(client,args),null,2));
+    if (action==='redeem') console.log(JSON.stringify(await redeemCommand(client,args),null,2));
   } finally { await client.end(); }
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href===import.meta.url) {
-  main().catch(error => { console.error('Database command failed:',error.code ? 'SQLSTATE '+error.code : error.message); process.exitCode=1; });
+  main().catch(error => {
+    const message = error.code && error.code !== 'P0001' ? 'SQLSTATE '+error.code : error.message;
+    console.error('Database command failed:',message);
+    process.exitCode=1;
+  });
 }

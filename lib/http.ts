@@ -4,6 +4,7 @@ import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, updateKey } from './gateway';
 import { dashboard, usage } from './reports';
 import { appOrigin, endSession, loginSession, sessionCookie, sessionUser, setSession } from './session';
+import { redeemCredit, walletEntries } from './wallet';
 
 const date = z.iso.datetime({ offset:true });
 const usageFilter = z.object({
@@ -15,6 +16,8 @@ const keyInput = z.object({
   name:z.string().trim().min(1).max(80), groupId:z.uuid(), rpm:z.int().min(1).max(600),
   capMicros:z.string().regex(/^[1-9]\d{0,14}$/).nullish(),
 });
+const ledgerFilter = z.object({kind:z.enum(['redemption','usage']).optional(),cursor:z.uuid().optional()});
+const redemptionInput = z.strictObject({code:z.string().trim().min(1).max(128)});
 const callInput = z.strictObject({
   model:z.string().min(1).max(64), stream:z.literal(false).default(false),
   messages:z.array(z.strictObject({ role:z.enum(['system','user','assistant']), content:z.string().min(1).max(3000) })).min(1).max(12),
@@ -96,6 +99,21 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route === 'POST /api/redeem') {
+      const {code} = parse(redemptionInput,await body(req));
+      const result = await redeemCredit(user,code);
+      if (result.status==='ok') return json({receipt:result.receipt,wallet:result.wallet,replayed:result.replayed});
+      if (result.status==='rate_limited') {
+        const response = json({error:{code:'redeem_rate_limit',message:'尝试次数过多，请稍后再试。'}},429);
+        response.headers.set('Retry-After',String(result.retryAfter));
+        return response;
+      }
+      if (result.status==='balance_limit') throw new Fault(409,'balance_limit','本次补额会超出钱包余额上限。');
+      throw new Fault(404,'redeem_unavailable','兑换码不可用，请检查输入或联系试点运营。');
+    }
+    if (route === 'GET /api/wallet/entries') {
+      return json(await walletEntries(user,parse(ledgerFilter,Object.fromEntries(req.nextUrl.searchParams))));
+    }
     if (route === 'GET /api/catalog') return json({rates:await catalog()});
     if (route === 'GET /api/keys') return json({items:await listKeys(user)});
     if (route === 'POST /api/keys') {

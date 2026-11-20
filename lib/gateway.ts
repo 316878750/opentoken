@@ -125,8 +125,8 @@ export async function complete(header: string | null, body: CompletionInput, ret
       WHERE key_id=$1 AND created_at>=now()-interval '60 seconds'`, [key.id]);
     if (recent.count >= lockedKey.rpm_limit) throw new Fault(429,'rate_limit','已达到该密钥每分钟请求上限。');
     const { rows:[entry] } = await tx.query<{id:string}>(`INSERT INTO gateway.usage_requests
-      (user_id,key_id,group_id,model_id,rate_id,upstream_model_snapshot,idempotency_key,request_fingerprint,reserved_micros,status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,'dispatched') RETURNING id`,
+      (user_id,key_id,group_id,model_id,rate_id,upstream_model_snapshot,idempotency_key,request_fingerprint,reserved_micros,status,updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,'dispatched',clock_timestamp()) RETURNING id`,
       [key.user_id,key.id,key.group_id,quote.model_id,quote.rate_id,quote.upstream_model,retry,fingerprint,reserve.toString()]);
     await tx.query('UPDATE gateway.wallets SET held_micros=held_micros+$2,updated_at=now() WHERE user_id=$1',[key.user_id,reserve.toString()]);
     await tx.query('UPDATE gateway.api_keys SET held_micros=held_micros+$2,updated_at=now() WHERE id=$1',[key.id,reserve.toString()]);
@@ -136,7 +136,8 @@ export async function complete(header: string | null, body: CompletionInput, ret
   async function markReview(providerId: string | null, reason: string) {
     try {
       await db.query(`UPDATE gateway.usage_requests SET status='review',terminal_reason=$2,
-        upstream_request_id=$3,updated_at=now() WHERE id=$1 AND status='dispatched'`,[id,reason,providerId]);
+        upstream_request_id=coalesce($3,upstream_request_id),updated_at=clock_timestamp()
+        WHERE id=$1 AND (status='dispatched' OR (status='review' AND terminal_reason='dispatch_interrupted'))`,[id,reason,providerId]);
     } catch { console.error('Unable to record pending reconciliation',id); }
   }
 
@@ -145,7 +146,9 @@ export async function complete(header: string | null, body: CompletionInput, ret
       await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[key.user_id]);
       await tx.query('SELECT 1 FROM gateway.api_keys WHERE id=$1 FOR UPDATE',[key.id]);
       const { rowCount } = await tx.query(`UPDATE gateway.usage_requests SET status='released',terminal_reason='upstream_rejected',
-        upstream_request_id=$2,finalized_at=now(),updated_at=now() WHERE id=$1 AND status='dispatched'`,[id,providerId]);
+        upstream_request_id=$2,finalized_at=now(),updated_at=now()
+        WHERE id=$1 AND (status='dispatched' OR (status='review' AND terminal_reason='dispatch_interrupted'))
+          AND NOT EXISTS (SELECT 1 FROM gateway.wallet_entries WHERE request_id=$1)`,[id,providerId]);
       if (!rowCount) throw new Error('Request was already resolved');
       await tx.query('UPDATE gateway.wallets SET held_micros=held_micros-$2,updated_at=now() WHERE user_id=$1',[key.user_id,hold.toString()]);
       await tx.query('UPDATE gateway.api_keys SET held_micros=held_micros-$2,updated_at=now() WHERE id=$1',[key.id,hold.toString()]);
@@ -179,11 +182,11 @@ export async function complete(header: string | null, body: CompletionInput, ret
     await transaction(async tx => {
       await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[key.user_id]);
       await tx.query('SELECT 1 FROM gateway.api_keys WHERE id=$1 FOR UPDATE',[key.id]);
-      const { rows:[pending] } = await tx.query<{status:string}>('SELECT status FROM gateway.usage_requests WHERE id=$1 FOR UPDATE',[id]);
-      if (pending.status !== 'dispatched') throw new Error('Request cannot be settled from its current status');
-      await tx.query(`UPDATE gateway.usage_requests SET status='settled',input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
-        standard_micros=$5,charged_micros=$6,duration_ms=$7,upstream_request_id=$8,finalized_at=now(),updated_at=now() WHERE id=$1`,
+      const { rowCount } = await tx.query(`UPDATE gateway.usage_requests SET status='settled',input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
+        standard_micros=$5,charged_micros=$6,duration_ms=$7,upstream_request_id=$8,terminal_reason=NULL,finalized_at=now(),updated_at=now()
+        WHERE id=$1 AND (status='dispatched' OR (status='review' AND terminal_reason='dispatch_interrupted'))`,
         [id,input,cached,output,standard.toString(),charged.toString(),Date.now()-started,result.requestId]);
+      if (!rowCount) throw new Error('Request cannot be settled from its current status');
       await tx.query("INSERT INTO gateway.wallet_entries (user_id,request_id,kind,delta_micros) VALUES ($1,$2,'usage',$3)",
         [key.user_id,id,(-charged).toString()]);
       await tx.query('UPDATE gateway.wallets SET balance_micros=balance_micros-$2,held_micros=held_micros-$3,updated_at=now() WHERE user_id=$1',

@@ -10,6 +10,10 @@ type Wallet = {balanceMicros:string;heldMicros:string;availableMicros:string;asO
   requests:number;todayRequests:number;tokens:string;todayTokens:string;chargedMicros:string;standardMicros:string;
   todayChargedMicros:string;reviewCount:number};
 type UsagePage = {items:RequestRow[];nextCursor:string|null};
+type WalletEntry = {id:string;kind:'redemption'|'usage';deltaMicros:string;requestId:string|null;createdAt:string};
+type WalletPage = {items:WalletEntry[];nextCursor:string|null};
+type CreditReceipt = {receipt:{id:string;amountMicros:string;createdAt:string};replayed:boolean;
+  wallet:Pick<Wallet,'balanceMicros'|'heldMicros'|'availableMicros'>};
 
 class ApiError extends Error {
   constructor(public status:number, message:string, public requestId?:string) { super(message); }
@@ -33,15 +37,17 @@ function useData<T>(url:string, interval = 0) {
   const [snapshot,setSnapshot] = useState<{url:string;data:T}>();
   const [error,setError] = useState('');
   const [reload,refresh] = useState(0);
+  const revision = useRef(0);
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     async function load() {
+      const current = revision.current;
       try {
         const data = await api<T>(url,{signal:AbortSignal.timeout(12000)});
-        if (!stopped) { setSnapshot({url,data}); setError(''); }
+        if (!stopped && current===revision.current) { setSnapshot({url,data}); setError(''); }
       } catch {
-        if (!stopped) setError('数据暂未更新，请重试。');
+        if (!stopped && current===revision.current) setError('数据暂未更新，请重试。');
       } finally {
         if (!stopped && interval) timer = setTimeout(load,interval);
       }
@@ -49,7 +55,11 @@ function useData<T>(url:string, interval = 0) {
     void load();
     return () => { stopped = true; clearTimeout(timer); };
   },[url,interval,reload]);
-  return {data:snapshot?.url===url ? snapshot.data : undefined,error,refresh:() => refresh(n => n+1)};
+  return {data:snapshot?.url===url ? snapshot.data : undefined,error,refresh:() => refresh(n => n+1),
+    replaceAndRefresh:(data:T)=>{
+      revision.current++;
+      setSnapshot({url,data});setError('');refresh(n=>n+1);
+    }};
 }
 
 function money(micros: string | null) {
@@ -81,7 +91,7 @@ export function Login() {
     try {
       await api('/api/session/login',{method:'POST',body:JSON.stringify(Object.fromEntries(form)),signal:AbortSignal.timeout(22000)});
       const destination = new URLSearchParams(location.search).get('redirect');
-      location.replace(destination && ['/dashboard','/pricing','/keys','/usage'].includes(destination) ? destination : '/dashboard');
+      location.replace(destination && ['/dashboard','/pricing','/keys','/usage','/redeem'].includes(destination) ? destination : '/dashboard');
     } catch (error) {
       setError(error instanceof ApiError ? error.message : '登录请求暂时无法完成。');
       setBusy(false);
@@ -100,6 +110,7 @@ export function Dashboard() {
   const {data,error,refresh} = useData<Wallet>('/api/dashboard?tz='+encodeURIComponent(tz),1200);
   return <><Heading title="概览" description="核对可用额度、预占和已结算费用。" />
     <div className="actions"><a className="action primary" href="/keys">管理密钥</a><a className="action" href="/usage">查看使用记录</a>
+      <a className="action" href="/redeem">兑换额度</a>
       <button type="button" onClick={refresh}>刷新数据</button></div>
     <ErrorNote error={error} />
     {data ? <><section className="panel" aria-labelledby="wallet-title"><h2 id="wallet-title">余额</h2>
@@ -312,11 +323,12 @@ export function Keys() {
 }
 
 export function Usage() {
-  const [filter,setFilter] = useState({key_id:'',status:'',from:'',to:''});
+  const [filter,setFilter] = useState({key_id:'',request_id:'',status:'',from:'',to:''});
   const [cursors,setCursors] = useState<string[]>([]);
   const [copyNotice,setCopyNotice] = useState('');
   const query = new URLSearchParams();
   if (filter.key_id) query.set('key_id',filter.key_id);
+  if (filter.request_id) query.set('request_id',filter.request_id);
   if (filter.status) query.set('status',filter.status);
   if (filter.from) query.set('from',new Date(filter.from+'T00:00:00').toISOString());
   if (filter.to) {
@@ -328,12 +340,13 @@ export function Usage() {
   const records = useData<UsagePage>('/api/usage?'+query,1200);
   useEffect(() => {
     const initial = new URLSearchParams(location.search);
-    setFilter(f => ({...f,key_id:initial.get('key_id')||'',status:initial.get('status')||''}));
+    setFilter(f => ({...f,key_id:initial.get('key_id')||'',request_id:initial.get('request_id')||'',status:initial.get('status')||''}));
   },[]);
   function update(name:keyof typeof filter,value:string) {
     setFilter(f => ({...f,[name]:value}));setCursors([]);
   }
   return <><Heading title="使用记录" description="按密钥和日期核对单次请求的预占、费用及 Token。" />
+    {filter.request_id && <p className="muted">已定位请求 <code>{filter.request_id}</code></p>}
     <div className="filters">
       <label>密钥<select value={filter.key_id} onChange={e => update('key_id',e.target.value)}><option value="">全部密钥</option>
         {keys.data?.items.map(k => <option key={k.id} value={k.id}>{k.name} · {k.prefix}…</option>)}</select></label>
@@ -342,7 +355,7 @@ export function Usage() {
       <label>开始日期<input type="date" value={filter.from} max={filter.to||undefined} onChange={e => update('from',e.target.value)} /></label>
       <label>结束日期<input type="date" value={filter.to} min={filter.from||undefined} onChange={e => update('to',e.target.value)} /></label>
       <button onClick={records.refresh}>刷新</button>
-      <button onClick={() => {setFilter({key_id:'',status:'',from:'',to:''});setCursors([]);}}>清空筛选</button>
+      <button onClick={() => {setFilter({key_id:'',request_id:'',status:'',from:'',to:''});setCursors([]);}}>清空筛选</button>
     </div>
     <ErrorNote error={records.error || keys.error} />
     {records.data ? <section className="panel"><h2>请求明细</h2>
@@ -369,5 +382,87 @@ export function Usage() {
       <div className="actions"><button disabled={!cursors.length} onClick={() => setCursors(cursors.slice(0,-1))}>上一页</button>
         <button disabled={!records.data.nextCursor} onClick={() => setCursors([...cursors,records.data!.nextCursor!])}>下一页</button></div>
     </section> : <Placeholder error={records.error} />}
+  </>;
+}
+
+export function Redeem() {
+  const wallet = useData<CreditReceipt['wallet']>('/api/dashboard');
+  const field = useRef<HTMLInputElement>(null);
+  const [code,setCode] = useState('');
+  const [receipt,setReceipt] = useState<CreditReceipt>();
+  const [feedback,setFeedback] = useState('');
+  const [busy,setBusy] = useState(false);
+  const [kind,setKind] = useState('');
+  const [cursors,setCursors] = useState<string[]>([]);
+  const query = new URLSearchParams();
+  if (kind) query.set('kind',kind);
+  if (cursors.length) query.set('cursor',cursors.at(-1)!);
+  const history = useData<WalletPage>('/api/wallet/entries?'+query);
+  const balances = wallet.data;
+
+  async function submit(event:FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || !code.trim()) return;
+    setBusy(true); setFeedback(''); setReceipt(undefined);
+    try {
+      const result = await api<CreditReceipt>('/api/redeem',{
+        method:'POST',body:JSON.stringify({code}),signal:AbortSignal.timeout(15000),
+      });
+      setReceipt(result); setCode(''); setKind(''); setCursors([]);
+      wallet.replaceAndRefresh(result.wallet); history.refresh();
+    } catch (error) {
+      setFeedback(error instanceof ApiError && error.status<500 ? error.message :
+        '提交结果暂未确认。可以用同一码重试，已到账的额度只会记一次。');
+    } finally {
+      setBusy(false);
+    }
+  }
+  useEffect(() => { if (feedback) field.current?.focus(); },[feedback]);
+
+  return <><Heading title="兑换与流水" description="兑换试点额度，核对到账和已结算扣费。" />
+    <section className="panel" aria-labelledby="redeem-balance"><h2 id="redeem-balance">余额</h2>
+      {balances ? <dl className="metrics">
+        <div><dt>可用余额</dt><dd>{money(balances.availableMicros)}</dd></div>
+        <div><dt>账面余额</dt><dd>{money(balances.balanceMicros)}</dd></div>
+        <div><dt>预占金额</dt><dd>{money(balances.heldMicros)}</dd></div>
+      </dl> : <p className="muted">{wallet.error ? '暂时无法读取余额。' : '正在读取余额…'}</p>}
+      <ErrorNote error={wallet.error} />
+      {wallet.error && <button onClick={wallet.refresh}>刷新余额</button>}
+    </section>
+    <section className="panel" aria-labelledby="redeem-title"><h2 id="redeem-title">兑换额度</h2>
+      <form onSubmit={submit} action="/api/redeem" method="post" aria-busy={busy}>
+        <div className="filters">
+          <label>兑换码<input ref={field} name="code" type="password" value={code}
+            autoComplete="off" autoCapitalize="none" spellCheck={false} required readOnly={busy} maxLength={128}
+            aria-invalid={feedback ? true : undefined} aria-describedby={feedback ? 'redeem-feedback' : undefined}
+            onChange={e=>{setCode(e.target.value);setFeedback('');}} /></label>
+          <button className="primary" disabled={busy || !code.trim()}>{busy ? '正在兑换…' : '兑换'}</button>
+        </div>
+      </form>
+      {feedback && <p className="error" id="redeem-feedback" role="alert">{feedback}</p>}
+      <div role="status">{receipt && <>
+        <p><strong>{receipt.replayed ? '该额度已到账' : '兑换成功'} · {money(receipt.receipt.amountMicros)}</strong></p>
+        <p>收据编号 <code>{receipt.receipt.id}</code></p>
+        <p className="muted">到账时间 {new Date(receipt.receipt.createdAt).toLocaleString('zh-CN')}</p>
+      </>}</div>
+    </section>
+    <section className="panel" aria-labelledby="wallet-history"><h2 id="wallet-history">钱包流水</h2>
+      <div className="filters"><label>流水类型<select value={kind} onChange={e=>{setKind(e.target.value);setCursors([]);}}>
+        <option value="">全部流水</option><option value="redemption">额度到账</option><option value="usage">模型扣费</option>
+      </select></label><button onClick={()=>{history.refresh();wallet.refresh();}}>刷新余额与流水</button></div>
+      <ErrorNote error={history.error} />
+      {history.data ? history.data.items.length ? <>
+        <div className="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>金额</th><th>编号</th></tr></thead>
+          <tbody>{history.data.items.map(item=><tr key={item.id}>
+            <td>{new Date(item.createdAt).toLocaleString('zh-CN')}</td>
+            <td>{item.kind==='redemption' ? '额度到账' : '模型扣费'}</td>
+            <td>{item.kind==='redemption' ? '+'+money(item.deltaMicros) : '−'+money(String(-BigInt(item.deltaMicros)))}</td>
+            <td>{item.requestId ? <a href={'/usage?request_id='+item.requestId}><code>{item.requestId}</code></a> : <code>{item.id}</code>}</td>
+          </tr>)}</tbody></table></div>
+        <div className="actions"><button disabled={!cursors.length} onClick={()=>setCursors(cursors.slice(0,-1))}>上一页</button>
+          <button disabled={!history.data.nextCursor} onClick={()=>setCursors([...cursors,history.data!.nextCursor!])}>下一页</button></div>
+      </> : <p>{kind ? '没有符合筛选条件的流水。' : '还没有钱包流水。兑换额度或完成模型调用后会在这里显示。'}</p>
+      : <p className="muted">{history.error ? '暂时无法读取流水。' : '正在读取流水…'}</p>}
+    </section>
   </>;
 }

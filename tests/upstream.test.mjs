@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { openAiCompletion, upstreamModel, UpstreamError } from '../lib/upstream.ts';
+import { openAiCompletion, openAiStream, upstreamModel, UpstreamError } from '../lib/upstream.ts';
 import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
 
 const request = { model:'openai-mini', messages:[{role:'user',content:'Reply with OK.'}], max_completion_tokens:16 };
@@ -12,6 +12,29 @@ const completion = {
 };
 const reply = (status, data) => new Response(JSON.stringify(data),{status,headers:{'x-request-id':'provider-test-id'}});
 const official = resolveLiveUpstream({ENABLE_OPENAI:'1',UPSTREAM_MODE:'official',OPENAI_API_KEY:'fixture-key'});
+
+test('official streaming is opt-in and redacts a credential split across deltas',async () => {
+  assert.equal(official.streaming,false);
+  const provider = resolveLiveUpstream({ENABLE_OPENAI:'1',UPSTREAM_MODE:'official',OPENAI_API_KEY:'fixture-key',
+    ENABLE_UPSTREAM_STREAMING:'1'});
+  assert.equal(provider.streaming,true);
+  const frame = (choices,usage=null) => 'data: '+JSON.stringify({id:'provider-completion',model:upstreamModel,
+    object:'chat.completion.chunk',choices,usage})+'\n\n';
+  const deltas = [];
+  const result = await openAiStream(request,provider,delta=>deltas.push(delta),async (url,options) => {
+    assert.equal(url,'https://api.openai.com/v1/chat/completions');
+    assert.equal(options.redirect,'error');
+    assert.deepEqual(JSON.parse(options.body).stream_options,{include_usage:true});
+    assert.equal(JSON.parse(options.body).store,false);
+    return new Response(frame([{index:0,delta:{content:'Echo: fix'},finish_reason:null}])+
+      frame([{index:0,delta:{content:'ture-key; OK'},finish_reason:'stop'}])+
+      frame([],completion.usage)+'data: [DONE]\n\n',
+      {headers:{'content-type':'text/event-stream','x-request-id':'fixture-key'}});
+  });
+  assert.equal(deltas.map(delta=>delta.content).join(''),'Echo: [redacted]; OK');
+  assert.equal(result.requestId,'provider-completion');
+  assert.deepEqual(result.tokens,{input:14,cached:4,output:2});
+});
 
 test('official adapter fixes the host/model, uses non-streaming and extracts billed tokens',async () => {
   let calls = 0;

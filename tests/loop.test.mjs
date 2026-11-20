@@ -18,6 +18,7 @@ const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.t
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
+  ENABLE_UPSTREAM_STREAMING:'1',
   COMPATIBLE_API_KEY:'fixture-key',OPENAI_MODEL:'vendor/text-model',OPENAI_RESPONSE_MODEL:'',
   UPSTREAM_INPUT_USD_PER_MTOK:'0.20',UPSTREAM_CACHED_USD_PER_MTOK:'0.04',UPSTREAM_OUTPUT_USD_PER_MTOK:'0.60',
   UPSTREAM_MAX_CONTEXT_TOKENS:'8192',UPSTREAM_MAX_TOKENS_FIELD:'max_tokens',
@@ -427,20 +428,93 @@ for (const disconnect of [false,true]) {
   });
 }
 
-test('rejects streaming for a non-enabled model before reserving any credit', async () => {
+test('compatible SSE settles from upstream usage and retries cannot charge twice', async () => {
   const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
   const sessionOverride = login.headers.get('set-cookie').split(';')[0];
   const {data:{rates}} = await request('/api/catalog',{sessionOverride});
   const rate = rates.find(item=>item.upstream==='compatible');
   const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
-    body:{name:'non-stream fixture',groupId:rate.groupId,rpm:10}});
+    body:{name:'provider SSE fixture',groupId:rate.groupId,rpm:20}});
   const {data:before} = await request('/api/dashboard',{sessionOverride});
-  const failed = await request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,
-    body:{model:rate.model,messages:[{role:'user',content:'Unsupported stream'}],max_completion_tokens:128,stream:true}});
-  assert.equal(failed.status,400);
-  assert.equal(failed.data.error.code,'stream_not_supported');
+  const body = {model:rate.model,messages:[{role:'user',content:'stream success'}],max_completion_tokens:16,
+    stream:true,stream_options:{include_usage:true}};
+  const retry = crypto.randomUUID();
+  const response = await fetch(base+'/v1/chat/completions',{method:'POST',headers:{
+    'content-type':'application/json',authorization:'Bearer '+key.secret,'idempotency-key':retry},body:JSON.stringify(body)});
+  assert.equal(response.status,200);
+  assert.match(response.headers.get('content-type'),/^text\/event-stream/);
+  const id = response.headers.get('x-request-id');
+  const {data:held} = await request('/api/dashboard',{sessionOverride});
+  assert.equal(BigInt(held.heldMicros)-BigInt(before.heldMicros),1648n);
+  const duplicate = await request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,retry,body});
+  assert.equal(duplicate.status,409);
+  assert.equal(duplicate.data.error.code,'duplicate_request');
+  const frames = (await response.text()).trim().split('\n\n').map(frame=>frame.slice(6));
+  assert.equal(frames.pop(),'[DONE]');
+  const chunks = frames.map(frame=>JSON.parse(frame));
+  assert.equal(chunks.flatMap(chunk=>chunk.choices.map(choice=>choice.delta.content ?? '')).join(''),'流式输出');
+  assert.ok(chunks.every(chunk=>chunk.id===id && chunk.model===rate.model));
+  assert.deepEqual(chunks.at(-1).usage,{prompt_tokens:14,completion_tokens:2,total_tokens:16,
+    prompt_tokens_details:{cached_tokens:4}});
+  const {data:{items:[settled]}} = await request('/api/usage?request_id='+id,{sessionOverride});
+  assert.equal(settled.status,'settled');
+  assert.equal(settled.upstreamRequestId,'fixture-provider-request');
+  assert.equal(settled.chargedMicros,'4');
+  assert.equal(settled.releasedMicros,'1644');
+  const {data:after} = await request('/api/dashboard',{sessionOverride});
+  assert.equal(after.heldMicros,before.heldMicros);
+  assert.equal(BigInt(before.balanceMicros)-BigInt(after.balanceMicros),4n);
+});
+
+test('compatible SSE keeps the hold in review when billing evidence is incomplete or exceeds its quote', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const rate = rates.find(item=>item.upstream==='compatible');
+  const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
+    body:{name:'provider SSE review fixture',groupId:rate.groupId,rpm:20}});
+  const {data:before} = await request('/api/dashboard',{sessionOverride});
+  for (const scenario of ['missing usage','interrupted stream','over budget','unsupported output','malformed terminator']) {
+    const response = await fetch(base+'/v1/chat/completions',{method:'POST',headers:{
+      'content-type':'application/json',authorization:'Bearer '+key.secret},
+      body:JSON.stringify({model:rate.model,messages:[{role:'user',content:scenario}],max_completion_tokens:16,stream:true})});
+    assert.equal(response.status,200);
+    const text = await response.text();
+    assert.match(text,/"code":"billing_review"/);
+    assert.ok(!text.includes('[DONE]'));
+    const {data:{items:[row]}} = await request('/api/usage?request_id='+response.headers.get('x-request-id'),{sessionOverride});
+    assert.equal(row.status,'review');
+    assert.equal(row.ledgerDeltaMicros,null);
+  }
   const {data:after} = await request('/api/dashboard',{sessionOverride});
   assert.equal(after.balanceMicros,before.balanceMicros);
-  assert.equal(after.heldMicros,before.heldMicros);
-  assert.equal((await request('/api/usage?key_id='+key.id,{sessionOverride})).data.items.length,0);
+  assert.equal(BigInt(after.heldMicros)-BigInt(before.heldMicros),8240n);
+});
+
+test('compatible SSE drains upstream after the client disconnects and settles once', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const rate = rates.find(item=>item.upstream==='compatible');
+  const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
+    body:{name:'disconnected provider',groupId:rate.groupId,rpm:10}});
+  const response = await fetch(base+'/v1/chat/completions',{method:'POST',headers:{
+    'content-type':'application/json',authorization:'Bearer '+key.secret},
+    body:JSON.stringify({model:rate.model,messages:[{role:'user',content:'client disconnect'}],max_completion_tokens:16,stream:true})});
+  assert.equal(response.status,200);
+  const id = response.headers.get('x-request-id');
+  const reader = response.body.getReader();
+  const {value} = await reader.read();
+  assert.match(new TextDecoder().decode(value),/"role":"assistant"/);
+  await reader.cancel();
+  let row;
+  for(let attempt=0;attempt<30;attempt++) {
+    const {data} = await request('/api/usage?request_id='+id,{sessionOverride});
+    row = data.items[0];
+    if (row.status==='settled') break;
+    await sleep(200);
+  }
+  assert.equal(row.status,'settled');
+  const {data:ledger} = await request('/api/wallet/entries',{sessionOverride});
+  assert.deepEqual(ledger.items.filter(entry=>entry.requestId===id).map(entry=>entry.deltaMicros),['-4']);
 });

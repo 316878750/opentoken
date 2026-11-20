@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { after } from 'next/server';
 import { digest, store, transaction } from './data';
-import { mockCompletion, mockModel, openAiCompletion, UpstreamError, type CompletionInput } from './upstream';
+import { mockCompletion, mockModel, openAiCompletion, openAiStream, UpstreamError, type CompletionInput, type TextDelta } from './upstream';
 import { resolveLiveUpstream } from './upstream-config.mjs';
 
 export class Fault extends Error {
@@ -111,7 +111,7 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
     if (!quote || body.max_completion_tokens > quote.max_output_tokens) {
       throw new Fault(400,'unsupported_model_or_limit','请选择可用模型，并将输出上限设为 1 至 128。');
     }
-    if (streaming && quote.model!==mockModel) {
+    if (streaming && quote.model!==mockModel && !live?.streaming) {
       throw new Fault(400,'stream_not_supported','当前模型只支持非流式调用。');
     }
     if (quote.model!==mockModel && live?.mode==='compatible' && (
@@ -143,7 +143,7 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
 async function finishCompletion(
   {key,db,live,started,id,rate,hold}: Awaited<ReturnType<typeof prepareCompletion>>,
   body: CompletionInput,
-  onText?: (content:string) => void,
+  onDelta?: (delta:TextDelta) => void,
 ) {
   async function markReview(providerId: string | null, reason: string) {
     try {
@@ -169,7 +169,11 @@ async function finishCompletion(
 
   let result: Awaited<ReturnType<typeof openAiCompletion>>;
   try {
-    result = rate.model===mockModel ? await mockCompletion(body,onText) : await openAiCompletion(body,live!);
+    if (rate.model===mockModel) {
+      result = await mockCompletion(body,onDelta && (content => onDelta({content})));
+    } else {
+      result = onDelta ? await openAiStream(body,live!,onDelta) : await openAiCompletion(body,live!);
+    }
   } catch (error) {
     const providerId = error instanceof UpstreamError ? error.requestId : null;
     if (error instanceof UpstreamError && error.disposition==='release') {
@@ -235,20 +239,20 @@ export async function streamCompletion(header:string|null,body:CompletionInput,r
         const payload = data==='[DONE]' ? data : JSON.stringify(data);
         controller.enqueue(encoder.encode('data: '+payload+'\n\n'));
       }
-      function sendChoice(delta: {role?:'assistant';content?:string}, finishReason: string|null = null) {
+      function sendChoice(delta: TextDelta & {role?:'assistant'}, finishReason: string|null = null) {
         send({...metadata,choices:[{index:0,delta,finish_reason:finishReason}],...(includeUsage ? {usage:null} : {})});
       }
       // Transport cancellation detaches the client while the gateway finishes accounting.
       after((async () => {
         try {
           sendChoice({role:'assistant'});
-          const result = await finishCompletion(prepared,body,content => sendChoice({content}));
+          const result = await finishCompletion(prepared,body,delta => sendChoice(delta));
           sendChoice({},result.choices[0].finish_reason);
           if (includeUsage) send({...metadata,choices:[],usage:result.usage});
           send('[DONE]');
         } catch (error) {
           send({error:{code:error instanceof Fault ? error.code : 'billing_review',
-            message:'费用待核对，请按请求编号查看记录。',request_id:id}});
+            message:error instanceof Fault ? error.message : '费用待核对，请按请求编号查看记录。',request_id:id}});
         } finally {
           if (!disconnected) controller.close();
         }

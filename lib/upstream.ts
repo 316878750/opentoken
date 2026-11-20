@@ -12,6 +12,8 @@ export type CompletionInput = {
   max_completion_tokens: number;
 };
 
+export type TextDelta = {content?:string;refusal?:string};
+
 type Completion = {
   tokens: { input: number; cached: number; output: number };
   choices: { index: number; message: { role: 'assistant'; content: string | null; refusal?: string | null }; finish_reason: string }[];
@@ -28,6 +30,14 @@ export class UpstreamError extends Error {
   }
 }
 
+const usageSchema = z.object({
+  prompt_tokens: z.int().nonnegative(),
+  completion_tokens: z.int().nonnegative(),
+  prompt_cache_hit_tokens: z.int().nonnegative().optional(),
+  prompt_cache_miss_tokens: z.int().nonnegative().optional(),
+  prompt_tokens_details: z.object({ cached_tokens: z.int().nonnegative().optional() }).nullish(),
+});
+
 const responseSchema = z.object({
   id: z.string().optional(),
   model: z.string(),
@@ -35,42 +45,36 @@ const responseSchema = z.object({
     index: z.int().nonnegative(), finish_reason: z.string(),
     message: z.object({ role:z.literal('assistant'), content:z.string().nullable(), refusal:z.string().nullish() }),
   })).length(1),
-  usage: z.object({
-    prompt_tokens: z.int().nonnegative(),
-    completion_tokens: z.int().nonnegative(),
-    prompt_cache_hit_tokens: z.int().nonnegative().optional(),
-    prompt_cache_miss_tokens: z.int().nonnegative().optional(),
-    prompt_tokens_details: z.object({ cached_tokens: z.int().nonnegative().optional() }).nullish(),
-  }),
+  usage: usageSchema,
 });
 
-export async function openAiCompletion(
-  input: CompletionInput, upstream: LiveUpstream, fetcher: typeof fetch = fetch,
-): Promise<Completion> {
+function providerId(value:string|null|undefined,apiKey:string) {
+  return value && /^[\w.:-]{1,128}$/.test(value) && !value.includes(apiKey) ? value : null;
+}
+
+async function fetchCompletion(input:CompletionInput,upstream:LiveUpstream,stream:boolean,fetcher:typeof fetch) {
   let response: Response;
   try {
     response = await fetcher(upstream.endpoint,{
       method:'POST',headers:{Authorization:'Bearer '+upstream.apiKey,'Content-Type':'application/json'},
       body:JSON.stringify({model:upstream.model,messages:input.messages,[upstream.tokenField]:input.max_completion_tokens,
-        stream:false,...(upstream.mode==='official' ? {reasoning_effort:'none',service_tier:'default',store:false} : {})}),
+        stream,...(stream ? {stream_options:{include_usage:true}} : {}),
+        ...(upstream.mode==='official' ? {reasoning_effort:'none',service_tier:'default',store:false} : {})}),
       redirect:'error',signal:AbortSignal.timeout(25000),
     });
   } catch {
     throw new UpstreamError('review',null);
   }
-  const header = response.headers.get('x-request-id');
-  const chosenId = (value?:string|null) => value && /^[\w.:-]{1,128}$/.test(value) && !value.includes(upstream.apiKey) ? value : null;
-  const headerId = chosenId(header);
+  const headerId = providerId(response.headers.get('x-request-id'),upstream.apiKey);
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
     const confirmedRejection = upstream.mode==='official' && [400,401,403,404,422,429].includes(response.status);
     throw new UpstreamError(confirmedRejection ? 'release' : 'review',headerId);
   }
-  const parsed = responseSchema.safeParse(await response.json().catch(() => null));
-  if (!parsed.success) throw new UpstreamError('review',headerId);
-  const requestId = headerId ?? chosenId(parsed.data.id);
-  if (parsed.data.model!==upstream.responseModel) throw new UpstreamError('review',requestId);
-  const usage = parsed.data.usage;
+  return {response,headerId};
+}
+
+function billedTokens(usage:z.infer<typeof usageSchema>,input:CompletionInput,upstream:LiveUpstream,requestId:string|null) {
   const cached = [usage.prompt_tokens_details?.cached_tokens,usage.prompt_cache_hit_tokens,
     usage.prompt_cache_miss_tokens===undefined ? undefined : usage.prompt_tokens-usage.prompt_cache_miss_tokens]
     .filter((count): count is number=>count!==undefined);
@@ -79,10 +83,135 @@ export async function openAiCompletion(
   }
   const tokens = {input:usage.prompt_tokens,cached:cached[0] ?? 0,output:usage.completion_tokens};
   if (tokens.cached<0 || tokens.cached>tokens.input || tokens.output>input.max_completion_tokens) throw new UpstreamError('review',requestId);
+  return tokens;
+}
+
+export async function openAiCompletion(
+  input: CompletionInput, upstream: LiveUpstream, fetcher: typeof fetch = fetch,
+): Promise<Completion> {
+  const {response,headerId} = await fetchCompletion(input,upstream,false,fetcher);
+  const parsed = responseSchema.safeParse(await response.json().catch(() => null));
+  if (!parsed.success) throw new UpstreamError('review',headerId);
+  const requestId = headerId ?? providerId(parsed.data.id,upstream.apiKey);
+  if (parsed.data.model!==upstream.responseModel) throw new UpstreamError('review',requestId);
+  const tokens = billedTokens(parsed.data.usage,input,upstream,requestId);
   const hideKey = (value: string|null|undefined) => value?.replaceAll(upstream.apiKey,'[redacted]') ?? value;
   const choices = parsed.data.choices.map(choice=>({...choice,finish_reason:hideKey(choice.finish_reason)!,message:{...choice.message,
     content:hideKey(choice.message.content) ?? null,refusal:hideKey(choice.message.refusal)}}));
   return {choices,tokens,requestId};
+}
+
+const streamFrame = z.object({
+  id:z.string().min(1).max(128),
+  model:z.string(),
+  object:z.literal('chat.completion.chunk'),
+  choices:z.array(z.object({
+    index:z.literal(0),
+    delta:z.object({role:z.literal('assistant').optional(),content:z.string().nullish(),refusal:z.string().nullish(),
+      tool_calls:z.null().optional(),function_call:z.null().optional(),audio:z.null().optional()}),
+    finish_reason:z.enum(['stop','length','content_filter']).nullish(),
+  })).max(1),
+  usage:usageSchema.extend({total_tokens:z.int().nonnegative().optional()}).nullish(),
+});
+
+async function* readSse(body:ReadableStream<Uint8Array>) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder('utf-8',{fatal:true});
+  let received = 0;
+  let buffer = '';
+  let pendingCr = false;
+  try {
+    for (;;) {
+      const {value,done} = await reader.read();
+      received += value?.byteLength ?? 0;
+      if (received>1_048_576) throw new Error('Upstream stream limit');
+      let text:string = (pendingCr ? '\r' : '')+decoder.decode(value,{stream:!done});
+      pendingCr = !done && text.endsWith('\r');
+      if (pendingCr) text = text.slice(0,-1);
+      const start = Math.max(buffer.length-1,0);
+      buffer += text.replace(/\r\n?/g,'\n');
+      for (let end=buffer.indexOf('\n\n',start);end>=0;end=buffer.indexOf('\n\n')) {
+        const lines = buffer.slice(0,end).split('\n');
+        buffer = buffer.slice(end+2);
+        const fields = lines.map(line => {
+          const colon = line.indexOf(':');
+          return colon<0 ? [line,''] : [line.slice(0,colon),line.slice(colon+1).replace(/^ /,'')];
+        });
+        const data = fields.filter(([name])=>name==='data').map(([,value])=>value).join('\n');
+        if (!data) continue;
+        const type = fields.filter(([name])=>name==='event').at(-1)?.[1];
+        if (type && type!=='message') throw new Error('Unexpected upstream event');
+        yield data;
+      }
+      if (done) return;
+    }
+  } finally {
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+// Keep any trailing prefix of the credential until the next delta disambiguates it.
+function redactDeltas(secret:string,emit:(text:string)=>void) {
+  let pending = '';
+  return {
+    push(text:string) {
+      const parts = (pending+text).split(secret);
+      const tail = parts.pop()!;
+      let keep = Math.min(tail.length,secret.length-1);
+      while (keep>0 && !tail.endsWith(secret.slice(0,keep))) keep--;
+      pending = tail.slice(tail.length-keep);
+      const safe = [...parts,tail.slice(0,tail.length-keep)].join('[redacted]');
+      if (safe) emit(safe);
+    },
+    flush() {
+      if (pending) emit(pending);
+    },
+  };
+}
+
+export async function openAiStream(
+  input:CompletionInput,upstream:LiveUpstream,emit:(delta:TextDelta)=>void,fetcher:typeof fetch=fetch,
+):Promise<Completion> {
+  const {response,headerId} = await fetchCompletion(input,upstream,true,fetcher);
+  if (!response.body || !/^text\/event-stream(?:;|$)/i.test(response.headers.get('content-type') ?? '')) {
+    void response.body?.cancel().catch(() => {});
+    throw new UpstreamError('review',headerId);
+  }
+  let id:string|undefined;
+  let requestId = headerId;
+  let finishReason:string|undefined;
+  let tokens:Completion['tokens']|undefined;
+  const content = redactDeltas(upstream.apiKey,text=>emit({content:text}));
+  const refusal = redactDeltas(upstream.apiKey,text=>emit({refusal:text}));
+  try {
+    for await (const data of readSse(response.body)) {
+      if (data==='[DONE]') {
+        if (!finishReason || !tokens) break;
+        content.flush();
+        refusal.flush();
+        return {requestId,tokens,choices:[{index:0,message:{role:'assistant',content:null},finish_reason:finishReason}]};
+      }
+      const frame = streamFrame.parse(JSON.parse(data));
+      if (frame.model!==upstream.responseModel || (id && id!==frame.id) || tokens) break;
+      id ??= frame.id;
+      requestId ??= providerId(id,upstream.apiKey);
+      const [choice] = frame.choices;
+      if (choice) {
+        if (finishReason || frame.usage) break;
+        if (choice.delta.content) content.push(choice.delta.content);
+        if (choice.delta.refusal) refusal.push(choice.delta.refusal);
+        finishReason = choice.finish_reason ?? undefined;
+      } else {
+        if (!finishReason || !frame.usage) break;
+        tokens = billedTokens(frame.usage,input,upstream,requestId);
+        if (frame.usage.total_tokens!==undefined && frame.usage.total_tokens!==tokens.input+tokens.output) break;
+      }
+    }
+  } catch {
+    throw new UpstreamError('review',requestId);
+  }
+  throw new UpstreamError('review',requestId);
 }
 
 export async function mockCompletion(input: CompletionInput,onText?: (content:string) => void): Promise<Completion> {

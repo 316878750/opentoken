@@ -9,7 +9,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
 import { check,migrate,seed } from '../scripts/database.mjs';
 import { redeemCommand } from '../scripts/redeem.mjs';
-import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
+import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
 
 const primary = '30000000-0000-4000-8000-000000000001';
 const secondary = '30000000-0000-4000-8000-000000000002';
@@ -22,10 +22,14 @@ const upstreamEnv = {
   COMPATIBLE_API_KEY:'fixture-key',OPENAI_MODEL:'vendor/text-model',OPENAI_RESPONSE_MODEL:'',
   UPSTREAM_INPUT_USD_PER_MTOK:'0.20',UPSTREAM_CACHED_USD_PER_MTOK:'0.04',UPSTREAM_OUTPUT_USD_PER_MTOK:'0.60',
   UPSTREAM_MAX_CONTEXT_TOKENS:'8192',UPSTREAM_MAX_TOKENS_FIELD:'max_tokens',
+  UPSTREAM_ADDITIONAL_MODELS_JSON:JSON.stringify([{
+    alias:'value-chat',model:'vendor/value-model',inputUsdPerMtok:'0.30',cachedUsdPerMtok:'0.06',outputUsdPerMtok:'0.90',
+    groups:[{code:'value',name:'用量分组',multiplierBps:9000}],
+  }]),
 };
 let base;
 let cookie;
-let server, serverExit, socket, database, auth;
+let server, serverExit, socket, database, auth, admin;
 
 function fakeAuth() {
   const activeTokens = new Map();
@@ -65,15 +69,15 @@ test.before(async () => {
     CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz);
     CREATE ROLE opentoken_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;`);
   for (const [email,id] of identities) await database.query('INSERT INTO auth.users VALUES ($1,$2,now())',[id,email]);
-  const admin = {query:async (sql,params) => {
+  admin = {query:async (sql,params) => {
     if (!params && sql.trim().replace(/;$/,'').includes(';')) return database.exec(sql);
     const result = await database.query(sql,params);
     return {...result,rowCount:result.rows.length || result.affectedRows || 0};
   }};
   await migrate(admin);
   await migrate(admin);
-  await seed(admin,'pilot-a@example.test',resolveLiveUpstream(upstreamEnv));
-  await seed(admin,'pilot-a@example.test',resolveLiveUpstream(upstreamEnv));
+  await seed(admin,'pilot-a@example.test',resolveLiveUpstreams(upstreamEnv));
+  await seed(admin,'pilot-a@example.test',resolveLiveUpstreams(upstreamEnv));
   const expiry = new Date(Date.now()+3_600_000).toISOString();
   for (const type of ['contest','funding','voided']) {
     const issued = await redeemCommand(admin,['issue','3.00',expiry]);
@@ -517,4 +521,60 @@ test('compatible SSE drains upstream after the client disconnects and settles on
   assert.equal(row.status,'settled');
   const {data:ledger} = await request('/api/wallet/entries',{sessionOverride});
   assert.deepEqual(ledger.items.filter(entry=>entry.requestId===id).map(entry=>entry.deltaMicros),['-4']);
+});
+
+test('additional models use their configured group and rate without crossing key groups', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const rate = rates.find(item=>item.model==='value-chat');
+  assert.ok(rate);
+  assert.equal(rate.groupName,'用量分组');
+  assert.equal(rate.multiplierBps,9000);
+  assert.equal(rate.streaming,false);
+  const compatible = rates.find(item=>item.model==='compatible-chat');
+  assert.equal(compatible.streaming,true);
+  const makeKey = async groupId => (await request('/api/keys',{method:'POST',sessionOverride,
+    body:{name:'routing fixture',groupId,rpm:10}})).data;
+  const key = await makeKey(rate.groupId);
+  const pilotKey = await makeKey(compatible.groupId);
+  const models = await request('/v1/models',{session:false,token:key.secret});
+  assert.deepEqual(models.data.data.map(item=>item.id),['value-chat']);
+  const call = (token,model,stream=false) => request('/v1/chat/completions',{method:'POST',session:false,token,
+    body:{model,messages:[{role:'user',content:'model selection fixture'}],max_completion_tokens:16,stream}});
+  assert.equal((await call(key.secret,'compatible-chat')).status,400);
+  assert.equal((await call(pilotKey.secret,rate.model)).status,400);
+  const notStreaming = await call(key.secret,rate.model,true);
+  assert.equal(notStreaming.status,400);
+  assert.equal(notStreaming.data.error.code,'stream_not_supported');
+  const ok = await call(key.secret,rate.model);
+  assert.equal(ok.status,200);
+  assert.equal(ok.data.model,'value-chat');
+  const {data:{items:[row]}} = await request('/api/usage?request_id='+ok.data.id,{sessionOverride});
+  assert.equal(row.chargedMicros,'5');
+  assert.equal(row.standardMicros,'6');
+  assert.equal((await request('/api/usage?key_id='+key.id,{sessionOverride})).data.items.length,1);
+
+  const publish = async providers => {
+    await database.exec('RESET ROLE');
+    try { await seed(admin,null,providers); }
+    finally { await database.exec('SET ROLE opentoken_app'); }
+  };
+  const current = resolveLiveUpstreams(upstreamEnv);
+  try {
+    await publish(current.map(provider=>provider.alias===rate.model ?
+      {...provider,groups:provider.groups.map(group=>({...group,multiplierBps:8000}))} : provider));
+    assert.ok(!(await request('/api/catalog',{sessionOverride})).data.rates.some(item=>item.model===rate.model));
+    assert.deepEqual((await request('/v1/models',{session:false,token:key.secret})).data.data,[]);
+    assert.equal((await request('/api/keys',{method:'POST',sessionOverride,
+      body:{name:'stale route',groupId:rate.groupId,rpm:10}})).status,400);
+    const stale = await call(key.secret,rate.model);
+    assert.equal(stale.status,503);
+    assert.equal(stale.data.error.code,'seed_config_mismatch');
+    const {data:{items:[historic]}} = await request('/api/usage?request_id='+ok.data.id,{sessionOverride});
+    assert.equal(historic.chargedMicros,'5');
+    assert.equal(historic.ledgerDeltaMicros,'-5');
+  } finally {
+    await publish(current);
+  }
 });

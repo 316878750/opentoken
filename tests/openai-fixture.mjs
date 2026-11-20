@@ -31,7 +31,7 @@ globalThis.fetch = async (input,options) => {
     }}),{headers:{...headers,'content-type':'text/event-stream; charset=utf-8'}});
   }
   return reply(200,{
-    model:'vendor/text-model',
+    model:request.model,
     choices:[{index:0,message:{role:'assistant',content:'OK'},finish_reason:'stop'}],
     usage:{prompt_tokens:14,completion_tokens:2,prompt_tokens_details:{cached_tokens:4}},
   });

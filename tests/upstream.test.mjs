@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { openAiCompletion, openAiStream, upstreamModel, UpstreamError } from '../lib/upstream.ts';
-import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
+import { resolveLiveUpstream, resolveLiveUpstreams } from '../lib/upstream-config.mjs';
 
 const request = { model:'openai-mini', messages:[{role:'user',content:'Reply with OK.'}], max_completion_tokens:16 };
 const completion = {
@@ -74,6 +74,20 @@ const compatibleEnv = {
   OPENAI_BASE_URL:'https://provider.example/v1', OPENAI_MODEL:'vendor/text-model',
   UPSTREAM_INPUT_USD_PER_MTOK:'0.20', UPSTREAM_CACHED_USD_PER_MTOK:'0.04', UPSTREAM_OUTPUT_USD_PER_MTOK:'0.60',
 };
+
+test('additional models share only the configured compatible credentials and enforce unique routes', () => {
+  const model = {alias:'value-chat',model:'vendor/value-model',inputUsdPerMtok:'0.2',cachedUsdPerMtok:'0.04',outputUsdPerMtok:'0.6',streaming:true};
+  const resolve = entries => resolveLiveUpstreams({...compatibleEnv,UPSTREAM_ADDITIONAL_MODELS_JSON:JSON.stringify(entries)});
+  const [primary,additional] = resolve([model]);
+  assert.equal(additional.endpoint,primary.endpoint);
+  assert.equal(additional.apiKey,primary.apiKey);
+  assert.equal(additional.responseModel,model.model);
+  assert.equal(additional.streaming,false);
+  assert.throws(()=>resolve([{...model,endpoint:'https://other.example/v1'}]),/Invalid additional/);
+  assert.throws(()=>resolve([model,model]),/Duplicate or reserved/);
+  assert.throws(()=>resolve([{...model,alias:'mock-text'}]),/Duplicate or reserved/);
+  assert.throws(()=>resolve([{...model,groups:[{code:'pilot',name:'Different',multiplierBps:10000}]}]),/inconsistent pricing group/);
+});
 
 test('compatible credentials require an explicit HTTPS destination and never fall back to OpenAI', () => {
   assert.equal(resolveLiveUpstream({...compatibleEnv,ENABLE_OPENAI:'0'}),null);

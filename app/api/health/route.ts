@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { digest, store } from '@/lib/data';
 import { appOrigin } from '@/lib/session';
-import { resolveLiveUpstream } from '@/lib/upstream-config.mjs';
+import { resolveLiveUpstreams } from '@/lib/upstream-config.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,7 +33,7 @@ async function checkAuth() {
 
 async function checkRuntime() {
   digest('health','readiness');
-  resolveLiveUpstream();
+  resolveLiveUpstreams();
 }
 
 function ready() {

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 
-type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible'};
+type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
 type KeyRow = {id:string;name:string;prefix:string;status:string;groupName:string;rpm:number;capMicros:string|null};
 type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;releasedMicros:string|null;standardMicros:string|null;
   chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string;upstreamRequestId:string|null};
@@ -141,14 +141,15 @@ export function Pricing() {
   return <><Heading title="模型价格" description="当前分组费率。单价按每百万 Token 计。" />
     <ErrorNote error={error} />{error && <button onClick={refresh}>重试</button>}
     {data ? <section className="panel table-wrap"><table><thead><tr>
-      <th>模型</th><th>分组</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th>
+      <th>模型</th><th>分组</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th><th>请求方式</th>
     </tr></thead><tbody>{data.rates.map(r => <tr key={r.groupId+r.model}><td><code>{r.model}</code> · {r.upstream==='mock'?'模拟':r.upstream==='compatible'?'兼容上游':'OpenAI'}</td><td>{r.groupName}</td>
-      <td>{money(r.inputMicros)}</td><td>{money(r.cacheMicros)}</td><td>{money(r.outputMicros)}</td><td>{r.multiplierBps/10000}×</td></tr>)}</tbody></table></section>
+      <td>{money(r.inputMicros)}</td><td>{money(r.cacheMicros)}</td><td>{money(r.outputMicros)}</td><td>{r.multiplierBps/10000}×</td>
+      <td>{r.streaming?'流式 / 非流式':'非流式'}</td></tr>)}</tbody></table></section>
       : <Placeholder error={error} />}
   </>;
 }
 
-type NewKey = {id:string;secret:string;name:string;groupName:string};
+type NewKey = {id:string;secret:string;name:string;groupId:string;groupName:string};
 type Step = 'form' | 'secret' | 'confirm';
 
 export function Keys() {
@@ -176,6 +177,7 @@ export function Keys() {
   const revokeTrigger = useRef<HTMLButtonElement>(null);
   const [endpoint,setEndpoint] = useState('');
   const groups = [...new Map(catalog.data?.rates.map(rate => [rate.groupId,rate])).values()];
+  const demoAllowed = catalog.data?.rates.some(rate=>rate.groupId===created?.groupId && rate.model==='mock-text');
   const clear = useCallback(() => {
     request.current?.abort();
     if (keyField.current) keyField.current.value = '';
@@ -218,14 +220,15 @@ export function Keys() {
     const [whole,dec=''] = cap.split('.');
     const capMicros = cap ? String(BigInt(whole)*1_000_000n+BigInt(dec.padEnd(6,'0'))) : null;
     const controller = new AbortController();
+    const groupId = String(form.get('groupId'));
     request.current = controller;
     setCreating(true); setFormError('');
     try {
-      const result = await api<NewKey>('/api/keys',{method:'POST',body:JSON.stringify({
-        name:form.get('name'),groupId:form.get('groupId'),rpm:Number(form.get('rpm')),capMicros,
+      const result = await api<Omit<NewKey,'groupId'|'groupName'>>('/api/keys',{method:'POST',body:JSON.stringify({
+        name:form.get('name'),groupId,rpm:Number(form.get('rpm')),capMicros,
       }),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(12000)])});
       if (!controller.signal.aborted) {
-        setCreated({...result,groupName:catalog.data?.rates.find(rate => rate.groupId===form.get('groupId'))?.groupName || '演示分组'});
+        setCreated({...result,groupId,groupName:groups.find(rate=>rate.groupId===groupId)?.groupName || ''});
         setStep('secret'); keys.refresh();
       }
     } catch (error) {
@@ -239,7 +242,7 @@ export function Keys() {
     catch { keyField.current?.select(); setNotice('复制失败，已选中密钥，可手动复制。'); }
   }
   async function demo() {
-    if (!created || demoBusy || lastDemo.current===created.id) return;
+    if (!created || !demoAllowed || demoBusy || lastDemo.current===created.id) return;
     lastDemo.current = created.id;
     setDemoBusy(true);
     setNotice('调用已发起。可在新标签页查看实时余额和请求。');
@@ -270,7 +273,7 @@ export function Keys() {
     <section className="panel"><h2>接入地址</h2><p><code>{endpoint}</code></p>
       <button onClick={async () => {try { await navigator.clipboard.writeText(endpoint); setPageError(''); setNotice('已复制接入地址。'); }
         catch {setPageError('复制失败，可选中地址后手动复制。');}}}>复制接入地址</button>
-      <p className="muted">支持非流式文本调用。<code>mock-text</code> 用于演示，当前可用模型见 <a href="/pricing">模型价格</a>。</p>
+      <p className="muted">密钥只能使用所属分组的模型。可用模型及流式支持见 <a href="/pricing">模型价格</a>。</p>
       {!created && notice && <p role="status">{notice}</p>}
     </section>
     {keys.data ? <section className="panel table-wrap"><h2>密钥列表</h2>
@@ -302,7 +305,7 @@ export function Keys() {
         <p className="muted">{created.name} · {created.groupName}</p>
         <label>完整密钥<input ref={keyField} readOnly autoComplete="off" spellCheck={false} value={created.secret} /></label>
         <div className="actions"><button onClick={copyKey}>复制密钥</button>
-          <button onClick={demo} disabled={demoBusy || lastDemo.current===created.id}>{demoBusy?'模拟调用进行中…':lastDemo.current===created.id?'已发起模拟调用':'模拟调用一次'}</button></div>
+          {demoAllowed && <button onClick={demo} disabled={demoBusy || lastDemo.current===created.id}>{demoBusy?'模拟调用进行中…':lastDemo.current===created.id?'已发起模拟调用':'模拟调用一次'}</button>}</div>
         <div className="actions"><a href="/dashboard" target="_blank" rel="noreferrer">在新标签页看余额</a>
           <a href={'/usage?key_id='+created.id} target="_blank" rel="noreferrer">在新标签页看请求</a></div>
         <p role="status">{notice}</p>

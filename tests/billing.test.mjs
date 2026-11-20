@@ -22,7 +22,7 @@ before(async () => {
   }};
   await migrate(admin);
   await migrate(admin);
-  await seed(admin,email,null);
+  await seed(admin,email,[]);
 });
 
 after(async () => { await database?.close(); });

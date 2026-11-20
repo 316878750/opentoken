@@ -50,6 +50,7 @@ function fakeAuth() {
     }
     const token = request.headers.authorization?.slice('Bearer '.length);
     if (request.method==='GET' && request.url==='/auth/v1/user' && activeTokens.has(token)) return json(200,activeTokens.get(token));
+    if (request.method==='GET' && request.url==='/auth/v1/settings' && request.headers.apikey==='fixture-key') return json(200,{});
     if (request.method==='POST' && request.url?.startsWith('/auth/v1/logout')) {
       return json(204,null);
     }
@@ -136,6 +137,13 @@ async function request(path, { method = 'GET', body, token, retry, session = tru
 }
 
 const loginPayload = (email,password='fixture-test-password') => ({method:'POST',body:{email,password}});
+
+test('public readiness checks PostgreSQL and Auth without disclosing service configuration', async () => {
+  const health = await request('/api/health',{session:false});
+  assert.equal(health.status,200);
+  assert.deepEqual(health.data,{status:'ok'});
+  assert.match(health.headers.get('cache-control'),/no-store/);
+});
 
 test('mock call settles once, hides the API key and isolates independent users', async () => {
   assert.equal((await request('/api/keys', {session:false})).status, 401);

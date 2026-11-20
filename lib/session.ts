@@ -3,7 +3,7 @@ import type { NextRequest, NextResponse } from 'next/server';
 
 export const sessionCookie = 'opentoken_session';
 
-function client() {
+export function createAuthClient() {
   const { SUPABASE_URL:base, SUPABASE_PUBLISHABLE_KEY:key } = process.env;
   if (!base || !key) throw new Error('Supabase Auth is not configured');
   const url = new URL(base);
@@ -15,19 +15,19 @@ function client() {
 }
 
 export async function loginSession(email: string,password: string) {
-  return client().auth.signInWithPassword({email,password});
+  return createAuthClient().auth.signInWithPassword({email,password});
 }
 
 export async function sessionUser(token: string | undefined) {
   if (!token || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) return null;
-  const {data,error} = await client().auth.getUser(token);
+  const {data,error} = await createAuthClient().auth.getUser(token);
   if (error && (!error.status || error.status>=500)) throw new Error('Supabase Auth is temporarily unavailable');
   return data.user?.id ?? null;
 }
 
 export async function endSession(token: string | undefined) {
   if (token && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) {
-    const {error} = await client().auth.admin.signOut(token,'local');
+    const {error} = await createAuthClient().auth.admin.signOut(token,'local');
     if (error && (!error.status || error.status>=500)) console.error('Supabase session revoke temporarily unavailable');
   }
 }

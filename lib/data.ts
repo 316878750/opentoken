@@ -1,24 +1,13 @@
 import { createHmac } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
+import { postgresConnectionOptions } from './postgres-config.mjs';
 
 const globals = globalThis as typeof globalThis & { opentokenPool?: Pool };
 
 export function store() {
   if (!globals.opentokenPool) {
-    const connectionString = process.env.DATABASE_URL;
-    if (!connectionString) throw new Error('DATABASE_URL is required');
-    const url = new URL(connectionString);
-    const local = url.hostname === '127.0.0.1' || url.hostname === 'localhost';
-    if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error('DATABASE_URL must use PostgreSQL');
-    const query = [...url.searchParams];
-    if (url.hash || query.length>1 || query.some(([key,value]) => key!=='sslmode' || value!=='verify-full')) {
-      throw new Error('Use a plain PostgreSQL URI with at most one sslmode=verify-full');
-    }
-    if (!local && (url.searchParams.get('sslmode') !== 'verify-full' ||
-      decodeURIComponent(url.username).split('.')[0] !== 'opentoken_app')) {
-      throw new Error('Use the opentoken_app role and sslmode=verify-full');
-    }
-    const pool = new Pool({connectionString,max:5,connectionTimeoutMillis:5000,statement_timeout:8000});
+    const connection = postgresConnectionOptions(process.env.DATABASE_URL,{application:true});
+    const pool = new Pool({...connection,max:5,connectionTimeoutMillis:5000,statement_timeout:8000});
     pool.on('error', () => console.error('Idle PostgreSQL connection failed'));
     globals.opentokenPool = pool;
   }

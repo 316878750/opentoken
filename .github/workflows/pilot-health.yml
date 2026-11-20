@@ -1,0 +1,36 @@
+name: Pilot health
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  readiness:
+    if: vars.OPENTOKEN_PILOT_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      PILOT_URL: ${{ vars.OPENTOKEN_PILOT_URL }}
+    steps:
+      - name: Verify HTTPS readiness and login
+        shell: bash
+        run: |
+          if [[ ! "$PILOT_URL" =~ ^https://[A-Za-z0-9.-]+/?$ ]]; then
+            echo "::error::OPENTOKEN_PILOT_URL must be a canonical HTTPS origin"
+            exit 1
+          fi
+          origin="${PILOT_URL%/}"
+          for attempt in 1 2; do
+            if curl --proto '=https' --fail --silent --show-error --connect-timeout 8 --max-time 25 "$origin/api/health" |
+                jq -e '. == {"status":"ok"}' >/dev/null &&
+                [[ "$(curl --proto '=https' --silent --show-error --connect-timeout 8 --max-time 20 --output /dev/null --write-out '%{http_code}' "$origin/login")" == '200' ]]; then
+              echo "Pilot is ready"
+              exit 0
+            fi
+            if [[ "$attempt" == 1 ]]; then sleep 5; fi
+          done
+          echo "::error::Pilot readiness or login page unavailable"
+          exit 1

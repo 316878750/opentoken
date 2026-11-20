@@ -1,0 +1,56 @@
+# OpenToken 小范围试点部署
+
+## 上线前核对
+
+| 项目 | 状态 |
+| --- | --- |
+| 应用代码和迁移 | 部署构建通过，29 项隔离测试通过。试点库已应用迁移 001–004。 |
+| 试点数据库 | Supabase 项目 `opentoken`，使用低权限应用账号。数据库内每五分钟运行账本对账。 |
+| 备份与恢复 | 已校验试点加密快照，覆盖 14 张表，账务检查通过。隔离 PostgreSQL 已完成恢复演练。 |
+| 正式 HTTPS 地址 | 选用 Vercel 分配的地址，等待完成 Vercel 登录和私有仓库授权。 |
+| 邀请和告警通知 | 首轮联系对象及告警邮箱已确认，正式地址就绪后配置与验证。 |
+
+试点入口仅供受邀用户。放出链接前，在目标 Supabase 项目的 **Authentication → Sign In / Providers** 关闭公开注册，保留邮箱和密码登录。在 **URL Configuration** 设置正式 HTTPS 地址，并把正式地址的 `/invite` 加入 Auth 重定向列表。用公开 Auth 设置确认 `disable_signup` 为 `true`。
+
+## 托管设置
+
+Vercel 可从 GitHub 导入 `316878750/opentoken`，选用 Next.js 框架、`main` 生产分支和平台分配的 HTTPS 地址。自有域名按托管后台给出的 DNS 记录配置。应用和网关共用同一个正式域名。[Vercel 的 GitHub 部署说明](https://vercel.com/docs/git/vercel-for-github)
+
+从现有 Supabase 项目取得应用连接和公开 Auth 配置。托管环境填写以下变量。
+
+| 变量 | 内容 |
+| --- | --- |
+| `APP_ORIGIN` | 正式 HTTPS 源地址，例如 `https://opentoken.example.com`。 |
+| `SUPABASE_URL`、`SUPABASE_PUBLISHABLE_KEY` | 同一个试点项目的 Auth 地址和公开密钥。 |
+| `DATABASE_URL` | `opentoken_app` 低权限数据库连接，带 `sslmode=verify-full`。 |
+| `DATABASE_CA_BASE64` | Supabase 官方数据库 CA PEM 的 Base64。托管 Node 通过此变量验证证书和数据库主机名。 |
+| `GATEWAY_SECRET` | 原试点的 32 字节十六进制网关密钥。恢复时同一值能继续验证已有 API 密钥。 |
+| `ENABLE_OPENAI` | 首轮可设为 `0`，试点从 `mock-text` 走完调用和结算。真实上游按已核准范围显式启用。 |
+
+管理员迁移连接和邀请密钥由运营端保管。PowerShell 可将项目 CA 文件转换为托管变量。
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath '.env.supabase-ca.pem').Path))
+```
+
+部署后检查正式域名的 `/login` 和 `/api/health` 都返回 HTTP 200。再登录检查会话 Cookie 使用 `HttpOnly`、`Secure` 和 `SameSite=Strict`，并确认不同账号只能看到自己的密钥、使用记录和账本。
+
+## 监控
+
+- 配置仓库的 Actions 变量 `OPENTOKEN_PILOT_URL` 为正式 HTTPS 源地址。**Pilot health** 每 15 分钟检查登录页和健康接口，可手动运行。健康接口核对数据库权限、Supabase Auth、关闭公开注册的设置和网关配置，探针只读取服务状态。
+- 在托管平台查看应用错误日志，在 Supabase Cron 查看 `opentoken-billing-maintenance` 的运行结果。用 `pnpm db:billing alerts` 检查账务告警。
+- 用接收邮箱验证实际通知渠道。GitHub Actions 可记录检查失败，试点启用前应发一次监控测试通知并确认收到。
+
+## 邀请和验收
+
+正式地址就绪后，按确认名单逐一发放邀请，记录每人的验证状态。现有已确认账号直接使用正式登录地址。新账号的邀请可由运营用 `pnpm pilot:invite RECIPIENT_EMAIL` 生成。命令从本地运营环境读取 `APP_ORIGIN`、`SUPABASE_URL` 和 `SUPABASE_SECRET_KEY`，返回一次性设密链接。通过已授权的邮件渠道把链接发给指定收件人。收件人设置密码后进入登录页。若邀请已经验证但密码未能保存，可在同一浏览器内重试，设置会话最长保留 10 分钟。若设置会话过期，运营需协助恢复账号。默认 Supabase SMTP 只能向项目团队成员投递，如改用 Supabase 发信，应配置自有 SMTP。[Supabase 生成邀请链接](https://supabase.com/docs/reference/javascript/auth-admin-generatelink) · [Supabase SMTP 配置](https://supabase.com/docs/guides/auth/auth-smtp)
+
+1. 接受邀请、设置密码并登录。
+2. 创建一把 API 密钥，保存只在创建时显示的完整密钥。
+3. 通过内部兑换码为测试账户到账。在余额和流水中找到同一笔补额。
+4. 发起一次非流式模型调用。在概览记录预占及释放，在使用记录和钱包流水用请求 ID 核对扣费。
+5. 将每一步的通过状态记录到运营验收记录。保留请求 ID 和收据 ID，配置和凭据留在本地。
+
+## 备份恢复
+
+在试点开启前生成一份加密快照并校验。试点运行时按约定周期执行备份，密钥和备份分开保存。恢复演练使用隔离目标库，并比对登录用户标识、钱包、预占和流水。详见 [加密备份与恢复手册](backup.md)。

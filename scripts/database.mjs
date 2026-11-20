@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Client } from 'pg';
+import { postgresConnectionOptions } from '../lib/postgres-config.mjs';
 import { resolveLiveUpstream } from '../lib/upstream-config.mjs';
 import { billingCommand, scanBilling } from './billing.mjs';
 import { redeemCommand } from './redeem.mjs';
@@ -9,16 +10,8 @@ import { redeemCommand } from './redeem.mjs';
 function connection(name) {
   const value = process.env[name];
   if (!value) throw new Error(name + ' is required');
-  const url = new URL(value);
-  if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error('Use a PostgreSQL connection string');
-  const query = [...url.searchParams];
-  if (url.hash || query.length>1 || query.some(([key,value]) => key!=='sslmode' || value!=='verify-full')) {
-    throw new Error('Use a plain PostgreSQL URI with at most one sslmode=verify-full');
-  }
-  if (!['127.0.0.1','localhost'].includes(url.hostname) && url.searchParams.get('sslmode')!=='verify-full') {
-    throw new Error('Use sslmode=verify-full for remote PostgreSQL');
-  }
-  return new Client({connectionString:value,connectionTimeoutMillis:8000,statement_timeout:15000});
+  const config = postgresConnectionOptions(value,{application:name==='DATABASE_URL'});
+  return new Client({...config,connectionTimeoutMillis:8000,statement_timeout:15000});
 }
 
 async function inTransaction(client,work) {

@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import type { TrendDay } from '@/lib/reports';
 
 type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
 type KeyRow = {id:string;name:string;prefix:string;status:string;groupName:string;rpm:number;capMicros:string|null};
@@ -105,13 +106,56 @@ export function Login() {
   </form></main>;
 }
 
+const trendMetrics = {requests:'请求数',tokens:'计费 Token',chargedMicros:'实际扣费'} as const;
+
+function UsageTrend({tz}:{tz:string}) {
+  const [days,setDays] = useState<'7'|'30'>('7');
+  const [metric,setMetric] = useState<keyof typeof trendMetrics>('requests');
+  const {data,error,refresh} = useData<{items:TrendDay[]}>('/api/usage-trend?days='+days+'&tz='+encodeURIComponent(tz),15000);
+  const value = (day:TrendDay) => BigInt(day[metric]);
+  const peak = data?.items.reduce((max,day)=>value(day)>max ? value(day) : max,0n) ?? 0n;
+  const format = (amount:bigint) => metric==='chargedMicros' ? money(amount.toString()) : amount.toLocaleString('zh-CN');
+  const hasRequests = data?.items.some(day=>day.requests>0);
+  return <section className="panel" aria-labelledby="trend-title">
+    <h2 id="trend-title">用量趋势</h2>
+    <div className="filters">
+      <label>时间范围<select value={days} onChange={e=>setDays(e.target.value==='30' ? '30' : '7')}>
+        <option value="7">最近 7 天</option><option value="30">最近 30 天</option>
+      </select></label>
+      <label>指标<select value={metric} onChange={e=>setMetric(e.target.value as keyof typeof trendMetrics)}>
+        <option value="requests">请求数</option><option value="tokens">计费 Token</option><option value="chargedMicros">实际扣费</option>
+      </select></label>
+      <button type="button" onClick={refresh}>刷新趋势</button>
+    </div>
+    <ErrorNote error={error} />
+    {data ? hasRequests ? <>
+      <p className="muted trend-summary">时区 {tz} · 单日峰值 {format(peak)}</p>
+      <div className="trend-chart" aria-hidden="true">{data.items.map(day=>
+        <div key={day.date} title={day.date+' · '+trendMetrics[metric]+' '+format(value(day))}
+          style={{height:(peak>0n ? Number(value(day)*10000n/peak)/100 : 0)+'%'}} />)}</div>
+      <div className="trend-dates" aria-hidden="true">
+        <span>{data.items[0]?.date}</span><span>{data.items.at(-1)?.date}</span>
+      </div>
+      <details className="trend-details">
+        <summary>查看按日明细</summary>
+        <div className="table-wrap"><table><thead><tr><th scope="col">日期</th><th scope="col">请求数</th>
+          <th scope="col">计费 Token</th><th scope="col">实际扣费</th></tr></thead>
+          <tbody>{data.items.map(day=><tr key={day.date}><th scope="row">{day.date}</th>
+            <td>{day.requests.toLocaleString('zh-CN')}</td><td>{BigInt(day.tokens).toLocaleString('zh-CN')}</td>
+            <td>{money(day.chargedMicros)}</td></tr>)}</tbody></table></div>
+      </details>
+    </> : <p className="muted trend-summary">这段时间没有请求。</p> :
+      !error && <p className="muted trend-summary">正在读取趋势…</p>}
+  </section>;
+}
+
 export function Dashboard() {
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const {data,error,refresh} = useData<Wallet>('/api/dashboard?tz='+encodeURIComponent(tz),1200);
   return <><Heading title="概览" description="核对可用额度、预占和已结算费用。" />
     <div className="actions"><a className="action primary" href="/keys">管理密钥</a><a className="action" href="/usage">查看使用记录</a>
       <a className="action" href="/redeem">兑换额度</a>
-      <button type="button" onClick={refresh}>刷新数据</button></div>
+      <button type="button" onClick={refresh}>刷新余额和汇总</button></div>
     <ErrorNote error={error} />
     {data ? <><section className="panel" aria-labelledby="wallet-title"><h2 id="wallet-title">余额</h2>
       <dl className="metrics">
@@ -133,6 +177,7 @@ export function Dashboard() {
         <div><dt>累计标准费用</dt><dd>{money(data.standardMicros)}</dd></div>
       </dl>
     </section></> : <Placeholder error={error} />}
+    <UsageTrend tz={tz} />
   </>;
 }
 

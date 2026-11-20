@@ -22,6 +22,32 @@ export async function dashboard(user: string, tz: string) {
   return row;
 }
 
+export type TrendDay = {date:string;requests:number;tokens:string;chargedMicros:string};
+
+export async function usageTrend(user:string,tz:string,days:7|30) {
+  const {db} = await store();
+  const {rows} = await db.query<TrendDay>(`WITH calendar AS (
+    SELECT (now() AT TIME ZONE $2)::date AS today
+  ), bounds AS (
+    SELECT today, today-($3::int-1) AS first_day FROM calendar
+  ), totals AS (
+    SELECT (created_at AT TIME ZONE $2)::date AS day, count(*)::int AS requests,
+      coalesce(sum(input_tokens::bigint+output_tokens) FILTER (WHERE status='settled'),0)::text AS tokens,
+      coalesce(sum(charged_micros) FILTER (WHERE status='settled'),0)::text AS charged
+    FROM gateway.usage_requests CROSS JOIN bounds WHERE user_id=$1
+      AND created_at >= (first_day::timestamp AT TIME ZONE $2)
+      AND created_at < ((today+1)::timestamp AT TIME ZONE $2)
+    GROUP BY 1
+  )
+  SELECT to_char(bounds.first_day+dates.day_offset,'YYYY-MM-DD') AS date,
+    coalesce(totals.requests,0) AS requests, coalesce(totals.tokens,'0') AS tokens,
+    coalesce(totals.charged,'0') AS "chargedMicros"
+  FROM bounds CROSS JOIN generate_series(0,$3::int-1) AS dates(day_offset)
+  LEFT JOIN totals ON totals.day=bounds.first_day+dates.day_offset
+  ORDER BY dates.day_offset`,[user,tz,days]);
+  return {items:rows};
+}
+
 export type UsageFilter = { key_id?:string; request_id?:string; status?:string; from?:string; to?:string; cursor?:string };
 
 export async function usage(user: string, f: UsageFilter) {

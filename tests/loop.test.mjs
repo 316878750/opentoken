@@ -578,3 +578,41 @@ test('additional models use their configured group and rate without crossing key
     await publish(current);
   }
 });
+
+test('daily usage trends fill 7 and 30 local days, reconcile charges, and isolate accounts', async () => {
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.get('set-cookie').split(';')[0];
+  const sessionOverride = await signIn('pilot-a@example.test');
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const rate = rates.find(item=>item.model==='value-chat');
+  const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
+    body:{name:'trend fixture',groupId:rate.groupId,rpm:10}});
+  const call = await request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,
+    body:{model:rate.model,messages:[{role:'user',content:'daily trend fixture'}],max_completion_tokens:16}});
+  assert.equal(call.status,200);
+  const {rows:[past]} = await database.query(`UPDATE gateway.usage_requests
+    SET created_at=(date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')-interval '8 days'+interval '20 hours'
+    WHERE id=$1 RETURNING created_at`,[call.data.id]);
+  const utcDay = new Date(past.created_at).toISOString().slice(0,10);
+  const shanghaiDay = new Date(new Date(past.created_at).getTime()+8*3_600_000).toISOString().slice(0,10);
+  assert.notEqual(utcDay,shanghaiDay);
+  const trend = (days,tz,session=sessionOverride) => request('/api/usage-trend?days='+days+'&tz='+encodeURIComponent(tz),{sessionOverride:session});
+  const utc = await trend(30,'UTC');
+  assert.equal(utc.status,200);
+  const shanghai = await trend(30,'Asia/Shanghai');
+  assert.equal(shanghai.status,200);
+  assert.equal(shanghai.data.items.length,30);
+  assert.deepEqual(utc.data.items.find(day=>day.date===utcDay),{date:utcDay,requests:1,tokens:'16',chargedMicros:'5'});
+  assert.deepEqual(shanghai.data.items.find(day=>day.date===shanghaiDay),
+    {date:shanghaiDay,requests:1,tokens:'16',chargedMicros:'5'});
+  const seven = await trend(7,'Asia/Shanghai');
+  assert.equal(seven.data.items.length,7);
+  assert.deepEqual(seven.data.items,shanghai.data.items.slice(-7));
+  assert.ok(seven.data.items.some(day=>day.requests===0 && day.tokens==='0' && day.chargedMicros==='0'));
+  const {data:dashboard} = await request('/api/dashboard?tz=Asia%2FShanghai',{sessionOverride});
+  assert.equal(shanghai.data.items.reduce((sum,day)=>sum+BigInt(day.chargedMicros),0n),BigInt(dashboard.chargedMicros));
+  const other = await trend(7,'UTC',await signIn('pilot-b@example.test'));
+  assert.equal(other.status,200);
+  assert.ok(other.data.items.every(day=>day.requests===0 && day.tokens==='0' && day.chargedMicros==='0'));
+  assert.equal((await trend(8,'UTC')).status,400);
+  assert.equal((await trend(7,'Invalid/Timezone')).status,400);
+});

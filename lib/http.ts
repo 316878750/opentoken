@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
-import { dashboard, usage } from './reports';
+import { dashboard, usage, usageTrend } from './reports';
 import { appOrigin, endSession, loginSession, sessionCookie, sessionUser, setSession } from './session';
 import { redeemCredit, walletEntries } from './wallet';
 
@@ -17,6 +17,7 @@ const keyInput = z.object({
   capMicros:z.string().regex(/^[1-9]\d{0,14}$/).nullish(),
 });
 const ledgerFilter = z.object({kind:z.enum(['redemption','usage']).optional(),cursor:z.uuid().optional()});
+const trendRange = z.enum(['7','30']).default('7');
 const redemptionInput = z.strictObject({code:z.string().trim().min(1).max(128)});
 const callInput = z.strictObject({
   model:z.string().min(1).max(64), stream:z.boolean().default(false),
@@ -55,6 +56,14 @@ async function body(req: NextRequest) {
   } finally {
     reader.releaseLock();
   }
+}
+
+function timeZone(query:URLSearchParams) {
+  const tz = query.get('tz') || 'UTC';
+  if (/^[+-]/.test(tz)) throw new Fault(400,'invalid_timezone','请使用 IANA 时区。');
+  try { new Intl.DateTimeFormat('en',{timeZone:tz}); }
+  catch { throw new Fault(400,'invalid_timezone','时区无效。'); }
+  return tz;
 }
 
 export async function handle(req: NextRequest) {
@@ -129,12 +138,11 @@ export async function handle(req: NextRequest) {
       await updateKey(user,id,status);
       return json({ok:true});
     }
-    if (route === 'GET /api/dashboard') {
-      const tz = req.nextUrl.searchParams.get('tz') || 'UTC';
-      if (/^[+-]/.test(tz)) throw new Fault(400,'invalid_timezone','请使用 IANA 时区。');
-      try { new Intl.DateTimeFormat('en',{timeZone:tz}); }
-      catch { throw new Fault(400,'invalid_timezone','时区无效。'); }
-      return json(await dashboard(user,tz));
+    if (route === 'GET /api/dashboard') return json(await dashboard(user,timeZone(req.nextUrl.searchParams)));
+    if (route === 'GET /api/usage-trend') {
+      const query = req.nextUrl.searchParams;
+      const days = parse(trendRange,query.get('days') ?? undefined);
+      return json(await usageTrend(user,timeZone(query),days==='30' ? 30 : 7));
     }
     if (route === 'GET /api/usage') return json(await usage(user,parse(usageFilter,Object.fromEntries(req.nextUrl.searchParams))));
     throw new Fault(404,'not_found','该接口不在本次实现范围内。');

@@ -85,10 +85,19 @@ export async function openAiCompletion(
   return {choices,tokens,requestId};
 }
 
-export async function mockCompletion(input: CompletionInput): Promise<Completion> {
-  await delay(Math.min(30_000,Math.max(1_000,Number(process.env.DEMO_DELAY_MS) || 12_000)));
+export async function mockCompletion(input: CompletionInput,onText?: (content:string) => void): Promise<Completion> {
+  const chunks = ['本地模拟','调用已完成。'];
+  const duration = Math.min(30_000,Math.max(1_000,Number(process.env.DEMO_DELAY_MS) || 12_000));
+  if (onText) {
+    for (const chunk of chunks) {
+      await delay(duration/chunks.length);
+      onText(chunk);
+    }
+  } else {
+    await delay(duration);
+  }
   return {
     tokens:{input:375,cached:0,output:Math.min(48,input.max_completion_tokens)},requestId:null,
-    choices:[{index:0,message:{role:'assistant',content:'本地模拟调用已完成。'},finish_reason:'stop'}],
+    choices:[{index:0,message:{role:'assistant',content:chunks.join('')},finish_reason:'stop'}],
   };
 }

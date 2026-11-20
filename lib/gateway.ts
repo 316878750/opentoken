@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { after } from 'next/server';
 import { digest, store, transaction } from './data';
 import { mockCompletion, mockModel, openAiCompletion, UpstreamError, type CompletionInput } from './upstream';
 import { resolveLiveUpstream } from './upstream-config.mjs';
@@ -89,7 +90,7 @@ function price(rate: Rate, input: number, cache: number, output: number, multipl
   return (weighted*BigInt(multiplier) + denominator-1n)/denominator;
 }
 
-export async function complete(header: string | null, body: CompletionInput, retry: string | null) {
+async function prepareCompletion(header:string|null,body:CompletionInput,retry:string|null,streaming = false) {
   const key = await findKey(header);
   const { db } = await store();
   const fingerprint = retry ? (await digest('request-body',JSON.stringify(body))).toString('hex') : null;
@@ -109,6 +110,9 @@ export async function complete(header: string | null, body: CompletionInput, ret
     const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$3 AND m.code=$4',[live?.alias ?? null,live?.model ?? null,key.group_id,body.model]);
     if (!quote || body.max_completion_tokens > quote.max_output_tokens) {
       throw new Fault(400,'unsupported_model_or_limit','请选择可用模型，并将输出上限设为 1 至 128。');
+    }
+    if (streaming && quote.model!==mockModel) {
+      throw new Fault(400,'stream_not_supported','当前模型只支持非流式调用。');
     }
     if (quote.model!==mockModel && live?.mode==='compatible' && (
       quote.max_context_tokens!==live.maxContextTokens || quote.max_output_tokens!==live.maxOutputTokens ||
@@ -133,6 +137,14 @@ export async function complete(header: string | null, body: CompletionInput, ret
     return { id:entry.id, rate:quote, hold:reserve };
   });
 
+  return {key,db,live,started,id,rate,hold};
+}
+
+async function finishCompletion(
+  {key,db,live,started,id,rate,hold}: Awaited<ReturnType<typeof prepareCompletion>>,
+  body: CompletionInput,
+  onText?: (content:string) => void,
+) {
   async function markReview(providerId: string | null, reason: string) {
     try {
       await db.query(`UPDATE gateway.usage_requests SET status='review',terminal_reason=$2,
@@ -157,7 +169,7 @@ export async function complete(header: string | null, body: CompletionInput, ret
 
   let result: Awaited<ReturnType<typeof openAiCompletion>>;
   try {
-    result = rate.model===mockModel ? await mockCompletion(body) : await openAiCompletion(body,live!);
+    result = rate.model===mockModel ? await mockCompletion(body,onText) : await openAiCompletion(body,live!);
   } catch (error) {
     const providerId = error instanceof UpstreamError ? error.requestId : null;
     if (error instanceof UpstreamError && error.disposition==='release') {
@@ -203,4 +215,47 @@ export async function complete(header: string | null, body: CompletionInput, ret
     choices:result.choices,
     usage:{ prompt_tokens:input, completion_tokens:output, total_tokens:input+output, prompt_tokens_details:{cached_tokens:cached} },
   };
+}
+
+export async function complete(header:string|null,body:CompletionInput,retry:string|null) {
+  return finishCompletion(await prepareCompletion(header,body,retry),body);
+}
+
+export async function streamCompletion(header:string|null,body:CompletionInput,retry:string|null,includeUsage = false) {
+  const prepared = await prepareCompletion(header,body,retry,true);
+  const id = prepared.id;
+  const metadata = {id,object:'chat.completion.chunk',created:Math.floor(prepared.started/1000),model:body.model};
+  const encoder = new TextEncoder();
+  let disconnected = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      function send(data: unknown) {
+        if (disconnected) return;
+        const payload = data==='[DONE]' ? data : JSON.stringify(data);
+        controller.enqueue(encoder.encode('data: '+payload+'\n\n'));
+      }
+      function sendChoice(delta: {role?:'assistant';content?:string}, finishReason: string|null = null) {
+        send({...metadata,choices:[{index:0,delta,finish_reason:finishReason}],...(includeUsage ? {usage:null} : {})});
+      }
+      // Transport cancellation detaches the client while the gateway finishes accounting.
+      after((async () => {
+        try {
+          sendChoice({role:'assistant'});
+          const result = await finishCompletion(prepared,body,content => sendChoice({content}));
+          sendChoice({},result.choices[0].finish_reason);
+          if (includeUsage) send({...metadata,choices:[],usage:result.usage});
+          send('[DONE]');
+        } catch (error) {
+          send({error:{code:error instanceof Fault ? error.code : 'billing_review',
+            message:'费用待核对，请按请求编号查看记录。',request_id:id}});
+        } finally {
+          if (!disconnected) controller.close();
+        }
+      })());
+    },
+    cancel() { disconnected = true; },
+  });
+  return new Response(stream,{headers:{'Content-Type':'text/event-stream; charset=utf-8',
+    'Cache-Control':'no-store, no-transform','X-Accel-Buffering':'no','X-Request-Id':id}});
 }

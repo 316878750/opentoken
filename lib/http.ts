@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
 import { ensureWallet } from './data';
-import { catalog, complete, createKey, Fault, listKeys, models, updateKey } from './gateway';
+import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { dashboard, usage } from './reports';
 import { appOrigin, endSession, loginSession, sessionCookie, sessionUser, setSession } from './session';
 import { redeemCredit, walletEntries } from './wallet';
@@ -19,10 +19,11 @@ const keyInput = z.object({
 const ledgerFilter = z.object({kind:z.enum(['redemption','usage']).optional(),cursor:z.uuid().optional()});
 const redemptionInput = z.strictObject({code:z.string().trim().min(1).max(128)});
 const callInput = z.strictObject({
-  model:z.string().min(1).max(64), stream:z.literal(false).default(false),
+  model:z.string().min(1).max(64), stream:z.boolean().default(false),
+  stream_options:z.strictObject({include_usage:z.boolean().optional()}).optional(),
   messages:z.array(z.strictObject({ role:z.enum(['system','user','assistant']), content:z.string().min(1).max(3000) })).min(1).max(12),
   max_completion_tokens:z.int().min(1).max(128).default(128),
-});
+}).refine(request => request.stream || !request.stream_options);
 
 function json(data: unknown, status = 200) {
   return NextResponse.json(data,{status,headers:{'cache-control':'no-store'}});
@@ -71,6 +72,7 @@ export async function handle(req: NextRequest) {
       if (Buffer.byteLength(requestBody.messages.map(m => m.content).join(''),'utf8')>3000) {
         throw new Fault(400,'input_too_long','首发接口限 3,000 字节文本输入。');
       }
+      if (requestBody.stream) return await streamCompletion(bearer,requestBody,retry,requestBody.stream_options?.include_usage);
       const result = await complete(bearer,requestBody,retry);
       const response = json(result);
       response.headers.set('x-request-id',result.id);

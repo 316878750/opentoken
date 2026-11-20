@@ -363,3 +363,84 @@ test('a user with an empty wallet can redeem credit, call the mock model and rec
   assert.equal(items[0].requestId,result.headers.get('x-request-id'));
   assert.equal(items[1].id,credit.data.receipt.id);
 });
+
+for (const disconnect of [false,true]) {
+  test(disconnect ? 'disconnected mock stream settles with one ledger debit' : 'mock SSE exposes a hold before one settlement', async () => {
+    const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+    const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+    const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+    const {data:before} = await request('/api/dashboard',{sessionOverride});
+    const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
+      body:{name:'stream fixture',groupId:rates.find(rate=>rate.model==='mock-text').groupId,rpm:10}});
+    const response = await fetch(base+'/v1/chat/completions',{method:'POST',
+      headers:{'content-type':'application/json',authorization:'Bearer '+key.secret,'idempotency-key':crypto.randomUUID()},
+      body:JSON.stringify({model:'mock-text',messages:[{role:'user',content:'SSE fixture'}],max_completion_tokens:128,
+        stream:true,stream_options:{include_usage:true}})});
+    assert.equal(response.status,200);
+    assert.match(response.headers.get('content-type'),/^text\/event-stream/);
+    const id = response.headers.get('x-request-id');
+    assert.match(id,/^[a-f0-9-]{36}$/);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.equal(first.done,false);
+    const {data:during} = await request('/api/dashboard',{sessionOverride});
+    assert.equal(BigInt(during.heldMicros)-BigInt(before.heldMicros),2_000_000n);
+    if (disconnect) await reader.cancel();
+    else {
+      const decoder = new TextDecoder();
+      let text = decoder.decode(first.value,{stream:true});
+      while (!text.includes('data: [DONE]\n\n')) {
+        const next = await reader.read();
+        assert.equal(next.done,false,'SSE closed before the completion marker');
+        text += decoder.decode(next.value,{stream:true});
+      }
+      const events = (text+decoder.decode()).trim().split('\n\n').map(line=>line.slice('data: '.length));
+      assert.equal(events.pop(),'[DONE]');
+      const chunks = events.map(line=>JSON.parse(line));
+      assert.ok(chunks.every(chunk=>chunk.id===id && chunk.object==='chat.completion.chunk'));
+      const content = chunks.flatMap(chunk=>chunk.choices.map(choice=>choice.delta.content).filter(Boolean));
+      assert.ok(content.length>1,'response should contain multiple content chunks');
+      assert.match(content.join(''),/本地模拟调用已完成/);
+      assert.equal(chunks.find(chunk=>chunk.choices[0]?.finish_reason==='stop').id,id);
+      assert.deepEqual(chunks.at(-1).choices,[]);
+      assert.equal(chunks.at(-1).usage.completion_tokens,48);
+    }
+    const readUsage = async () => (await request('/api/usage?request_id='+id,{sessionOverride})).data.items[0];
+    let row = await readUsage();
+    if (disconnect) {
+      for (let attempts = 0; row?.status!=='settled' && attempts < 40; attempts++) {
+        await sleep(200);
+        row = await readUsage();
+      }
+    } else {
+      assert.equal((await reader.read()).done,true);
+    }
+    assert.equal(row.status,'settled');
+    assert.equal(row.reservedMicros,'2000000');
+    assert.equal(row.chargedMicros,'750000');
+    assert.equal(row.releasedMicros,'1250000');
+    const {data:after} = await request('/api/dashboard',{sessionOverride});
+    assert.equal(after.heldMicros,before.heldMicros);
+    assert.equal(BigInt(before.balanceMicros)-BigInt(after.balanceMicros),750_000n);
+    const {data:ledger} = await request('/api/wallet/entries',{sessionOverride});
+    assert.deepEqual(ledger.items.filter(entry=>entry.requestId===id).map(entry=>entry.deltaMicros),['-750000']);
+  });
+}
+
+test('rejects streaming for a non-enabled model before reserving any credit', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const rate = rates.find(item=>item.upstream==='compatible');
+  const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
+    body:{name:'non-stream fixture',groupId:rate.groupId,rpm:10}});
+  const {data:before} = await request('/api/dashboard',{sessionOverride});
+  const failed = await request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,
+    body:{model:rate.model,messages:[{role:'user',content:'Unsupported stream'}],max_completion_tokens:128,stream:true}});
+  assert.equal(failed.status,400);
+  assert.equal(failed.data.error.code,'stream_not_supported');
+  const {data:after} = await request('/api/dashboard',{sessionOverride});
+  assert.equal(after.balanceMicros,before.balanceMicros);
+  assert.equal(after.heldMicros,before.heldMicros);
+  assert.equal((await request('/api/usage?key_id='+key.id,{sessionOverride})).data.items.length,0);
+});

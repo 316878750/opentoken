@@ -74,6 +74,18 @@ td { overflow-wrap: anywhere; }
 .request-row summary { display: grid; grid-template-columns: 1.25fr 1.4fr 1fr 1fr; gap: var(--zc-space-8); align-items: center; cursor: pointer; }
 .request-row summary .badge { justify-self: start; }
 .request-row p { margin-top: var(--zc-space-8); }
+.trend-summary, .trend-details { margin-top: var(--zc-space-16); }
+.trend-chart {
+  height: 8rem;
+  display: flex;
+  gap: clamp(.125rem, .55vw, .5rem);
+  align-items: flex-end;
+  margin-top: var(--zc-space-8);
+  border-bottom: thin solid var(--zc-color-border-input);
+}
+.trend-chart > div { flex: 1; min-width: 0; background: var(--zc-color-accent); border-radius: .2rem .2rem 0 0; }
+.trend-dates { display: flex; justify-content: space-between; color: var(--zc-color-text-muted); font-size: var(--zc-type-sm-size); }
+.trend-details summary { cursor: pointer; }
 
 /* Match the lg and sm breakpoints in design/tokens.json. */
 @media (max-width: 63.99rem) {

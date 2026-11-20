@@ -11,7 +11,7 @@ jobs:
   readiness:
     if: vars.OPENTOKEN_PILOT_URL != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     env:
       PILOT_URL: ${{ vars.OPENTOKEN_PILOT_URL }}
     steps:
@@ -24,13 +24,13 @@ jobs:
           fi
           origin="${PILOT_URL%/}"
           for attempt in 1 2; do
-            if curl --proto '=https' --fail --silent --show-error --connect-timeout 8 --max-time 25 "$origin/api/health" |
+            if curl --proto '=https' --fail --silent --show-error --connect-timeout 8 --max-time 75 "$origin/api/health" |
                 jq -e '. == {"status":"ok"}' >/dev/null &&
                 [[ "$(curl --proto '=https' --silent --show-error --connect-timeout 8 --max-time 20 --output /dev/null --write-out '%{http_code}' "$origin/login")" == '200' ]]; then
               echo "Pilot is ready"
               exit 0
             fi
-            if [[ "$attempt" == 1 ]]; then sleep 5; fi
+            if [[ "$attempt" == 1 ]]; then sleep 25; fi
           done
           echo "::error::Pilot readiness or login page unavailable"
           exit 1

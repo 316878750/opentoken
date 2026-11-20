@@ -6,15 +6,16 @@
 | --- | --- |
 | 应用代码和迁移 | 部署构建通过，29 项隔离测试通过。试点库已应用迁移 001–004。 |
 | 试点数据库 | Supabase 项目 `opentoken`，使用低权限应用账号。数据库内每五分钟运行账本对账。 |
-| 备份与恢复 | 已校验试点加密快照，覆盖 14 张表，账务检查通过。隔离 PostgreSQL 已完成恢复演练。 |
-| 正式 HTTPS 地址 | 选用 Render 免费 Web Service 分配的 `onrender.com` 地址，等待私有仓库授权及部署验证。 |
-| 邀请和告警通知 | 首轮联系对象及告警邮箱已确认，正式地址就绪后配置与验证。 |
+| 备份与恢复 | 已校验包含线上验收流水的试点加密快照，覆盖 14 张表，零账务异常。隔离 PostgreSQL 已完成恢复演练，已启用本机每日备份任务。 |
+| 正式 HTTPS 地址 | Render 免费 Web Service `opentoken-pilot` 已在新加坡上线。登录与健康接口均返回 HTTP 200。 |
+| Supabase Auth | 已配置正式站点地址与 `/invite` 重定向，公开注册已关闭。 |
+| 告警通知 | GitHub Actions HTTPS 检查已启用并通过首次运行。Codex 本机自动化发送故障邮件。告警测试邮件已提交发送，收件确认待回执。 |
 
 试点入口仅供受邀用户。放出链接前，在目标 Supabase 项目的 **Authentication → Sign In / Providers** 关闭公开注册，保留邮箱和密码登录。在 **URL Configuration** 设置正式 HTTPS 地址，并把正式地址的 `/invite` 加入 Auth 重定向列表。用公开 Auth 设置确认 `disable_signup` 为 `true`。
 
 ## 托管设置
 
-在 Render 创建免费 Web Service，从 GitHub 导入 `316878750/opentoken` 的 `main` 分支，运行环境选 Node，健康检查路径设为 `/api/health`。应用和网关使用 Render 分配的同一个 HTTPS 地址。[Render 的 Next.js 部署说明](https://render.com/docs/deploy-nextjs-app)
+在 Render 创建免费 Web Service，从 GitHub 导入 `316878750/opentoken` 的 `main` 分支，运行环境选 Node，健康检查路径设为 `/api/health`。应用入口为 [OpenToken 登录](https://opentoken-pilot.onrender.com/login)，兼容网关使用同一域名下的 `/v1`。[Render 的 Next.js 部署说明](https://render.com/docs/deploy-nextjs-app)
 
 构建命令安装锁定的依赖并构建应用。
 
@@ -53,7 +54,7 @@ APP_ORIGIN="${APP_ORIGIN:-$RENDER_EXTERNAL_URL}" node node_modules/next/dist/bin
 
 - 配置仓库的 Actions 变量 `OPENTOKEN_PILOT_URL` 为正式 HTTPS 源地址。**Pilot health** 每 15 分钟检查登录页和健康接口，可手动运行。Render 免费实例闲置后会休眠，健康检查允许等待启动并重试一次。健康接口核对数据库权限、Supabase Auth、关闭公开注册的设置和网关配置，探针只读取服务状态。[Render 免费实例限制](https://render.com/docs/free)
 - 在托管平台查看应用错误日志，在 Supabase Cron 查看 `opentoken-billing-maintenance` 的运行结果。用 `pnpm db:billing alerts` 检查账务告警。
-- 用接收邮箱验证实际通知渠道。GitHub Actions 可记录检查失败，试点启用前应发一次监控测试通知并确认收到。
+- [首次 GitHub Actions 检查已通过](https://github.com/316878750/opentoken/actions/runs/44739829526)。Codex 本机自动化「OpenToken 试点故障邮件」每 30 分钟读取工作流结果，每次故障最多发送一封邮件。邮件转发依赖本机 Codex 和 Gmail 连接。测试邮件已发出，收件箱的实际投递待收件人确认。
 
 ## 邀请和验收
 
@@ -65,6 +66,10 @@ APP_ORIGIN="${APP_ORIGIN:-$RENDER_EXTERNAL_URL}" node node_modules/next/dist/bin
 4. 发起一次非流式模型调用。在概览记录预占及释放，在使用记录和钱包流水用请求 ID 核对扣费。
 5. 将每一步的通过状态记录到运营验收记录。保留请求 ID 和收据 ID，配置和凭据留在本地。
 
+2026-11-20 在 Render 正式地址完成了运营验收。Supabase 试点账号可登录，会话 Cookie 使用 `HttpOnly`、`Secure` 和 `SameSite=Strict`。密钥创建时返回完整值，后续列表只显示前缀，验收后已撤销临时密钥。试点补额 3.00 美元已入账，一笔 `mock-text` 非流式请求预占 2.00 美元、扣费 0.75 美元、释放 1.25 美元。仪表盘、使用记录和钱包流水金额一致。受邀用户自行走查的结果另行登记。
+
+已向首轮唯一确认的试点账号发出邀请邮件。试点用户可以用已有账号及已入账的验收额度走查，收件回执和用户自行验收结果待确认。
+
 ## 备份恢复
 
-在试点开启前生成一份加密快照并校验。试点运行时按约定周期执行备份，密钥和备份分开保存。恢复演练使用隔离目标库，并比对登录用户标识、钱包、预占和流水。详见 [加密备份与恢复手册](backup.md)。
+试点开启前和线上验收后均生成了加密快照。Codex 本机自动化「OpenToken 每日加密备份」每天 02:15（北京时间）创建并校验加密快照。需要本机可运行且能连接 Supabase。密钥和备份分开保存。恢复演练使用隔离目标库，并比对登录用户标识、钱包、预占和流水。详见 [加密备份与恢复手册](backup.md)。

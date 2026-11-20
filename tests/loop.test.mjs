@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
-import { check,migrate,seed } from '../scripts/database.mjs';
+import { check,enableStripeSandbox,migrate,seed } from '../scripts/database.mjs';
 import { redeemCommand } from '../scripts/redeem.mjs';
 import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
 
@@ -105,6 +105,8 @@ test.before(async () => {
     windowsHide:true,stdio:['ignore','pipe','inherit'],env:{...process.env,NEXT_TELEMETRY_DISABLED:'1',
       DATABASE_URL:'postgresql://opentoken_app@'+socket.getServerConn()+'/postgres',
       SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
+      STRIPE_TEST_SECRET_KEY:'sk_test_fixture',STRIPE_TEST_WEBHOOK_SECRET:'whsec_fixture',
+      STRIPE_TEST_CREDIT_PRICE_ID:'price_fixture_credit',STRIPE_TEST_SUBSCRIPTION_PRICE_ID:'price_fixture_monthly',
       GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',...upstreamEnv},
   });
   serverExit = once(server,'exit');
@@ -615,4 +617,123 @@ test('daily usage trends fill 7 and 30 local days, reconcile charges, and isolat
   assert.ok(other.data.items.every(day=>day.requests===0 && day.tokens==='0' && day.chargedMicros==='0'));
   assert.equal((await trend(8,'UTC')).status,400);
   assert.equal((await trend(7,'Invalid/Timezone')).status,400);
+});
+
+async function stripeEvent(type,object,{id='evt_'+crypto.randomUUID().replaceAll('-',''),live=false,valid=true}={}) {
+  const timestamp = Math.floor(Date.now()/1000);
+  const payload = JSON.stringify({id,type,object:'event',livemode:live,created:timestamp,data:{object}});
+  const signature = createHmac('sha256',valid?'whsec_fixture':'invalid_secret').update(timestamp+'.'+payload).digest('hex');
+  const response = await fetch(base+'/api/stripe/webhook',{method:'POST',body:payload,headers:{
+    'content-type':'application/json','stripe-signature':'t='+timestamp+',v1='+signature,
+  }});
+  return response.status;
+}
+
+async function enableStripeFixture() {
+  const {rows:[{marked}]} = await database.query('SELECT EXISTS(SELECT 1 FROM gateway.stripe_sandbox) AS marked');
+  if (marked) return;
+  await database.exec('RESET ROLE');
+  try {
+    const {rows:[{fixtures}]} = await database.query("SELECT EXISTS (SELECT 1 FROM gateway.usage_requests WHERE upstream_model_snapshot='vendor/text-model') AS fixtures");
+    if (fixtures) {
+      await assert.rejects(enableStripeSandbox(admin),/separate database/);
+      // All earlier upstream requests were fixtures. Simulate a dedicated database for the payment tests.
+      await database.query('INSERT INTO gateway.stripe_sandbox(enabled) VALUES(true)');
+    } else {
+      await enableStripeSandbox(admin);
+    }
+  } finally { await database.exec('SET ROLE opentoken_app'); }
+}
+
+test('Stripe sandbox checkout uses signed paid events and credits the wallet exactly once', async () => {
+  const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const {data:before} = await request('/api/dashboard',{sessionOverride});
+  const body = {kind:'credit',nonce:crypto.randomUUID()};
+  assert.equal((await request('/api/billing/checkout',{method:'POST',body,sessionOverride})).status,503);
+  const {data:{rates}} = await request('/api/catalog',{sessionOverride});
+  const live = rates.find(rate=>rate.upstream==='compatible');
+  const {data:key} = await request('/api/keys',{method:'POST',sessionOverride,
+    body:{name:'prior provider key',groupId:live.groupId,rpm:10}});
+  await enableStripeFixture();
+  assert.ok((await request('/api/catalog',{sessionOverride})).data.rates.every(rate=>rate.upstream==='mock'));
+  const forbiddenBeforePayment = await request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,
+    body:{model:live.model,messages:[{role:'user',content:'must never dispatch'}],max_completion_tokens:16}});
+  assert.equal(forbiddenBeforePayment.status,400);
+  assert.equal((await request('/api/usage?key_id='+key.id,{sessionOverride})).data.items.length,0);
+  await assert.rejects(database.query(`INSERT INTO gateway.usage_requests
+    (user_id,key_id,group_id,model_id,rate_id,upstream_model_snapshot,reserved_micros,status)
+    SELECT k.user_id,k.id,k.group_id,m.id,r.id,m.upstream_model,1,'dispatched'
+    FROM gateway.api_keys k JOIN gateway.model_rates r ON r.group_id=k.group_id
+    JOIN gateway.models m ON m.id=r.model_id WHERE k.id=$1 AND m.code=$2 AND r.closed_at IS NULL`,[key.id,live.model]),
+  {code:'23514',message:/Stripe sandbox prevents real upstream dispatch/});
+  const order = await request('/api/billing/checkout',{method:'POST',body,sessionOverride});
+  assert.equal(order.status,200);
+  assert.match(order.data.url,/^https:\/\/checkout\.stripe\.com\//);
+  const duplicate = await request('/api/billing/checkout',{method:'POST',body,sessionOverride});
+  assert.deepEqual(duplicate.data,order.data);
+  const object = {object:'checkout.session',id:'cs_test_'+order.data.id.replaceAll('-',''),mode:'payment',
+    client_reference_id:order.data.id,livemode:false,amount_total:500,currency:'usd',payment_intent:'pi_fixture_credit',
+    metadata:{opentoken_order:order.data.id,opentoken_price:'price_fixture_credit'},payment_status:'paid'};
+  assert.equal(await stripeEvent('checkout.session.completed',object,{valid:false}),400);
+  assert.equal(await stripeEvent('checkout.session.completed',object,{live:true}),400);
+  assert.equal(await stripeEvent('checkout.session.completed',{...object,payment_status:'unpaid'}),200);
+  assert.equal(await stripeEvent('checkout.session.completed',{...object,amount_total:499}),500);
+  assert.equal((await request('/api/dashboard',{sessionOverride})).data.balanceMicros,before.balanceMicros);
+  assert.equal(await stripeEvent('checkout.session.completed',object,{id:'evt_fixture_credit'}),200);
+  assert.equal(await stripeEvent('checkout.session.completed',object,{id:'evt_fixture_credit'}),200);
+  assert.equal(await stripeEvent('checkout.session.async_payment_succeeded',object),200);
+  const {data:after} = await request('/api/dashboard',{sessionOverride});
+  assert.equal(BigInt(after.balanceMicros)-BigInt(before.balanceMicros),5_000_000n);
+  const {data:{orders}} = await request('/api/billing',{sessionOverride});
+  assert.equal(orders.find(item=>item.id===order.data.id).state,'paid');
+  const another = await request('/api/session/login',loginPayload('pilot-b@example.test'));
+  assert.deepEqual((await request('/api/billing',{sessionOverride:another.headers.get('set-cookie').split(';')[0]})).data.orders,[]);
+});
+
+test('Stripe sandbox subscription reflects authoritative status and protects the customer portal', async () => {
+  await enableStripeFixture();
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.get('set-cookie').split(';')[0];
+  const sessionOverride = await signIn('pilot-a@example.test');
+  const body = {kind:'subscription',nonce:crypto.randomUUID()};
+  const order = await request('/api/billing/checkout',{method:'POST',body,sessionOverride});
+  assert.equal(order.status,200);
+  const id = order.data.id;
+  const metadata = {opentoken_order:id,opentoken_price:'price_fixture_monthly'};
+  const subscription = 'sub_'+id.replaceAll('-','');
+  const record = async () => (await request('/api/billing',{sessionOverride})).data.orders.find(item=>item.id===id);
+  await database.query("UPDATE gateway.stripe_orders SET checkout_id=NULL,expires_at=now()-interval '1 minute' WHERE id=$1",[id]);
+  const delayed = await request('/api/billing/checkout',{method:'POST',sessionOverride,
+    body:{kind:'subscription',nonce:crypto.randomUUID()}});
+  assert.equal(delayed.status,409,'A completed Stripe checkout with delayed webhooks still blocks a replacement');
+  assert.equal(await stripeEvent('customer.subscription.created',{id:subscription,metadata}),200);
+  assert.equal((await record()).subscriptionStatus,'active');
+  assert.equal(await stripeEvent('checkout.session.completed',{
+    object:'checkout.session',id:'cs_test_'+id.replaceAll('-',''),mode:'subscription',client_reference_id:id,livemode:false,
+    amount_total:1000,currency:'usd',metadata,payment_status:'paid',subscription,customer:'cus_fixture',
+  }),200);
+  assert.equal((await record()).state,'paid');
+  const anotherCheckout = await request('/api/billing/checkout',{method:'POST',sessionOverride,
+    body:{kind:'subscription',nonce:crypto.randomUUID()}});
+  assert.equal(anotherCheckout.status,409);
+  const portal = await request('/api/billing/portal',{method:'POST',sessionOverride});
+  assert.equal(portal.data.url,'https://billing.stripe.com/p/session/fixture');
+  const otherPortal = await request('/api/billing/portal',{method:'POST',sessionOverride:await signIn('pilot-b@example.test')});
+  assert.equal(otherPortal.status,404);
+  assert.equal(await stripeEvent('invoice.payment_failed',{parent:{subscription_details:{subscription}}}),200);
+  assert.equal((await record()).subscriptionStatus,'past_due');
+  assert.equal(await stripeEvent('customer.subscription.deleted',{id:subscription,metadata}),200);
+  assert.equal((await record()).subscriptionStatus,'canceled');
+  assert.equal(await stripeEvent('customer.subscription.updated',{id:subscription,metadata}),200);
+  assert.equal((await record()).subscriptionStatus,'canceled');
+
+  const abandoned = (await database.query(`INSERT INTO gateway.stripe_orders
+    (user_id,nonce,kind,price_id,amount_cents,created_at,expires_at)
+    VALUES ($1,$2,'subscription','price_fixture_monthly',1000,now()-interval '1 hour',now()-interval '15 minutes')
+    RETURNING id`,[primary,crypto.randomUUID()])).rows[0];
+  const replacement = await request('/api/billing/checkout',{method:'POST',sessionOverride,
+    body:{kind:'subscription',nonce:crypto.randomUUID()}});
+  assert.equal(replacement.status,200,'A proven absent Stripe session no longer blocks a new subscription');
+  const {data:{orders}} = await request('/api/billing',{sessionOverride});
+  assert.equal(orders.find(item=>item.id===abandoned.id).state,'expired');
 });

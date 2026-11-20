@@ -28,7 +28,8 @@ const rateQuery = `SELECT r.id AS rate_id, m.id AS model_id, g.id AS group_id, m
     max_context integer, max_output integer, input_rate bigint, cache_rate bigint, output_rate bigint, multiplier integer)
     ON route.alias=m.code AND route.model=m.upstream_model AND route.group_code=g.code
   WHERE r.closed_at IS NULL AND m.enabled AND g.enabled
-    AND ((m.code='${mockModel}' AND m.upstream_model='${mockModel}') OR route.alias IS NOT NULL)`;
+    AND ((m.code='${mockModel}' AND m.upstream_model='${mockModel}') OR
+      (route.alias IS NOT NULL AND NOT EXISTS (SELECT 1 FROM gateway.stripe_sandbox WHERE enabled)))`;
 const availableRateQuery = `${rateQuery} AND ${inSync}`;
 
 function routeParameters(providers:ReturnType<typeof resolveLiveUpstreams>) {
@@ -119,6 +120,7 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
   const live = providers.find(provider=>provider.alias===body.model);
   const started = Date.now();
   const { id, rate, hold } = await transaction(async tx => {
+    if (live) await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros)::text AS available
       FROM gateway.wallets WHERE user_id=$1 FOR UPDATE`,[key.user_id]);
     const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE id=$1 FOR UPDATE`,[key.id]);

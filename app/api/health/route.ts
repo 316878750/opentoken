@@ -9,6 +9,7 @@ let probe: {expiresAt:number; result:Promise<boolean>} | undefined;
 
 async function checkDatabase() {
   const {rows:[row]} = await store().db.query<{ready:boolean}>(`SELECT
+    to_regclass('gateway.stripe_sandbox') IS NOT NULL AND
     has_table_privilege(to_regclass('gateway.wallets'),'SELECT') AND
     has_function_privilege(to_regprocedure('gateway.redeem_trial_credit(uuid,bytea)'),'EXECUTE') AS ready`);
   if (!row.ready) throw new Error('Gateway schema is unavailable');

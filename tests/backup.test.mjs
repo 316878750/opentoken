@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import test from 'node:test';
-import { decodeBackup, encodeBackup, postgresEndpoint, restoreTarget } from '../scripts/backup.mjs';
+import { backupTables, decodeBackup, encodeBackup, postgresEndpoint, restoreTarget } from '../scripts/backup.mjs';
 
 test('backup encrypts binary archive and manifest, rejecting modified bytes or the wrong key', () => {
   const key = randomBytes(32);
@@ -33,4 +33,12 @@ test('remote database connection values require TLS hostname verification', () =
   assert.throws(() => postgresEndpoint('postgresql://u:p@db.example.test/postgres?sslmode=require'), /verify-full/);
   assert.throws(() => postgresEndpoint('postgresql://u:p@db.example.test/postgres?sslmode=verify-full&options=secret'), /plain PostgreSQL/);
   assert.equal(postgresEndpoint('postgresql://u:p%40ss@db.example.test/postgres?sslmode=verify-full').password, 'p@ss');
+});
+
+test('legacy and Stripe snapshots validate their explicit migration inventories', () => {
+  const pilot = ['001','002','003','004'];
+  assert.equal(backupTables(pilot).length,14);
+  assert.deepEqual(backupTables([...pilot,'005']).filter(table=>table.includes('stripe')),
+    ['gateway.stripe_events','gateway.stripe_orders','gateway.stripe_sandbox']);
+  assert.throws(()=>backupTables([...pilot,'999']),/Unsupported migration/);
 });

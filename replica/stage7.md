@@ -32,7 +32,18 @@
 
 ## 7.4 在线支付与订阅
 
-- [ ] 在沙盒中验证托管结账、订单与支付回调。以验签后的服务端事件确认支付，按支付对象唯一键幂等入账，处理失败与重发。
-- [ ] 用订阅账期和事件管理权益。用户确定支付商、可用地区、币种、套餐与退款口径后，再确定正式接入配置和上线验收。真实扣款单独授权。
+- [x] 接入 Stripe 测试 Checkout。在本地验证签名、币种和金额校验、钱包入账、相同事件重发及不同事件标识指向同一笔支付。
+- [x] 接入测试订阅和 Stripe Customer Portal。在本地验证开通、续费异常、取消、延迟回调防重复开通，以及账号隔离。
+- [ ] 使用真实 Stripe 沙盒价格、测试卡和实际回调验收支付、续费与取消。正式套餐权益、税费、币种及退款口径另行确认。
+
+使用独立的沙盒数据库，先迁移至 005，再用沙盒数据库管理员连接运行 `node --env-file=.env.local scripts/database.mjs stripe-sandbox`。命令会拒绝已有真实上游请求的数据库。启用标记后，网关会在该数据库禁用真实上游路由，Stripe 测试充值只用于模拟调用。
+
+在沙盒服务设置 `STRIPE_TEST_SECRET_KEY`（`sk_test_`）、`STRIPE_TEST_WEBHOOK_SECRET`、`STRIPE_TEST_CREDIT_PRICE_ID` 和 `STRIPE_TEST_SUBSCRIPTION_PRICE_ID`。价格分别使用美元一次性价和周期价。配置 Stripe 测试 Customer Portal，从 Stripe 测试事件转发至 `/api/stripe/webhook`。沙盒端到端验收使用 Stripe 测试卡。每笔充值按等额测试余额入账，订阅显示支付状态和当前账期。回跳页展示订单，钱包余额以通过验签的支付事件为准。
+
+订阅 Checkout 在 Stripe 确认已过期或终止前会阻止再次开通。若与 Stripe 的首次创建通信中断，可用原浏览器继续同一个结账请求。若订单已过期且缺少 Stripe 会话号，网关按订单创建时间和编号核对 Stripe 会话。已完成但待回调的结账继续阻止重复开通，确定没有创建会话时才放行。
+
+本机 PostgreSQL 演练已核对 17 张表、零账务异常，恢复后订单、事件、测试钱包和隔离标记一致。旧版 14 表归档仍可校验。
 
 [OpenAI 流式事件格式](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)
+
+[Stripe Checkout 履约](https://docs.stripe.com/checkout/fulfillment) · [Stripe Webhook 验签](https://docs.stripe.com/webhooks/signature)

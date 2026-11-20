@@ -1,8 +1,66 @@
 // Loaded only by the integration runner. No test process sends external requests.
 const originalFetch = globalThis.fetch;
+const checkouts = new Map();
+const subscriptionReads = new Map();
+
+function stripeFixture(url,options) {
+  if (new Headers(options.headers).get('authorization')!=='Bearer sk_test_fixture' || options.redirect!=='error') {
+    throw new Error('Unexpected sandbox credentials or redirect policy');
+  }
+  const reply = data => new Response(JSON.stringify(data),{headers:{'content-type':'application/json','request-id':'req_fixture'}});
+  const path = url.pathname;
+  if (path==='/v1/prices/price_fixture_credit') return reply({
+    id:'price_fixture_credit',object:'price',livemode:false,active:true,currency:'usd',type:'one_time',unit_amount:500,
+  });
+  if (path==='/v1/prices/price_fixture_monthly') return reply({
+    id:'price_fixture_monthly',object:'price',livemode:false,active:true,currency:'usd',type:'recurring',unit_amount:1000,
+  });
+  if (path==='/v1/checkout/sessions' && options.method==='POST') {
+    const form = new URLSearchParams(String(options.body));
+    const order = form.get('client_reference_id');
+    const mode = form.get('mode');
+    const price = form.get('line_items[0][price]');
+    if (!order || new Headers(options.headers).get('idempotency-key')!=='opentoken-checkout-'+order ||
+      form.get('metadata[opentoken_order]')!==order || form.get('metadata[opentoken_price]')!==price ||
+      (mode==='subscription' && form.get('subscription_data[metadata][opentoken_order]')!==order)) {
+      throw new Error('Unexpected Stripe Checkout parameters');
+    }
+    const id = 'cs_test_'+order.replaceAll('-','');
+    const session = {id,object:'checkout.session',livemode:false,client_reference_id:order,mode,status:'open',
+      amount_total:mode==='subscription'?1000:500,currency:'usd',payment_status:'unpaid',
+      url:'https://checkout.stripe.com/c/pay/'+id,metadata:{opentoken_order:order,opentoken_price:price}};
+    checkouts.set(id,session);
+    return reply(session);
+  }
+  if (path==='/v1/checkout/sessions' && options.method==='GET') {
+    if (!url.searchParams.has('created[gte]') || !url.searchParams.has('created[lte]')) throw new Error('Stripe recovery must use a bounded creation window');
+    return reply({object:'list',has_more:false,data:[...checkouts.values()].map(checkout=>
+      checkout.mode==='subscription' ? {...checkout,status:'complete'} : checkout)});
+  }
+  if (path.startsWith('/v1/checkout/sessions/')) {
+    const checkout = checkouts.get(path.split('/').pop());
+    return reply(checkout?.mode==='subscription' ? {...checkout,status:'complete'} : checkout);
+  }
+  if (path.startsWith('/v1/subscriptions/')) {
+    const id = path.split('/').pop();
+    const checkout = checkouts.get('cs_test_'+id.slice(4));
+    if (!checkout || checkout.mode!=='subscription') throw new Error('Unexpected Stripe subscription lookup');
+    const reads = subscriptionReads.get(id) ?? 0;
+    subscriptionReads.set(id,reads+1);
+    return reply({id,object:'subscription',livemode:false,customer:'cus_fixture',status:['active','past_due','canceled'][Math.min(reads,2)],
+      metadata:checkout.metadata,items:{data:[{price:{id:checkout.metadata.opentoken_price},current_period_end:Math.floor(Date.now()/1000)+3_600}]}});
+  }
+  if (path==='/v1/billing_portal/sessions' && options.method==='POST') {
+    if (new URLSearchParams(String(options.body)).get('customer')!=='cus_fixture') throw new Error('Unexpected Stripe portal customer');
+    return reply({id:'bps_fixture',object:'billing_portal.session',livemode:false,url:'https://billing.stripe.com/p/session/fixture'});
+  }
+  throw new Error('Unexpected Stripe fixture request');
+}
+
 globalThis.fetch = async (input,options) => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   if (url.origin==='http://127.0.0.1' || url.origin.startsWith('http://127.0.0.1:')) return originalFetch(input,options);
+  if (url.origin==='https://api.stripe.com') return stripeFixture(url,options);
   if (url.href!=='https://provider.example/v1/chat/completions') throw new Error('Unexpected external request in integration test');
   const request = JSON.parse(options.body);
   await new Promise(resolve => setTimeout(resolve,1500));

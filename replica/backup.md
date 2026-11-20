@@ -2,7 +2,7 @@
 
 ## 备份范围
 
-OpenToken 使用 `pg_dump` 自定义格式，在同一个 PostgreSQL 只读快照中保存 `gateway` 的 12 张表，以及 `auth.users` 和 `auth.identities`。这包含钱包、冻结额、计费流水、请求与审计记录、兑换码摘要、API 密钥摘要、模型价格、迁移记录、认证用户 UUID 和密码哈希。归档和校验清单均以 AES-256-GCM 加密。原生数据库工具的明文数据通过内存传递。备份和恢复命令按试点规模限制单份归档与恢复 SQL 各为 256 MiB。
+OpenToken 使用 `pg_dump` 自定义格式，在同一个 PostgreSQL 只读快照中保存业务表、`auth.users` 和 `auth.identities`。迁移至 004 的快照覆盖 14 张表。迁移至 005 的快照覆盖 17 张表，另包含 Stripe 沙盒标记、订单和事件。认证用户 UUID、密码哈希、API 密钥摘要、钱包及账本都在加密范围内。归档和校验清单均以 AES-256-GCM 加密，原生数据库工具的明文数据通过内存传递。备份和恢复命令按试点规模限制单份归档与恢复 SQL 各为 256 MiB。
 
 恢复环境先用对应版本的项目迁移重建 `gateway` 结构、函数和权限，并由目标 Supabase 提供托管 `auth` 表结构。会话、刷新令牌、MFA、OAuth/SMTP/回调配置、JWT 签名密钥、数据库和上游凭据、Storage 对象、数据库角色密码、扩展与定时任务配置需要独立管理。恢复后用户重新登录。已有 OpenToken API 密钥是否继续可用取决于同一 `GATEWAY_SECRET`，该密钥从批准的密钥存储取得。
 
@@ -22,12 +22,12 @@ node --env-file=.env.local scripts/backup.mjs create
 node scripts/backup.mjs verify .demo-data/backups/opentoken-<timestamp>-<id>.otbk
 ```
 
-`keygen` 拒绝覆盖已有密钥。`create` 在 `.demo-data/backups` 生成带 UTC 时间的加密归档。`verify` 验证 GCM 认证标签、检查 14 张表的归档目录并解码整个 `pg_dump` 数据，输出快照时间与账务异常数量。校验会在创建文件之前执行一次。每次重要变更前及试点期间每天保留一份校验通过的归档。实际可恢复时间点以最后成功校验的试点归档为准。
+`keygen` 拒绝覆盖已有密钥。`create` 在 `.demo-data/backups` 生成带 UTC 时间的加密归档。`verify` 验证 GCM 认证标签、按迁移版本检查归档目录并解码整个 `pg_dump` 数据，输出快照时间、表数与账务异常数量。校验会在创建文件之前执行一次。每次重要变更前及试点期间每天保留一份校验通过的归档。实际可恢复时间点以最后成功校验的试点归档为准。
 
 ## 隔离恢复演练
 
 1. 在隔离 PostgreSQL 实例上创建新空库，库名使用 `opentoken_restore_` 前缀。准备与源一致的 `auth.users` 和 `auth.identities` 表结构及受限 `opentoken_app` 数据库角色。对 Supabase 项目则由平台预置 Auth 结构。
-2. 将目标库连接放入单独的本地环境文件或进程环境，设置该目标的 `MIGRATION_DATABASE_URL`，运行 `node --env-file=.env.recovery.local scripts/database.mjs migrate`。保持用户表和 `gateway` 业务表为空。迁移记录由脚本与归档核对。
+2. 将目标库连接放入单独的本地环境文件或进程环境，设置该目标的 `MIGRATION_DATABASE_URL`，运行 `node --env-file=.env.recovery.local scripts/database.mjs migrate`。保持用户表和 `gateway` 业务表为空。目标库的迁移版本必须与归档匹配。恢复 004 归档时，用第 6 阶段提交 `dff9411` 的迁移脚本准备目标库，恢复校验成功后再迁移到 005。若迁移到 005，备份任务应按 17 张表校验。
 3. 准备专用的 `BACKUP_TARGET_DATABASE_URL`。恢复命令会核对目标 PostgreSQL 主版本、表清单、迁移版本和空库状态，锁定表后在同一事务内恢复，保留外键和触发器检查，并对比每张表的行数、数据摘要和账务异常数量。任何一步失败均回滚。演练使用合成用户、账务和认证数据，创建演练归档后先移入 `.demo-data/backup-drills`。
 
 ```powershell

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
+import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
 import { dashboard, usage, usageTrend } from './reports';
 import { appOrigin, endSession, loginSession, sessionCookie, sessionUser, setSession } from './session';
 import { redeemCredit, walletEntries } from './wallet';
@@ -18,6 +19,7 @@ const keyInput = z.object({
 });
 const ledgerFilter = z.object({kind:z.enum(['redemption','usage']).optional(),cursor:z.uuid().optional()});
 const trendRange = z.enum(['7','30']).default('7');
+const checkoutInput = z.strictObject({kind:z.enum(['credit','subscription']),nonce:z.uuid()});
 const redemptionInput = z.strictObject({code:z.string().trim().min(1).max(128)});
 const callInput = z.strictObject({
   model:z.string().min(1).max(64), stream:z.boolean().default(false),
@@ -34,7 +36,7 @@ function parse<T>(schema: z.ZodType<T>, data: unknown): T {
   if (!result.success) throw new Fault(400,'invalid_request','请检查输入字段及其格式。');
   return result.data;
 }
-async function body(req: NextRequest) {
+async function jsonText(req: NextRequest,limit=16_384) {
   if (!req.headers.get('content-type')?.startsWith('application/json') || !req.body) {
     throw new Fault(400,'invalid_body','请发送 JSON 请求。');
   }
@@ -46,16 +48,22 @@ async function body(req: NextRequest) {
       const chunk = await reader.read();
       if (chunk.done) break;
       length += chunk.value.byteLength;
-      if (length>16_384) throw new Fault(413,'body_too_large','请求体超过 16 KB。');
+      if (length>limit) throw new Fault(413,'body_too_large','请求体超过大小上限。');
       value += decoder.decode(chunk.value,{stream:true});
     }
-    return JSON.parse(value+decoder.decode());
+    return value+decoder.decode();
   } catch (error) {
     if (error instanceof Fault) { await reader.cancel().catch(() => {}); throw error; }
     throw new Fault(400,'invalid_json','请求体不是有效的 JSON。');
   } finally {
     reader.releaseLock();
   }
+}
+
+async function body(req:NextRequest) {
+  const text = await jsonText(req);
+  try { return JSON.parse(text); }
+  catch { throw new Fault(400,'invalid_json','请求体不是有效的 JSON。'); }
 }
 
 function timeZone(query:URLSearchParams) {
@@ -73,6 +81,10 @@ export async function handle(req: NextRequest) {
     const path = req.nextUrl.pathname, method = req.method;
     const route = method + ' ' + path;
     const bearer = req.headers.get('authorization');
+    if (route === 'POST /api/stripe/webhook') {
+      await receiveStripeWebhook(await jsonText(req,262_144),req.headers.get('stripe-signature'));
+      return json({ok:true});
+    }
     if (route === 'GET /v1/models') return json(await models(bearer));
     if (route === 'POST /v1/chat/completions') {
       const requestBody = parse(callInput,await body(req));
@@ -110,6 +122,12 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route==='GET /api/billing') return json(await billing(user));
+    if (route==='POST /api/billing/checkout') {
+      const input = parse(checkoutInput,await body(req));
+      return json(await startCheckout(user,input.kind,input.nonce,origin));
+    }
+    if (route==='POST /api/billing/portal') return json(await startPortal(user,origin));
     if (route === 'POST /api/redeem') {
       const {code} = parse(redemptionInput,await body(req));
       const result = await redeemCredit(user,code);

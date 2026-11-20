@@ -433,6 +433,80 @@ export function Usage() {
   </>;
 }
 
+type CheckoutKind = 'credit'|'subscription';
+type TestOrder = {
+  id:string;kind:CheckoutKind;amountCents:number;state:string;subscriptionStatus:string|null;periodEnd:string|null;createdAt:string;
+};
+const paymentStatus:Record<string,string> = {
+  open:'待支付',paid:'已确认',expired:'已过期',active:'生效中',trialing:'试用中',
+  past_due:'续费异常',unpaid:'未支付',incomplete:'待激活',incomplete_expired:'未激活',
+  canceled:'已取消',paused:'已暂停',
+};
+
+function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
+  const [busy,setBusy] = useState(false);
+  const [feedback,setFeedback] = useState('');
+  const [returned,setReturned] = useState<string|null>(null);
+  const nonces = useRef<Partial<Record<CheckoutKind,string>>>({});
+  useEffect(() => { setReturned(new URLSearchParams(location.search).get('checkout')); },[]);
+  const {data,error,refresh} = useData<{enabled:boolean;orders:TestOrder[];canManage:boolean}>(
+    '/api/billing',returned==='success' ? 8000 : 0);
+
+  function checkoutNonce(kind:CheckoutKind) {
+    let nonce = nonces.current[kind] ?? crypto.randomUUID();
+    try {
+      const key = 'opentoken:stripe-test:'+kind;
+      const saved = sessionStorage.getItem(key);
+      if (saved && /^[a-f0-9-]{36}$/.test(saved)) nonce = saved;
+      sessionStorage.setItem(key,nonce);
+    } catch { /* The request can still be retried in this page. */ }
+    nonces.current[kind] = nonce;
+    return nonce;
+  }
+
+  async function open(kind:CheckoutKind|'portal') {
+    if (busy) return;
+    setBusy(true); setFeedback('');
+    try {
+      const result = kind==='portal' ? await api<{url:string}>('/api/billing/portal',{method:'POST'}) :
+        await api<{url:string}>('/api/billing/checkout',{method:'POST',
+          body:JSON.stringify({kind,nonce:checkoutNonce(kind)}),signal:AbortSignal.timeout(22000)});
+      location.assign(result.url);
+    } catch (error) {
+      if (kind!=='portal' && error instanceof ApiError && error.status===409) {
+        delete nonces.current[kind];
+        try { sessionStorage.removeItem('opentoken:stripe-test:'+kind); } catch {}
+      }
+      setFeedback(error instanceof ApiError ? error.message : '连接 Stripe 超时。可重试同一结账请求。');
+      setBusy(false);
+    }
+  }
+
+  if (!data?.enabled) return null;
+  return <section className="panel" aria-labelledby="test-billing-title">
+    <h2 id="test-billing-title">Stripe 测试支付</h2>
+    <div className="actions">
+      <button disabled={busy} onClick={()=>void open('credit')}>测试充值</button>
+      <button disabled={busy} onClick={()=>void open('subscription')}>开通测试订阅</button>
+      {data.canManage && <button disabled={busy} onClick={()=>void open('portal')}>管理测试订阅</button>}
+      <button onClick={()=>{refresh();refreshWallet();}}>刷新订单和余额</button>
+    </div>
+    {returned==='success' && <p role="status">已从 Stripe 返回。到账以订单和钱包流水为准。</p>}
+    {returned==='cancel' && <p role="status">结账尚未完成。可重开同一笔结账继续。</p>}
+    <ErrorNote error={feedback || error} />
+    {data.orders.length ? <div className="table-wrap"><table>
+      <thead><tr><th>订单</th><th>金额</th><th>支付状态</th><th>订阅状态</th></tr></thead>
+      <tbody>{data.orders.map(order=><tr key={order.id}>
+        <td>{order.kind==='credit'?'测试充值':'测试订阅'}<br/><small>{new Date(order.createdAt).toLocaleString('zh-CN')}</small></td>
+        <td>{money(String(BigInt(order.amountCents)*10000n))}</td>
+        <td>{paymentStatus[order.state] ?? '待确认'}</td>
+        <td>{order.subscriptionStatus ? paymentStatus[order.subscriptionStatus] ?? '待确认' : '—'}
+          {order.periodEnd && <><br/><small>账期截止 {new Date(order.periodEnd).toLocaleDateString('zh-CN')}</small></>}</td>
+      </tr>)}</tbody>
+    </table></div> : <p className="muted">还没有测试订单。</p>}
+  </section>;
+}
+
 export function Redeem() {
   const wallet = useData<CreditReceipt['wallet']>('/api/dashboard');
   const field = useRef<HTMLInputElement>(null);
@@ -477,6 +551,7 @@ export function Redeem() {
       <ErrorNote error={wallet.error} />
       {wallet.error && <button onClick={wallet.refresh}>刷新余额</button>}
     </section>
+    <TestBilling refreshWallet={()=>{wallet.refresh();history.refresh();}} />
     <section className="panel" aria-labelledby="redeem-title"><h2 id="redeem-title">兑换额度</h2>
       <form onSubmit={submit} action="/api/redeem" method="post" aria-busy={busy}>
         <div className="filters">

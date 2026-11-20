@@ -16,12 +16,20 @@ const restoreErrors = new Map([
   ['PBR05', 'Restored data differs from the source snapshot'],
   ['55P03', 'Recovery tables could not be locked. Disconnect other clients and retry'],
 ]);
-const tables = [
+const pilotTables = [
   'auth.identities', 'auth.users', 'gateway.api_keys', 'gateway.billing_alerts',
   'gateway.billing_resolutions', 'gateway.model_rates', 'gateway.models', 'gateway.pricing_groups',
   'gateway.redeem_attempts', 'gateway.redeem_codes', 'gateway.schema_migrations',
   'gateway.usage_requests', 'gateway.wallet_entries', 'gateway.wallets',
 ];
+export function backupTables(versions) {
+  const version = JSON.stringify(versions);
+  if (version==='["001","002","003","004"]') return pilotTables;
+  if (version==='["001","002","003","004","005"]') {
+    return [...pilotTables,'gateway.stripe_orders','gateway.stripe_events','gateway.stripe_sandbox'].sort();
+  }
+  throw new Error('Unsupported migration version for backup or restore');
+}
 const formats = `SET TIME ZONE 'UTC'; SET DateStyle TO 'ISO, YMD';
   SET bytea_output TO 'hex'; SET extra_float_digits TO 3; SET IntervalStyle TO 'postgres';`;
 const inventory = `SELECT n.nspname || '.' || c.relname AS name
@@ -29,7 +37,12 @@ const inventory = `SELECT n.nspname || '.' || c.relname AS name
   WHERE c.relkind IN ('r','p','f') AND (n.nspname='gateway' OR
     (n.nspname='auth' AND c.relname IN ('users','identities')))`;
 const migrationVersions = `(SELECT jsonb_agg(version ORDER BY version) FROM gateway.schema_migrations)`;
-const fingerprint = `SELECT jsonb_build_object('versions', ${migrationVersions},
+const paymentAccounting = `
+    UNION ALL
+    SELECT o.id FROM gateway.stripe_orders o LEFT JOIN gateway.wallet_entries e ON e.redeem_code_id=o.redeemed_code_id
+      WHERE o.kind='credit' AND o.state='paid' AND (e.user_id IS DISTINCT FROM o.user_id
+        OR e.delta_micros IS DISTINCT FROM o.amount_cents::bigint*10000)`;
+const fingerprint = tables => `SELECT jsonb_build_object('versions', ${migrationVersions},
   'tables', jsonb_build_object(${tables.map(table => `'${table}', (SELECT jsonb_build_array(count(*)::text,
     coalesce(encode(sha256(convert_to(string_agg(digest,' ' ORDER BY digest COLLATE "C"),'UTF8')),'hex'), ''))
     FROM (SELECT encode(sha256(convert_to(to_jsonb(t)::text,'UTF8')),'hex') AS digest FROM ${table} t) fingerprints)`).join(',\n')}),
@@ -48,7 +61,7 @@ const fingerprint = `SELECT jsonb_build_object('versions', ${migrationVersions},
     UNION ALL
     SELECT u.id FROM gateway.usage_requests u LEFT JOIN gateway.wallet_entries e ON e.request_id=u.id
     WHERE (u.status='settled' AND e.delta_micros IS DISTINCT FROM -u.charged_micros)
-      OR (u.status<>'settled' AND e.request_id IS NOT NULL)
+      OR (u.status<>'settled' AND e.request_id IS NOT NULL)${tables.includes('gateway.stripe_orders') ? paymentAccounting : ''}
   ) issues)) AS fingerprint`;
 
 export function encodeBackup(key, manifest, archive) {
@@ -170,13 +183,15 @@ async function capture(endpoint) {
     await client.connect();
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     await client.query(formats);
+    const {rows:[{versions}]} = await client.query(`SELECT ${migrationVersions} AS versions`);
+    const tables = backupTables(versions);
     const {rows: found} = await client.query(inventory);
     if (JSON.stringify(found.map(r => r.name).sort()) !== JSON.stringify(tables)) {
       throw new Error('Database table inventory differs from the OpenToken backup scope');
     }
     const {rows:[snapshot]} = await client.query(`SELECT pg_export_snapshot() AS id,
       current_setting('server_version_num')::int AS version, transaction_timestamp()::text AS created`);
-    const {rows:[state]} = await client.query(fingerprint);
+    const {rows:[state]} = await client.query(fingerprint(tables));
     const archive = await runTool('pg_dump', ['--format=custom', '--data-only', '--no-password', '--strict-names',
       '--lock-wait-timeout=5000', `--snapshot=${snapshot.id}`, ...tables.map(table => `--table=${table}`)],
     {...settings.env, PGOPTIONS:'-c default_transaction_read_only=on'});
@@ -186,7 +201,7 @@ async function capture(endpoint) {
   } finally { await client.end(); }
 }
 
-async function archiveSql(archive) {
+async function archiveSql(archive, tables) {
   const toc = (await runTool('pg_restore', ['--list'], {}, archive)).toString('utf8');
   const listedTables = [...toc.matchAll(/^\d+; \d+ \d+ TABLE DATA (\w+) (\w+) /gm)]
     .map(([,schema,table]) => `${schema}.${table}`).sort();
@@ -198,7 +213,7 @@ function sqlLiteral(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-async function restore(endpoint, manifest, sql) {
+async function restore(endpoint, manifest, sql, tables) {
   const {env} = await connectionSettings(endpoint);
   const expected = sqlLiteral(JSON.stringify(manifest.fingerprint));
   const prepare = `SET standard_conforming_strings TO on; SET lock_timeout TO '5s'; SET statement_timeout TO '120s';
@@ -218,7 +233,7 @@ async function restore(endpoint, manifest, sql) {
   `;
   const verify = `\n${formats}
     DO $check$ BEGIN
-      IF (${fingerprint}) IS DISTINCT FROM ${expected}::jsonb THEN
+      IF (${fingerprint(tables)}) IS DISTINCT FROM ${expected}::jsonb THEN
         RAISE SQLSTATE 'PBR05'; END IF;
     END $check$;
   `;
@@ -256,7 +271,8 @@ async function main() {
   const key = Buffer.from(keyText, 'hex');
   if (command === 'create') {
     const {archive, manifest} = await capture(postgresEndpoint(process.env.MIGRATION_DATABASE_URL));
-    await archiveSql(archive);
+    const tables = backupTables(manifest.fingerprint.versions);
+    await archiveSql(archive,tables);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const file = join('.demo-data', 'backups', `opentoken-${timestamp}-${randomBytes(4).toString('hex')}.otbk`);
     await writeBackup(file, encodeBackup(key, manifest, archive));
@@ -265,9 +281,10 @@ async function main() {
   }
   if ((await stat(arg)).size > maxBytes + 1024 * 1024) throw new Error('Archive exceeds the pilot backup size limit');
   const {manifest, archive} = decodeBackup(key, await readFile(arg));
+  const tables = backupTables(manifest.fingerprint.versions);
   const target = command === 'restore' && restoreTarget(process.env.BACKUP_TARGET_DATABASE_URL, manifest.source, confirmedProject);
-  const sql = await archiveSql(archive);
-  if (target) await restore(target, manifest, sql);
+  const sql = await archiveSql(archive,tables);
+  if (target) await restore(target, manifest, sql,tables);
   console.log(`${target ? 'Restored and matched' : 'Verified'} snapshot from ${manifest.createdAt} (${tables.length} tables, ${manifest.fingerprint.accountingIssues} accounting issues).`);
 }
 

@@ -6,12 +6,13 @@ import { api, ApiError, money, useData } from '../../console';
 
 const endpoint = '/api/admin/users';
 const roleNames = {system_admin:'系统管理员',operator:'运营人员',auditor:'审计员'};
-const statuses = {active:'正常',pending:'待验证',suspended:'已停用',auth_blocked:'身份服务已限制'};
+const statuses = {active:'正常',pending:'待验证',suspended:'已停用',auth_blocked:'身份服务已限制',deleted:'已删除'};
+type EditKind = 'state'|'role'|'delete';
 
 export function UserManager() {
   const [filters,setFilters] = useState({search:'',status:''});
   const [cursors,setCursors] = useState<string[]>([]);
-  const [editor,setEditor] = useState<{kind:'state'|'role';user:AdminUser}|null>(null);
+  const [editor,setEditor] = useState<{kind:EditKind;user:AdminUser}|null>(null);
   const [inviting,setInviting] = useState(false);
   const [inviteEmail,setInviteEmail] = useState('');
   const [operationId,setOperationId] = useState('');
@@ -38,7 +39,7 @@ export function UserManager() {
     setInviting(false); setInviteEmail(''); setOperationId(''); setInviteLink('');
   }
 
-  function openEditor(kind:'state'|'role',user:AdminUser) {
+  function openEditor(kind:EditKind,user:AdminUser) {
     clearInvite(); setEditor({kind,user}); setError(''); setNotice('');
   }
 
@@ -50,11 +51,12 @@ export function UserManager() {
     try {
       if (editor) {
         const {kind,user} = editor;
-        const payload = kind==='state'
-          ? {suspended:!user.suspended,expectedRevision:user.revision,reason:fields.get('reason')}
-          : {role:fields.get('role') || null,expectedRole:user.role,reason:fields.get('reason')};
+        const reason = fields.get('reason');
+        const payload = kind==='state' ? {suspended:!user.suspended,expectedRevision:user.revision,reason}
+          : kind==='role' ? {role:fields.get('role') || null,expectedRole:user.role,reason}
+          : {confirmation:fields.get('confirmation'),expectedRevision:user.revision,expectedRole:user.role,reason};
         await api(endpoint+'/'+user.id+'/'+kind,{method:'POST',body:JSON.stringify(payload),signal:AbortSignal.timeout(12000)});
-        setEditor(null); setNotice('用户变更已保存。');
+        setEditor(null); setNotice(kind==='delete' ? '该 OpenToken 账号已删除。' : '用户变更已保存。');
       } else if (inviting) {
         const id = operationId || crypto.randomUUID();
         setOperationId(id);
@@ -65,7 +67,7 @@ export function UserManager() {
       }
     } catch (failure) {
       if (failure instanceof ApiError) {
-        if (failure.code==='user_state_changed' || failure.code==='user_role_changed') setEditor(null);
+        if (['user_state_changed','user_role_changed','user_deleted'].includes(failure.code ?? '')) setEditor(null);
         if (failure.code==='invite_failed') setOperationId('');
         setError(failure.requestId ? failure.message+' 请求编号 '+failure.requestId : failure.message);
       } else {
@@ -81,8 +83,9 @@ export function UserManager() {
       <h1>用户管理</h1>
       <form className="filters" onSubmit={filter}>
         <label>{data?.canWrite ? '邮箱前缀或用户 ID' : '用户 ID'}<input name="search" maxLength={254}/></label>
-        <label>账号状态<select name="status"><option value="">全部</option>
-          {Object.entries(statuses).map(([value,label])=><option key={value} value={value}>{label}</option>)}
+        <label>账号状态<select name="status"><option value="">在册账号</option>
+          {Object.entries(statuses).filter(([value])=>value!=='deleted' || data?.canWrite || filters.status==='deleted')
+            .map(([value,label])=><option key={value} value={value}>{label}</option>)}
         </select></label>
         <button disabled={busy}>查询</button>
         <button type="button" disabled={busy} onClick={users.refresh}>刷新</button>
@@ -98,15 +101,18 @@ export function UserManager() {
         <thead><tr><th>账号</th><th>状态</th><th>后台角色</th>{data.canWrite && <><th>钱包</th><th>操作</th></>}</tr></thead>
         <tbody>{data.items.map(user=><tr key={user.id}>
           <td>{user.email ?? '邮箱不可用'}<br/><code>{user.id}</code></td>
-          <td>{statuses[user.status]}<br/>{user.emailConfirmed?'邮箱已验证':'邮箱待验证'}</td>
+          <td>{statuses[user.status]}<br/>{user.deletedAt
+            ? <time dateTime={user.deletedAt}>{new Date(user.deletedAt).toLocaleString('zh-CN')}</time>
+            : user.emailConfirmed?'邮箱已验证':'邮箱待验证'}</td>
           <td>{user.role ? roleNames[user.role] : '普通用户'}</td>
           {data.canWrite && <><td>{user.wallet ? <>
             余额 {money(user.wallet.balanceMicros)}<br/>
             用量预占 {money(user.wallet.heldMicros)}<br/>
             退款冻结 {money(user.wallet.refundHeldMicros)}
-          </> : '尚未开户'}</td><td>{data.actorId===user.id ? '当前账号' : <>
+          </> : '尚未开户'}</td><td>{user.status==='deleted' ? '已归档' : data.actorId===user.id ? '当前账号' : <>
             <button disabled={busy || !!inviteLink || user.status==='auth_blocked'} onClick={()=>openEditor('state',user)}>{user.suspended?'恢复':'停用'}</button>{' '}
-            <button disabled={busy || !!inviteLink} onClick={()=>openEditor('role',user)}>变更角色</button>
+            <button disabled={busy || !!inviteLink} onClick={()=>openEditor('role',user)}>变更角色</button>{' '}
+            <button className="danger" disabled={busy || !!inviteLink} onClick={()=>openEditor('delete',user)}>删除</button>
           </>}</td></>}
         </tr>)}</tbody>
       </table></div>}
@@ -120,7 +126,8 @@ export function UserManager() {
     {notice && <p role="status">{notice}</p>}
     {error && <p role="alert" className="error">{error}</p>}
     {data?.canWrite && editor && <form className="panel" key={editor.kind+editor.user.id} onSubmit={submit}>
-      <h2>{editor.kind==='role' ? '变更后台角色' : editor.user.suspended ? '恢复账号' : '停用账号'}</h2>
+      <h2>{editor.kind==='delete' ? '删除 OpenToken 账号' : editor.kind==='role' ? '变更后台角色'
+        : editor.user.suspended ? '恢复账号' : '停用账号'}</h2>
       <p>{editor.user.email ?? editor.user.id}</p>
       <fieldset disabled={busy}>
         {editor.kind==='role' && <label>后台角色<select name="role" defaultValue={editor.user.role??''}>
@@ -131,8 +138,14 @@ export function UserManager() {
         {editor.kind==='state' && <p>{editor.user.suspended
           ? '用户可重新登录，原来有效的 API 密钥将恢复。'
           : '控制台和 API 将停止接收此账号的新请求。已受理的调用仍会结算。'}</p>}
+        {editor.kind==='delete' && <>
+          <p className="error">删除后无法恢复，API 密钥与后台角色将撤销。钱包、订单和历史账单会保留。</p>
+          <p>目标用户 ID <code>{editor.user.id}</code></p>
+          <label>输入目标用户 ID 确认删除<input name="confirmation" required maxLength={36} autoComplete="off" spellCheck={false}/></label>
+        </>}
         <label>变更原因<input name="reason" required minLength={3} maxLength={160}/></label>
-        <div className="actions"><button className="primary">确认变更</button><button type="button" onClick={()=>setEditor(null)}>取消</button></div>
+        <div className="actions"><button className={editor.kind==='delete'?'danger':'primary'}>
+          {editor.kind==='delete'?'确认删除':'确认变更'}</button><button type="button" onClick={()=>setEditor(null)}>取消</button></div>
       </fieldset>
     </form>}
     {data?.canInvite && inviting && <section className="panel">

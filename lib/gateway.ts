@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { after } from 'next/server';
-import { digest, store, transaction } from './data';
+import { digest, lockAccount, store, transaction } from './data';
 import { channelCredentials, channelRoutingLock, type ChannelCredential } from './channel-credentials';
 import { mockCompletion, mockModel, openAiCompletion, openAiStream, UpstreamError, type CompletionInput, type TextDelta } from './upstream';
 import { resolveLiveUpstreams, type LiveUpstream } from './upstream-config.mjs';
@@ -77,7 +77,10 @@ export async function createKey(user: string, name: string, groupId: string, rpm
   const secret = 'mg_' + randomBytes(32).toString('base64url');
   const prefix = secret.slice(0, 12);
   const {rows}=await transaction(async tx=>{
-    await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[user]);
+    await lockAccount(tx,user);
+    const wallet = await tx.query(`SELECT 1 FROM gateway.wallets WHERE user_id=$1
+      AND gateway.account_access(user_id) IS NOT NULL FOR UPDATE`,[user]);
+    if (!wallet.rowCount) throw new Fault(401,'session_required','请重新登录。');
     await requireKeySlot(tx,user);
     return tx.query<{id:string}>(`INSERT INTO gateway.api_keys (user_id,group_id,name,public_prefix,secret_digest,rpm_limit,spend_cap_micros)
       SELECT $2,group_id,$3,$4,$5,$6,$7 FROM (${availableRateQuery} AND g.id=$8 LIMIT 1) available RETURNING id`,
@@ -155,7 +158,7 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
   const credentials = channelCredentials();
   const started = Date.now();
   const { id, rate, hold, live } = await transaction(async tx => {
-    await tx.query('SELECT pg_advisory_xact_lock_shared(961020037,hashtext($1))',[key.user_id]);
+    await lockAccount(tx,key.user_id);
     if (body.model!==mockModel) await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
     await tx.query('SELECT pg_advisory_xact_lock_shared($1)',[channelRoutingLock]);
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros-refund_held_micros)::text AS available

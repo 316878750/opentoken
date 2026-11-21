@@ -28,6 +28,38 @@ before(async () => {
 });
 after(async ()=>db?.close());
 
+test('checkout expiry reconciliation preserves a completed unpaid session and closes proven expired or missing checkouts',async t=>{
+  async function pending(checkoutId) {
+    const {rows:[row]}=await db.query(`INSERT INTO gateway.stripe_orders
+      (user_id,kind,nonce,price_id,amount_cents,checkout_id,created_at,expires_at)
+      VALUES ($1,'credit',gen_random_uuid(),'price_fixture',500,$2,now()-interval '1 hour',now()-interval '15 minutes')
+      RETURNING id`,[user,checkoutId]);
+    return row.id;
+  }
+  const uncertain=await pending('cs_test_unpaid'), expired=await pending('cs_test_expired'), missing=await pending(null);
+  t.mock.method(globalThis,'fetch',async (input,options)=>{
+    const url=new URL(input);
+    assert.equal(url.origin,'https://api.stripe.com');
+    assert.equal(new Headers(options.headers).get('authorization'),'Bearer sk_test_fixture');
+    if (url.pathname==='/v1/checkout/sessions') {
+      assert.ok(url.searchParams.has('created[gte]') && url.searchParams.has('created[lte]'));
+      return Response.json({object:'list',has_more:false,data:[]});
+    }
+    const id=url.pathname.split('/').at(-1);
+    assert.ok(['cs_test_unpaid','cs_test_expired'].includes(id));
+    const order=id==='cs_test_unpaid'?uncertain:expired;
+    return Response.json({id,livemode:false,client_reference_id:order,metadata:{opentoken_order:order,opentoken_price:'price_fixture'},
+      currency:'usd',amount_total:500,mode:'payment',payment_status:'unpaid',status:order===uncertain?'complete':'expired'});
+  });
+  const sync=id=>stripeCommand(admin,['sync-expired-checkout',id],'sk_test_fixture');
+  await assert.rejects(sync(uncertain),/not conclusively expired/i);
+  assert.equal((await sync(expired)).state,'expired');
+  assert.equal((await sync(missing)).state,'expired');
+  assert.equal((await sync(missing)).state,'expired');
+  const {rows} = await db.query('SELECT id,state FROM gateway.stripe_orders WHERE id=ANY($1::uuid[])',[[uncertain,expired,missing]]);
+  assert.deepEqual(Object.fromEntries(rows.map(row=>[row.id,row.state])),{[uncertain]:'open',[expired]:'expired',[missing]:'expired'});
+});
+
 async function credit(cents,owner=user) {
   const order=randomUUID(), suffix=order.replaceAll('-',''), payment='pi_'+suffix;
   await db.query(`INSERT INTO gateway.stripe_orders

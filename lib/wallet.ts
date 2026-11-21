@@ -1,17 +1,19 @@
-import { store,transaction } from './data';
+import { lockAccount,store,transaction } from './data';
 import { redeemCodeDigest, redeemCodePattern } from './redeem-code.mjs';
 
 type Redemption =
-  | {status:'unavailable'|'balance_limit'}
+  | {status:'unavailable'|'balance_limit'|'account_unavailable'}
   | {status:'rate_limited';retryAfter:number}
   | {status:'ok';replayed:boolean;receipt:{id:string;amountMicros:string;createdAt:string};
       wallet:{balanceMicros:string;heldMicros:string;availableMicros:string;refundHeldMicros?:string}};
 
-export async function redeemCredit(user:string, code:string) {
+export async function redeemCredit(user:string, code:string):Promise<Redemption> {
   const digest = redeemCodePattern.test(code) ? redeemCodeDigest(code) : null;
   return transaction(async tx=>{
+    await lockAccount(tx,user);
     const {rows:[{result}]}=await tx.query<{result:Redemption}>(
-      'SELECT gateway.redeem_trial_credit($1,$2) AS result',[user,digest]);
+      `SELECT CASE WHEN gateway.account_access($1) IS NULL THEN jsonb_build_object('status','account_unavailable')
+        ELSE gateway.redeem_trial_credit($1,$2) END AS result`,[user,digest]);
     if (result.status==='ok') {
       const {rows:[wallet]}=await tx.query<{refundHeldMicros:string;availableMicros:string}>(`SELECT
         refund_held_micros::text AS "refundHeldMicros",(balance_micros-held_micros-refund_held_micros)::text AS "availableMicros"

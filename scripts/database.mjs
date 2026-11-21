@@ -47,7 +47,8 @@ export async function migrate(client) {
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
       ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql'],
-      ['010','010-managed-channels.sql'],['011','011-admin-models.sql'],['012','012-admin-users.sql']]) {
+      ['010','010-managed-channels.sql'],['011','011-admin-models.sql'],['012','012-admin-users.sql'],
+      ['013','013-admin-user-deletion.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -149,6 +150,8 @@ export async function check(client) {
     NOT has_table_privilege(current_user,'gateway.pricing_groups','INSERT,UPDATE,DELETE,TRUNCATE') AS pricing_groups_private,
     has_function_privilege(current_user,'gateway.admin_write_model(uuid,uuid,text,jsonb,boolean,jsonb)','EXECUTE') AS admin_model_write,
     NOT has_table_privilege(current_user,'gateway.account_states','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS account_states_private,
+    EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('gateway.account_states')
+      AND attname='deleted_at' AND NOT attisdropped) AS account_deletion_ready,
     NOT has_table_privilege(current_user,'gateway.admin_user_invites','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS user_invites_private,
     has_function_privilege(current_user,'gateway.account_access(uuid)','EXECUTE') AS account_access,
     has_function_privilege(current_user,'gateway.admin_list_users(uuid,text,text,uuid,integer)','EXECUTE') AS admin_user_list,
@@ -209,7 +212,7 @@ async function main() {
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–012 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–013 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');

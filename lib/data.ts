@@ -40,3 +40,7 @@ export function digest(namespace: string, value: string) {
 export async function ensureWallet(userId: string) {
   await store().db.query('INSERT INTO gateway.wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING',[userId]);
 }
+
+export async function lockAccount(tx:PoolClient,userId:string) {
+  await tx.query('SELECT pg_advisory_xact_lock_shared(961020037,hashtext($1::uuid::text))',[userId]);
+}

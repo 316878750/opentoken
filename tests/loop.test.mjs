@@ -24,9 +24,10 @@ const creditUserA = '30000000-0000-4000-8000-000000000008';
 const creditUserB = '30000000-0000-4000-8000-000000000009';
 const channelUser = '30000000-0000-4000-8000-000000000011';
 const modelUser = '30000000-0000-4000-8000-000000000012';
+const deleteUser = '30000000-0000-4000-8000-000000000013';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
   ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],['model@example.test',modelUser],
-  ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB]]);
+  ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],['delete@example.test',deleteUser]]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -45,6 +46,7 @@ let server, serverExit, socket, database, auth, admin;
 const inviteCalls = new Map();
 const invitedAccounts = new Map();
 const fixtureInviteHash = 'a'.repeat(56);
+let deleteUserAuthChecks = 0;
 
 function fakeAuth() {
   const activeTokens = new Map();
@@ -105,7 +107,11 @@ function fakeAuth() {
       account.password = (await readJson()).password;
       return json(200,user);
     }
-    if (request.method==='GET' && request.url==='/auth/v1/user' && activeTokens.has(token)) return json(200,activeTokens.get(token));
+    if (request.method==='GET' && request.url==='/auth/v1/user' && activeTokens.has(token)) {
+      const user = activeTokens.get(token);
+      if (user.id===deleteUser) deleteUserAuthChecks++;
+      return json(200,user);
+    }
     if (request.method==='GET' && request.url==='/auth/v1/settings' && request.headers.apikey==='fixture-key') return json(200,{});
     if (request.method==='POST' && request.url?.startsWith('/auth/v1/logout')) {
       return json(204,null);
@@ -597,7 +603,8 @@ test('concurrent requests on separate keys cannot over-reserve a shared wallet',
   const keys = await Promise.all(Array.from({length:admitted+1},(_,i)=>request('/api/keys',{
     method:'POST',body:{name:'concurrent wallet '+i,groupId,rpm:10},
   })));
-  assert.ok(keys.every(key=>key.status===201));
+  assert.ok(keys.every(key=>key.status===201),JSON.stringify(keys.filter(key=>key.status!==201)
+    .map(key=>({status:key.status,code:key.data?.error?.code}))));
   const calls = keys.map(key=>request('/v1/chat/completions',{method:'POST',token:key.data.secret,session:false,
     body:{model:'mock-text',messages:[{role:'user',content:'Concurrent wallet test'}],max_completion_tokens:128}}));
   const results = await Promise.all(calls);
@@ -1369,6 +1376,113 @@ test('user administration enforces roles and suspends access without interruptin
   assert.equal((await write('state',competing[winner].target,{...suspension,suspended:false,
     expectedRevision:results[winner].data.revision},competing[winner].actor)).status,200);
   await changeAdminRole(member,null);
+});
+
+test('administrator deletion permanently revokes access and preserves in-flight accounting', async () => {
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(deleteUser,'operator');
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.getSetCookie().map(value=>value.split(';')[0]).join('; ');
+  const ownerCookie = await signIn('owner@example.test'), targetCookie = await signIn('delete@example.test');
+  const operatorCookie = await signIn('staff@example.test');
+  const route = '/api/admin/users';
+  const change = (target,action,body,sessionOverride=ownerCookie)=>request(route+'/'+target+'/'+action,{method:'POST',sessionOverride,body});
+  const deletion = {expectedRevision:'0',expectedRole:'operator',confirmation:deleteUser,reason:'隔离删除验收'};
+  assert.equal((await change(deleteUser,'delete',deletion,operatorCookie)).status,403);
+  assert.equal((await change(deleteUser,'delete',deletion,ownerCookie.split('; ')[0])).status,403);
+  assert.equal((await change(owner,'delete',{...deletion,confirmation:owner,expectedRole:'system_admin'})).status,409);
+  assert.equal((await change(deleteUser,'delete',{...deletion,confirmation:owner})).status,400);
+  assert.equal((await change(deleteUser,'delete',{...deletion,expectedRole:null})).data.error.code,'user_role_changed');
+  assert.equal((await change(deleteUser,'delete',{...deletion,expectedRevision:'1'})).data.error.code,'user_state_changed');
+
+  const checkout = await withDatabaseOwner(async()=>{
+    const {rows:[row]} = await database.query(`INSERT INTO gateway.stripe_orders(user_id,nonce,kind,price_id,amount_cents)
+      VALUES ($1,gen_random_uuid(),'credit','price_fixture_deletion',500) RETURNING id`,[deleteUser]);
+    return row.id;
+  });
+  assert.equal((await change(deleteUser,'delete',deletion)).data.error.code,'user_billing_open');
+  await withDatabaseOwner(()=>database.query("UPDATE gateway.stripe_orders SET expires_at=now()-interval '1 minute' WHERE id=$1",[checkout]));
+  assert.equal((await change(deleteUser,'delete',deletion)).data.error.code,'user_billing_open');
+  await withDatabaseOwner(()=>database.query("UPDATE gateway.stripe_orders SET state='expired' WHERE id=$1",[checkout]));
+  const subscription = await withDatabaseOwner(async()=>{
+    const {rows:[row]} = await database.query(`INSERT INTO gateway.stripe_orders
+      (user_id,nonce,kind,price_id,amount_cents,state,subscription_id,subscription_status)
+      VALUES ($1,gen_random_uuid(),'subscription','price_fixture_deletion',1000,'paid','sub_fixture_deletion','active') RETURNING id`,[deleteUser]);
+    return row.id;
+  });
+  assert.equal((await change(deleteUser,'delete',deletion)).data.error.code,'user_billing_open');
+  await withDatabaseOwner(()=>database.query("UPDATE gateway.stripe_orders SET subscription_status='canceled' WHERE id=$1",[subscription]));
+
+  const credit = await withDatabaseOwner(()=>redeemCommand(admin,['issue','3',new Date(Date.now()+3_600_000).toISOString()]));
+  assert.equal((await request('/api/redeem',{method:'POST',sessionOverride:targetCookie,body:{code:credit.code}})).status,200);
+  const mock = (await request('/api/catalog',{sessionOverride:targetCookie})).data.rates.find(row=>row.model==='mock-text');
+  const key = (await request('/api/keys',{method:'POST',sessionOverride:targetCookie,body:{name:'delete-fixture',groupId:mock.groupId,rpm:10}})).data;
+  await withDatabaseOwner(()=>database.exec(`ALTER TABLE gateway.admin_audit_events ADD CONSTRAINT fixture_block_delete_audit
+    CHECK (action<>'user.delete') NOT VALID`));
+  try {
+    assert.equal((await change(deleteUser,'delete',deletion)).status,500);
+    assert.equal((await request('/v1/models',{token:key.secret,session:false})).status,200);
+    assert.equal((await request('/api/admin/session',{sessionOverride:targetCookie})).data.role,'operator');
+  } finally {
+    await withDatabaseOwner(()=>database.exec('ALTER TABLE gateway.admin_audit_events DROP CONSTRAINT fixture_block_delete_audit'));
+  }
+  const call = ()=>request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,body:{model:'mock-text',
+    messages:[{role:'user',content:'deletion fixture'}],max_completion_tokens:128}});
+  const running = call();
+  let pending;
+  for (let attempt=0;attempt<35 && !pending;attempt++) {
+    pending = (await request('/api/usage?status=dispatched',{sessionOverride:targetCookie})).data.items[0];
+    if (!pending) await sleep(75);
+  }
+  assert.ok(pending);
+  const lateCredit = await withDatabaseOwner(()=>redeemCommand(admin,['issue','1',new Date(Date.now()+3_600_000).toISOString()]));
+  const beforeAuth = deleteUserAuthChecks;
+  const encoded = new TextEncoder();
+  let submitRemainder;
+  const input = new ReadableStream({start(controller) {
+    controller.enqueue(encoded.encode('{"code":'));
+    submitRemainder = ()=>{
+      controller.enqueue(encoded.encode(JSON.stringify(lateCredit.code)+'}'));
+      controller.close();
+    };
+  }});
+  const lateRedemption = fetch(base+'/api/redeem',{method:'POST',duplex:'half',
+    headers:{'content-type':'application/json',origin:base,cookie:targetCookie},body:input,signal:AbortSignal.timeout(10000)});
+  let results;
+  try {
+    for (let attempt=0;attempt<40 && deleteUserAuthChecks===beforeAuth;attempt++) await sleep(25);
+    assert.ok(deleteUserAuthChecks>beforeAuth,'the redemption must begin authentication before deletion');
+    results = await Promise.all([change(deleteUser,'delete',deletion),change(deleteUser,'delete',deletion)]);
+  } finally {
+    submitRemainder();
+  }
+  assert.equal((await lateRedemption).status,401);
+  assert.deepEqual(results.map(res=>res.status).sort(),[200,409]);
+  const removed = results.find(res=>res.status===200);
+  assert.equal(results.find(res=>res.status===409).data.error.code,'user_deleted');
+  assert.equal((await request('/api/dashboard',{sessionOverride:targetCookie})).status,401);
+  assert.equal((await request('/api/session/login',loginPayload('delete@example.test'))).status,403);
+  assert.equal((await request('/v1/models',{token:key.secret,session:false})).status,401);
+  assert.equal((await call()).status,401);
+  assert.equal((await running).status,200);
+  assert.equal((await change(deleteUser,'state',{suspended:false,expectedRevision:removed.data.revision,reason:'验证禁止恢复'})).data.error.code,'user_deleted');
+  assert.equal((await change(deleteUser,'role',{role:'operator',expectedRole:null,reason:'验证禁止赋权'})).data.error.code,'user_deleted');
+  await assert.rejects(changeAdminRole(deleteUser,'operator'),/active, confirmed/i);
+  assert.deepEqual((await request(route+'?search='+deleteUser,{sessionOverride:ownerCookie})).data.items,[]);
+  const archive = route+'?status=deleted&search='+deleteUser;
+  assert.deepEqual((await request(archive,{sessionOverride:operatorCookie})).data.items,[]);
+  const deleted = (await request(archive,{sessionOverride:ownerCookie})).data.items[0];
+  assert.deepEqual([deleted.status,deleted.role,deleted.wallet.balanceMicros,deleted.wallet.heldMicros],['deleted',null,'2250000','0']);
+  assert.ok(Date.parse(deleted.deletedAt));
+  await withDatabaseOwner(async()=>{
+    const {rows:[receipt]} = await database.query(`SELECT u.status,k.status AS key_status,u.reserved_micros::text,
+      u.charged_micros::text,e.delta_micros::text FROM gateway.usage_requests u
+      JOIN gateway.api_keys k ON k.id=u.key_id JOIN gateway.wallet_entries e ON e.request_id=u.id WHERE u.id=$1`,[pending.id]);
+    assert.deepEqual(receipt,{status:'settled',key_status:'revoked',reserved_micros:'2000000',charged_micros:'750000',delta_micros:'-750000'});
+    const {rows:[event]} = await database.query('SELECT action,actor_user_id,target_user_id,details FROM gateway.admin_audit_events WHERE request_id=$1',
+      [removed.headers.get('x-request-id')]);
+    assert.deepEqual([event.action,event.actor_user_id,event.target_user_id,event.details.after],['user.delete',owner,deleteUser,'deleted']);
+  });
 });
 
 test('user invitations generate one link, preserve uncertain outcomes and use the existing login flow', async () => {

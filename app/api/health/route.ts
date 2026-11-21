@@ -27,7 +27,9 @@ async function checkDatabase() {
     has_function_privilege(to_regprocedure('gateway.admin_list_users(uuid,text,text,uuid,integer)'),'EXECUTE') AND
     has_function_privilege(to_regprocedure('gateway.admin_write_user(uuid,uuid,uuid,text,jsonb,boolean)'),'EXECUTE') AND
     has_function_privilege(to_regprocedure('gateway.admin_begin_user_invite(uuid,uuid,uuid,text,bytea)'),'EXECUTE') AND
-    has_function_privilege(to_regprocedure('gateway.admin_finish_user_invite(uuid,uuid,uuid,text)'),'EXECUTE') AS ready`);
+    has_function_privilege(to_regprocedure('gateway.admin_finish_user_invite(uuid,uuid,uuid,text)'),'EXECUTE') AND
+    EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('gateway.account_states')
+      AND attname='deleted_at' AND NOT attisdropped) AS ready`);
   if (!row.ready) throw new Error('Gateway schema is unavailable');
 }
 

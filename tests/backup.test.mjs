@@ -64,5 +64,7 @@ test('legacy and Stripe snapshots validate their explicit migration inventories'
   assert.deepEqual(
     backupTables([...pilot,'005','006','007','008','009','010','011','012']).filter(table=>/account_states|admin_user_invites/.test(table)),
     ['gateway.account_states','gateway.admin_user_invites']);
+  assert.deepEqual(backupTables([...pilot,'005','006','007','008','009','010','011','012','013']),
+    backupTables([...pilot,'005','006','007','008','009','010','011','012']));
   assert.throws(()=>backupTables([...pilot,'999']),/Unsupported migration/);
 });

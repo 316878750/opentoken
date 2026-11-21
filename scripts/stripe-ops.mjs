@@ -1,4 +1,5 @@
 import Stripe from 'stripe';
+import {findStripeCheckout,validateStripeCheckout} from '../lib/stripe-checkout.mjs';
 import {recordPaidInvoice} from '../lib/stripe-invoices.mjs';
 
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -154,15 +155,36 @@ async function reconcile(db,stripe,id) {
     stripeRefunds:provider.map(({id,amount,status})=>({id,amountCents:amount,state:status})),issues};
 }
 
+async function syncExpiredCheckout(db,stripe,id) {
+  const {rows:[order]}=await db.query('SELECT *,expires_at<=clock_timestamp() AS past_deadline FROM gateway.stripe_orders WHERE id=$1',[id]);
+  if (!order) throw new Error('Stripe sandbox order not found');
+  if (order.state!=='open') return {order:id,state:order.state};
+  if (!order.past_deadline) throw new Error('Wait until the checkout deadline before reconciling the order');
+  const session = await findStripeCheckout(stripe,order);
+  if (session) {
+    validateStripeCheckout(order,session);
+    if (session.status!=='expired' || session.payment_status!=='unpaid' || session.subscription) {
+      throw new Error('Stripe checkout is not conclusively expired');
+    }
+  }
+  const {rows:[updated]}=await db.query(`UPDATE gateway.stripe_orders
+    SET state='expired',checkout_id=coalesce($2,checkout_id)
+    WHERE id=$1 AND state='open' AND checkout_id IS NOT DISTINCT FROM $3
+      AND payment_id IS NULL AND subscription_id IS NULL AND expires_at<=clock_timestamp()
+    RETURNING state`,[id,session?.id??null,order.checkout_id]);
+  if (!updated) throw new Error('Checkout changed during reconciliation. Verify the latest order status');
+  return {order:id,state:updated.state};
+}
+
 export async function stripeCommand(db,args,key=process.env.STRIPE_TEST_SECRET_KEY) {
   const [action,...values]=args;
   const approved=action==='approve-refund'&&values.length===4&&uuid.test(values[0])&&uuid.test(values[1])&&
     /^[1-9]\d{0,9}$/.test(values[2])&&Number(values[2])<=2_147_483_647&&values[3].trim().length>0&&values[3].length<=100;
-  const oneId=['reconcile','sync-invoices','sync-refund'].includes(action)&&values.length===1&&uuid.test(values[0]);
+  const oneId=['reconcile','sync-invoices','sync-refund','sync-expired-checkout'].includes(action)&&values.length===1&&uuid.test(values[0]);
   const cancel=action==='cancel-approval'&&values.length===2&&uuid.test(values[0])&&values[1].trim().length>0&&values[1].length<=160;
   if (!approved&&!oneId&&!cancel) {
     throw new Error('Usage: db:stripe approve-refund REFUND_UUID ORDER_UUID CENTS APPROVER | reconcile ORDER_UUID | '+
-      'sync-invoices ORDER_UUID | sync-refund REFUND_UUID | cancel-approval REFUND_UUID REVIEW_NOTE');
+      'sync-invoices ORDER_UUID | sync-expired-checkout ORDER_UUID | sync-refund REFUND_UUID | cancel-approval REFUND_UUID REVIEW_NOTE');
   }
   const {rows:[{enabled}]}=await db.query('SELECT EXISTS(SELECT 1 FROM gateway.stripe_sandbox WHERE enabled) AS enabled');
   if (!enabled) throw new Error('Stripe operations require an isolated sandbox database');
@@ -170,6 +192,7 @@ export async function stripeCommand(db,args,key=process.env.STRIPE_TEST_SECRET_K
   const id=values[0].toLowerCase();
   if (action==='reconcile') return reconcile(db,stripe,id);
   if (action==='sync-invoices') return syncInvoices(db,stripe,id);
+  if (action==='sync-expired-checkout') return syncExpiredCheckout(db,stripe,id);
   await db.query('SELECT pg_advisory_lock(961020033,hashtext($1))',[id]);
   try {
     if (approved) return await approveAndSend(db,stripe,id,values[1].toLowerCase(),Number(values[2]),values[3].trim());

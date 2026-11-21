@@ -6,16 +6,18 @@ import { Fault } from './gateway';
 import { generatePilotInvite, inviteRecipientDigest, PilotInviteError, pilotInvitesConfigured } from './pilot-invite.mjs';
 
 const role = z.enum(['system_admin','operator','auditor']).nullable();
-const state = z.enum(['active','pending','suspended','auth_blocked']);
+const state = z.enum(['active','pending','suspended','auth_blocked','deleted']);
 const reason = z.string().trim().min(3).max(160);
+const revision = z.string().regex(/^(?:0|[1-9]\d{0,18})$/);
 export const userListInput = z.strictObject({
   search:z.string().trim().min(1).max(254).optional(), status:state.optional(), cursor:z.uuid().optional(),
   limit:z.string().regex(/^(?:[1-9]|[1-4][0-9]|50)$/).default('25').transform(Number),
 });
 export const userChangeInput = z.discriminatedUnion('action',[
-  z.object({action:z.literal('state'),payload:z.strictObject({suspended:z.boolean(),
-    expectedRevision:z.string().regex(/^(?:0|[1-9]\d{0,18})$/),reason})}),
+  z.object({action:z.literal('state'),payload:z.strictObject({suspended:z.boolean(),expectedRevision:revision,reason})}),
   z.object({action:z.literal('role'),payload:z.strictObject({role,expectedRole:role,reason})}),
+  z.object({action:z.literal('delete'),payload:z.strictObject({expectedRevision:revision,expectedRole:role,
+    confirmation:z.string().trim().toLowerCase().pipe(z.uuid()),reason})}),
 ]);
 export const userInviteInput = z.strictObject({
   email:z.string().trim().toLowerCase().pipe(z.email().max(254)),operationId:z.uuid(),
@@ -23,15 +25,18 @@ export const userInviteInput = z.strictObject({
 
 export type AdminUser = {
   id:string;email:string|null;emailConfirmed:boolean;status:z.infer<typeof state>;role:AdminRole|null;
-  revision:string;suspended:boolean;wallet:{balanceMicros:string;heldMicros:string;refundHeldMicros:string}|null;
+  revision:string;suspended:boolean;deletedAt:string|null;wallet:{balanceMicros:string;heldMicros:string;refundHeldMicros:string}|null;
 };
 export type AdminUserPage = {items:AdminUser[];nextCursor:string|null;canWrite:boolean;canInvite:boolean;actorId:string};
 
 const errors:Record<string,[number,string]> = {
   user_forbidden:[403,'当前账号没有此项用户管理权限。'],
-  admin_recent_auth_required:[403,'请重新登录后再变更账号状态或后台角色。'],
+  admin_recent_auth_required:[403,'请重新登录后再执行此用户管理操作。'],
   user_self_change:[409,'请由另一位系统管理员变更此账号。'],
   user_not_found:[404,'用户不存在。'],
+  user_deleted:[409,'该 OpenToken 账号已删除。'],
+  user_delete_confirmation:[400,'请输入要删除的用户 ID 以确认。'],
+  user_billing_open:[409,'此账号有待完成的结账或尚未结束的订阅。请先完成账务处理，待 Stripe 状态同步后再删除。'],
   user_state_changed:[409,'用户状态已变更，请刷新后重试。'],
   user_role_changed:[409,'用户角色已变更，请刷新后重试。'],
   user_ineligible:[409,'只有已验证且可用的账号可以获得后台角色。'],
@@ -68,7 +73,7 @@ export async function writeAdminUser(actor:string,target:string,change:z.infer<t
   if (/(?:token_hash=|opentoken_session=|sb_secret_[\w-]+|mg_[\w-]{43}|sk-[\w-]{15,}|sk_(?:test_|live_)[\w-]+|\b[a-f0-9]{56,64}\b)/i.test(change.payload.reason)) {
     throw new Fault(400,'user_secret_in_reason','请移除变更原因中的邀请链接或凭据。',requestId);
   }
-  const {rows:[{result}]} = await store().db.query<{result:{denied:string|null;revision?:string;after?:AdminRole|null|boolean}}>(
+  const {rows:[{result}]} = await store().db.query<{result:{denied:string|null;revision?:string}}>(
     'SELECT gateway.admin_write_user($1,$2,$3,$4,$5,$6) AS result',
     [actor,requestId,target,change.action,JSON.stringify(change.payload),recent]);
   if (result.denied) throw userFault(result.denied,requestId);

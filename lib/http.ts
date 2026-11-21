@@ -172,7 +172,7 @@ export async function handle(req: NextRequest) {
       const invite = await inviteAdminUser(user,parse(userInviteInput,await body(req)),origin);
       return json(invite,201,invite.requestId);
     }
-    const userAction = method==='POST' && /^\/api\/admin\/users\/([^/]+)\/(state|role)$/.exec(path);
+    const userAction = method==='POST' && /^\/api\/admin\/users\/([^/]+)\/(state|role|delete)$/.exec(path);
     if (userAction) {
       const change = parse(userChangeInput,{action:userAction[2],payload:await body(req)});
       const saved = await writeAdminUser(user,parse(z.uuid(),userAction[1]),change,hasRecentAdminAuth(req,token));
@@ -239,6 +239,7 @@ export async function handle(req: NextRequest) {
         return response;
       }
       if (result.status==='balance_limit') throw new Fault(409,'balance_limit','本次补额会超出钱包余额上限。');
+      if (result.status==='account_unavailable') throw new Fault(401,'session_required','请重新登录。');
       throw new Fault(404,'redeem_unavailable','兑换码不可用，请检查输入或联系试点运营。');
     }
     if (route === 'GET /api/wallet/entries') {

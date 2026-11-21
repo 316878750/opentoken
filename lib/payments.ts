@@ -1,7 +1,9 @@
 import Stripe from 'stripe';
 import type { PoolClient } from 'pg';
-import { store, transaction } from './data';
+import { lockAccount, store, transaction } from './data';
 import { Fault } from './gateway';
+import { accountRevision } from './session';
+import { findStripeCheckout, validateStripeCheckout } from './stripe-checkout.mjs';
 import { recordPaidInvoice } from './stripe-invoices.mjs';
 
 type Kind = 'credit'|'subscription';
@@ -82,7 +84,10 @@ async function openOrder(user:string,kind:Kind,nonce:string,stripe:Stripe,priceI
     throw new Fault(503,'stripe_price_invalid','请配置有效的美元 Stripe 测试价格。');
   }
   return transaction(async tx => {
-    await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[user]);
+    await lockAccount(tx,user);
+    const wallet = await tx.query(`SELECT 1 FROM gateway.wallets WHERE user_id=$1
+      AND gateway.account_access(user_id) IS NOT NULL FOR UPDATE`,[user]);
+    if (!wallet.rowCount) throw new Fault(401,'session_required','请重新登录。');
     const raced = await existing(tx);
     if (raced) return raced;
     let customer:string|null = null;
@@ -153,6 +158,7 @@ export async function startPortal(user:string,origin:string) {
     !selected.features.subscription_cancel.enabled || selected.features.subscription_cancel.mode!=='at_period_end') {
     throw new Fault(503,'stripe_portal_invalid','请将 Stripe 测试门户配置为账期结束时取消续费。');
   }
+  if (await accountRevision(user)===null) throw new Fault(401,'session_required','请重新登录。');
   const portal = await stripe.billingPortal.sessions.create({customer:order.customer_id,return_url:origin+'/redeem',configuration:selected.id});
   if (portal.livemode!==false) throw new Fault(502,'stripe_unavailable','Stripe 返回的订阅管理地址不匹配。');
   return {url:link(portal.url,'billing.stripe.com')};
@@ -178,18 +184,8 @@ async function recoverSubscriptionCheckout(user:string,stripe:Stripe) {
     ORDER BY created_at DESC LIMIT 1`,[user]);
   if (!stale) return;
   let session:Stripe.Checkout.Session|undefined;
-  if (stale.checkout_id) {
-    session = await stripe.checkout.sessions.retrieve(stale.checkout_id);
-  } else {
-    const created = {gte:Math.floor(stale.created_at.getTime()/1000)-300,lte:Math.floor(stale.expires_at.getTime()/1000)+300};
-    let inspected = 0;
-    for await (const candidate of stripe.checkout.sessions.list({created,limit:100})) {
-      if (++inspected>500) throw new Fault(503,'stripe_checkout_unconfirmed','请稍后重试或联系运营核对旧结账。');
-      if (candidate.client_reference_id!==stale.id) continue;
-      if (session) throw new Fault(503,'stripe_checkout_unconfirmed','旧结账存在多条 Stripe 记录，需运营核对。');
-      session = candidate;
-    }
-  }
+  try { session = await findStripeCheckout(stripe,stale); }
+  catch { throw new Fault(503,'stripe_checkout_unconfirmed','旧结账状态未确认，请稍后重试或联系运营核对。'); }
   if (session?.status==='expired') {
     const expired = session;
     await transaction(tx=>checkoutEvent(tx,expired,'expired'));
@@ -199,7 +195,7 @@ async function recoverSubscriptionCheckout(user:string,stripe:Stripe) {
     const order = await lockOrder(tx,stale.id);
     if (!order || order.state!=='open') return;
     if (session) {
-      validateCheckout(order,session);
+      validateStripeCheckout(order,session);
       await tx.query('UPDATE gateway.stripe_orders SET checkout_id=$2 WHERE id=$1',[order.id,session.id]);
     } else if (!order.checkout_id && !order.subscription_id) {
       await tx.query("UPDATE gateway.stripe_orders SET state='expired' WHERE id=$1",[order.id]);
@@ -207,18 +203,10 @@ async function recoverSubscriptionCheckout(user:string,stripe:Stripe) {
   });
 }
 
-function validateCheckout(order:Order,session:Stripe.Checkout.Session) {
-  if (session.livemode!==false || !session.id.startsWith('cs_test_') || session.client_reference_id!==order.id ||
-    session.metadata?.opentoken_order!==order.id || session.metadata?.opentoken_price!==order.price_id ||
-    session.currency!=='usd' || session.amount_total!==order.amount_cents ||
-    session.mode!==(order.kind==='credit' ? 'payment' : 'subscription') ||
-    (order.checkout_id && order.checkout_id!==session.id)) throw new Error('Stripe checkout does not match the test order');
-}
-
 async function checkoutEvent(tx:PoolClient,session:Stripe.Checkout.Session,closed?:'expired'|'failed',paidAt?:number) {
   const order = await lockOrder(tx,session.metadata?.opentoken_order);
   if (!order) return;
-  validateCheckout(order,session);
+  validateStripeCheckout(order,session);
   if (closed) {
     if (closed==='expired' && session.status!=='expired') throw new Error('Stripe checkout has not expired');
     if (order.state==='open' && session.payment_status!=='paid' && !session.subscription) {

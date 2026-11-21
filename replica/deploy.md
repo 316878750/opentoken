@@ -9,7 +9,7 @@
 | 备份与恢复 | 2026-11-20 首次由本机任务计划程序自动生成并校验试点快照，覆盖 14 张表，零账务异常。隔离恢复演练已通过。 |
 | 正式 HTTPS 地址 | Render 免费 Web Service `opentoken-pilot` 已在新加坡上线。登录与健康接口均返回 HTTP 200。 |
 | Supabase Auth | 已配置正式站点地址与 `/invite` 重定向，公开注册已关闭。 |
-| 监控与告警 | 本机定时检查已通过，告警测试邮件已确认收到。GitHub Actions 手动及原生定时检查均实际执行并通过，实际触发间隔另见第 8 阶段记录。 |
+| 监控与告警 | UptimeRobot 已启用。运营人员确认电脑断网时仍收到模拟 DOWN 邮件。本机定时检查和 GitHub Actions 检查也已通过。 |
 | 用户试用 | 首轮试点用户反馈已登录并体验全部功能，未发现问题。 |
 
 试点入口仅供受邀用户。放出链接前，在目标 Supabase 项目的 **Authentication → Sign In / Providers** 关闭公开注册，保留邮箱和密码登录。在 **URL Configuration** 设置正式 HTTPS 地址，并把正式地址的 `/invite` 加入 Auth 重定向列表。用公开 Auth 设置确认 `disable_signup` 为 `true`。
@@ -55,7 +55,8 @@ APP_ORIGIN="${APP_ORIGIN:-$RENDER_EXTERNAL_URL}" node node_modules/next/dist/bin
 
 - 配置仓库的 Actions 变量 `OPENTOKEN_PILOT_URL` 为正式 HTTPS 源地址。**Pilot health** 每 15 分钟检查登录页和健康接口，可手动运行。Render 免费实例闲置后会休眠，健康检查允许等待启动并重试一次。健康接口核对数据库权限、Supabase Auth、关闭公开注册的设置和网关配置，探针只读取服务状态。[Render 免费实例限制](https://render.com/docs/free)
 - 在托管平台查看应用错误日志，在 Supabase Cron 查看 `opentoken-billing-maintenance` 的运行结果。用 `pnpm db:billing alerts` 检查账务告警。
-- 2026-11-21 已验证 GitHub Actions 原生定时运行。两次成功运行相隔约 5 小时，云端故障通知仍待独立验收。 [首次定时检查](https://github.com/316878750/opentoken/actions/runs/44823171577) · [第二次定时检查](https://github.com/316878750/opentoken/actions/runs/44858149825) · [第 8 阶段记录](stage8.md)
+- UptimeRobot 在云端监控正式试点的 `/api/health`。2026-11-21，运营人员在电脑断网时通过手机发送模拟 DOWN 通知，并确认 QQ 邮箱收到邮件。复验可在监控详情页使用 **Test Notification**。 [第 8 阶段验收记录](stage8.md) · [UptimeRobot 测试通知说明](https://help.uptimerobot.com/en/articles/11602913-how-to-test-notifications-in-uptimerobot-quick-guide)
+- 2026-11-21 已验证 GitHub Actions 原生定时运行。最初两次成功运行相隔约 5 小时。 [首次定时检查](https://github.com/316878750/opentoken/actions/runs/44823171577) · [第二次定时检查](https://github.com/316878750/opentoken/actions/runs/44858149825)
 - Windows 任务计划程序的 **OpenToken Pilot Health** 每 15 分钟用 Node 运行 `scripts/pilot-health.mjs`。首个定时运行中，`/api/health` 和 `/login` 都返回 HTTP 200。最近一次结果保存在本机 `.demo-data/pilot-health-scheduled.json`。
 - Codex 本机自动化「OpenToken 试点故障邮件」每 30 分钟检查 GitHub 与 Windows 探针中最新的有效结果。邮件转发需要本机 Codex 可运行并保持 Gmail 连接。试点运营已确认收到告警测试邮件。
 

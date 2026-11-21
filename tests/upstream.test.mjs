@@ -75,6 +75,28 @@ const compatibleEnv = {
   UPSTREAM_INPUT_USD_PER_MTOK:'0.20', UPSTREAM_CACHED_USD_PER_MTOK:'0.04', UPSTREAM_OUTPUT_USD_PER_MTOK:'0.60',
 };
 
+test('compatible SSE accepts usage on the terminal choice and rejects premature, duplicate or incomplete usage', async () => {
+  const provider = resolveLiveUpstream({...compatibleEnv,ENABLE_UPSTREAM_STREAMING:'1'});
+  const usage = {prompt_tokens:40,completion_tokens:12,total_tokens:52,prompt_tokens_details:{cached_tokens:0}};
+  const done = 'data: [DONE]\n\n';
+  const finalChoice = {index:0,delta:{},finish_reason:'stop'};
+  const textChoice = {index:0,delta:{content:'OK'},finish_reason:null};
+  const frame = (choices,counts) => 'data: '+JSON.stringify({id:'provider-completion',model:provider.model,
+    object:'chat.completion.chunk',choices,usage:counts})+'\n\n';
+  const stream = body => async () => new Response(body,{headers:{'content-type':'text/event-stream'}});
+  const final = frame([finalChoice],usage);
+  const deltas = [];
+  const result = await openAiStream(request,provider,delta=>deltas.push(delta),stream(frame([textChoice])+final+done));
+  assert.deepEqual(deltas,[{content:'OK'}]);
+  assert.deepEqual(result.tokens,{input:40,cached:0,output:12});
+  assert.equal(result.choices[0].finish_reason,'stop');
+
+  for (const body of [frame([textChoice],usage)+frame([finalChoice])+done, final+frame([],usage)+done, final,
+    frame([finalChoice],{...usage,total_tokens:99})+done]) {
+    await assert.rejects(openAiStream(request,provider,()=>{},stream(body)),{disposition:'review'});
+  }
+});
+
 test('additional models share only the configured compatible credentials and enforce unique routes', () => {
   const model = {alias:'value-chat',model:'vendor/value-model',inputUsdPerMtok:'0.2',cachedUsdPerMtok:'0.04',outputUsdPerMtok:'0.6',streaming:true};
   const resolve = entries => resolveLiveUpstreams({...compatibleEnv,UPSTREAM_ADDITIONAL_MODELS_JSON:JSON.stringify(entries)});

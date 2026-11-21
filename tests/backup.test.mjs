@@ -35,6 +35,18 @@ test('remote database connection values require TLS hostname verification', () =
   assert.equal(postgresEndpoint('postgresql://u:p%40ss@db.example.test/postgres?sslmode=verify-full').password, 'p@ss');
 });
 
+test('a hosted recovery drill requires a local fixture and explicit confirmation of the target', () => {
+  const source = postgresEndpoint('postgresql://admin:fake@localhost/opentoken_restore_fixture_test');
+  const target = 'postgresql://postgres.aaaaaaaaaaaaaaaaaaaa:fake@aws-0-region.pooler.supabase.com:5432/postgres?sslmode=verify-full';
+  const project = 'aaaaaaaaaaaaaaaaaaaa';
+  const fixture = {identity:source.identity, drillFixture:true};
+  assert.throws(() => restoreTarget(target, fixture, project), /Supabase project/);
+  assert.throws(() => restoreTarget(target, fixture, undefined, {drill:true}), /confirm/);
+  assert.throws(() => restoreTarget(target, {identity:source.identity}, project, {drill:true}), /fixture/);
+  assert.throws(() => restoreTarget(target, {...fixture, project:'bbbbbbbbbbbbbbbbbbbb'}, project, {drill:true}), /fixture/);
+  assert.equal(restoreTarget(target, fixture, project, {drill:true}).project, project);
+});
+
 test('legacy and Stripe snapshots validate their explicit migration inventories', () => {
   const pilot = ['001','002','003','004'];
   assert.equal(backupTables(pilot).length,14);

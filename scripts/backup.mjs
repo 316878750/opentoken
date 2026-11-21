@@ -115,14 +115,17 @@ export function postgresEndpoint(value) {
   return {host, port, database, user, password, local, project, identity, ssl:!local || query.length > 0};
 }
 
-export function restoreTarget(value, source, confirmedProject) {
+export function restoreTarget(value, source, confirmedProject, {drill = false} = {}) {
   const target = postgresEndpoint(value);
   if (target.identity === source.identity || (target.project && target.project === source.project)) {
     throw new Error('Restore cannot target the source project or database');
   }
+  if (drill && (source.drillFixture !== true || source.project || target.local)) {
+    throw new Error('Hosted recovery drills require a local fixture and a separate Supabase project');
+  }
   if (target.local) {
     if (!/^opentoken_restore_[a-z0-9_]+$/.test(target.database)) throw new Error('Use an isolated database named opentoken_restore_*');
-  } else if (!target.project || !source.project || target.database !== 'postgres') {
+  } else if (!target.project || (!drill && !source.project) || target.database !== 'postgres') {
     throw new Error('Remote restore requires a new Supabase project with an empty postgres database');
   } else if (confirmedProject !== target.project) {
     throw new Error('Explicitly confirm the new Supabase project reference');
@@ -197,6 +200,9 @@ async function capture(endpoint) {
     {...settings.env, PGOPTIONS:'-c default_transaction_read_only=on'});
     await client.query('COMMIT');
     const source = {identity:endpoint.identity, project:endpoint.project};
+    if (endpoint.local && /^opentoken_restore_fixture_[a-z0-9_]+$/.test(endpoint.database)) {
+      source.drillFixture = true;
+    }
     return {archive, manifest:{source, createdAt:snapshot.created, serverVersion:snapshot.version, fingerprint:state.fingerprint}};
   } finally { await client.end(); }
 }
@@ -253,10 +259,12 @@ async function writeBackup(file, data) {
 
 async function main() {
   const [command, arg, confirmedProject, ...extra] = process.argv.slice(2);
-  if (extra.length || !['keygen','create','verify','restore'].includes(command) ||
-      (['verify','restore'].includes(command) && !arg) || (confirmedProject && command !== 'restore') ||
+  const restoring = command === 'restore' || command === 'restore-drill';
+  if (extra.length || !['keygen','create','verify','restore','restore-drill'].includes(command) ||
+      ((command === 'verify' || restoring) && !arg) || (confirmedProject && !restoring) ||
       (arg && ['create','keygen'].includes(command))) {
-    throw new Error('Use keygen, create, verify <archive>, or restore <archive> [new Supabase project reference]');
+    throw new Error('Use keygen, create, verify <archive>, restore <archive> [new Supabase project reference], ' +
+      'or restore-drill <fixture archive> <new Supabase project reference>');
   }
   if (!process.env.BACKUP_KEY_FILE) throw new Error('BACKUP_KEY_FILE must point to a separately protected key file');
   const keyFile = resolve(process.env.BACKUP_KEY_FILE);
@@ -282,7 +290,8 @@ async function main() {
   if ((await stat(arg)).size > maxBytes + 1024 * 1024) throw new Error('Archive exceeds the pilot backup size limit');
   const {manifest, archive} = decodeBackup(key, await readFile(arg));
   const tables = backupTables(manifest.fingerprint.versions);
-  const target = command === 'restore' && restoreTarget(process.env.BACKUP_TARGET_DATABASE_URL, manifest.source, confirmedProject);
+  const target = restoring && restoreTarget(process.env.BACKUP_TARGET_DATABASE_URL, manifest.source, confirmedProject,
+    {drill:command === 'restore-drill'});
   const sql = await archiveSql(archive,tables);
   if (target) await restore(target, manifest, sql,tables);
   console.log(`${target ? 'Restored and matched' : 'Verified'} snapshot from ${manifest.createdAt} (${tables.length} tables, ${manifest.fingerprint.accountingIssues} accounting issues).`);

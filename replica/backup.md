@@ -36,3 +36,9 @@ node scripts/backup.mjs restore '.demo-data/backup-drills/opentoken-<timestamp>-
 ```
 
 正式恢复时创建全新 Supabase 项目，先完成相同的迁移与空库核对，再设置目标证书和连接。远程恢复命令要求显式提供**新项目**的项目引用，脚本会检查该引用并拒绝源项目。目标地址可使用 `db.<项目引用>.supabase.co` 或用户名为 `postgres.<项目引用>` 的会话连接池。恢复后在开放业务流量前检查 `db:check`、邮箱重新登录、钱包余额与冻结额、计费/兑换历史及账务异常，按项目手册配置 Auth、网关凭据和账务维护后再切换。托管 Supabase 替换项目仍需在实际切换前单独演练。 [Supabase 项目备份与恢复](https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore)
+
+### 托管项目合成数据演练
+
+在本地创建库名以 `opentoken_restore_fixture_` 开头的演练源库，只写入合成用户和账务数据。匹配目标的 PostgreSQL 主版本、Auth 表结构和迁移版本。使用单独的备份密钥执行 `create`，归档会记录合成演练源标记。
+
+为专用 Supabase 恢复项目准备相同迁移版本的空库，配置 `BACKUP_TARGET_DATABASE_URL` 和目标数据库 TLS 证书。运行 `node scripts/backup.mjs restore-drill <fixture-archive> <recovery-project-ref>`。此命令要求归档来自本地演练源库，并要求项目引用匹配目标连接。它使用同一套事务内表清单、空库、数据摘要和账务验证。

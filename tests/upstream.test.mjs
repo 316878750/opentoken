@@ -105,6 +105,10 @@ test('additional models share only the configured compatible credentials and enf
   assert.equal(additional.apiKey,primary.apiKey);
   assert.equal(additional.responseModel,model.model);
   assert.equal(additional.streaming,false);
+  const published = resolveLiveUpstreams({...compatibleEnv,UPSTREAM_PUBLISH_PRIMARY:'0',
+    UPSTREAM_ADDITIONAL_MODELS_JSON:JSON.stringify([model])});
+  assert.deepEqual(published.map(route=>route.alias),[model.alias]);
+  assert.equal(published[0].endpoint,primary.endpoint);
   assert.throws(()=>resolve([{...model,endpoint:'https://other.example/v1'}]),/Invalid additional/);
   assert.throws(()=>resolve([model,model]),/Duplicate or reserved/);
   assert.throws(()=>resolve([{...model,alias:'mock-text'}]),/Duplicate or reserved/);

@@ -122,11 +122,15 @@ export async function startCheckout(user:string,kind:Kind,nonce:string,origin:st
 export async function startPortal(user:string,origin:string) {
   const {stripe} = sandbox();
   await requireSandboxDatabase();
+  const configuration = process.env.STRIPE_TEST_PORTAL_CONFIGURATION_ID?.trim() || undefined;
+  if (configuration && !/^bpc_\w+$/.test(configuration)) {
+    throw new Fault(503,'stripe_portal_invalid','请配置有效的 Stripe 测试客户门户。');
+  }
   const {rows:[order]} = await store().db.query<{customer_id:string}>(`SELECT customer_id FROM gateway.stripe_orders
     WHERE user_id=$1 AND kind='subscription' AND customer_id IS NOT NULL AND subscription_id IS NOT NULL
     ORDER BY created_at DESC LIMIT 1`,[user]);
   if (!order) throw new Fault(404,'stripe_subscription_missing','没有可以管理的测试订阅。');
-  const portal = await stripe.billingPortal.sessions.create({customer:order.customer_id,return_url:origin+'/redeem'});
+  const portal = await stripe.billingPortal.sessions.create({customer:order.customer_id,return_url:origin+'/redeem',configuration});
   if (portal.livemode!==false) throw new Fault(502,'stripe_unavailable','Stripe 返回的订阅管理地址不匹配。');
   return {url:link(portal.url,'billing.stripe.com')};
 }
@@ -235,7 +239,7 @@ async function syncSubscription(tx:PoolClient,stripe:Stripe,id:string,orderId?:s
 
 const handledEvents = new Set([
   'checkout.session.completed','checkout.session.async_payment_succeeded','checkout.session.async_payment_failed','checkout.session.expired',
-  'customer.subscription.created','customer.subscription.updated','customer.subscription.deleted','invoice.payment_failed',
+  'customer.subscription.created','customer.subscription.updated','customer.subscription.deleted','invoice.paid','invoice.payment_failed',
 ]);
 
 export async function receiveStripeWebhook(payload:string,signature:string|null) {
@@ -269,6 +273,7 @@ export async function receiveStripeWebhook(payload:string,signature:string|null)
       case 'customer.subscription.deleted':
         await syncSubscription(tx,stripe,event.data.object.id,event.data.object.metadata.opentoken_order);
         break;
+      case 'invoice.paid':
       case 'invoice.payment_failed': {
         const subscription = identifier(event.data.object.parent?.subscription_details?.subscription);
         if (subscription) await syncSubscription(tx,stripe,subscription);

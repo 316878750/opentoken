@@ -107,6 +107,7 @@ test.before(async () => {
       SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
       STRIPE_TEST_SECRET_KEY:'sk_test_fixture',STRIPE_TEST_WEBHOOK_SECRET:'whsec_fixture',
       STRIPE_TEST_CREDIT_PRICE_ID:'price_fixture_credit',STRIPE_TEST_SUBSCRIPTION_PRICE_ID:'price_fixture_monthly',
+      STRIPE_TEST_PORTAL_CONFIGURATION_ID:'bpc_fixture',
       GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',...upstreamEnv},
   });
   serverExit = once(server,'exit');
@@ -720,6 +721,16 @@ test('Stripe sandbox subscription reflects authoritative status and protects the
   assert.equal(portal.data.url,'https://billing.stripe.com/p/session/fixture');
   const otherPortal = await request('/api/billing/portal',{method:'POST',sessionOverride:await signIn('pilot-b@example.test')});
   assert.equal(otherPortal.status,404);
+  const initialPeriod = (await record()).periodEnd;
+  const beforeRenewal = (await request('/api/dashboard',{sessionOverride})).data;
+  const invoice = {billing_reason:'subscription_cycle',parent:{subscription_details:{subscription}}};
+  assert.equal(await stripeEvent('invoice.paid',invoice,{id:'evt_fixture_renewal'}),200);
+  const renewed = await record();
+  assert.equal(renewed.subscriptionStatus,'active');
+  assert.ok(Date.parse(renewed.periodEnd)>Date.parse(initialPeriod),'A paid renewal must advance the displayed period');
+  assert.equal(await stripeEvent('invoice.paid',invoice,{id:'evt_fixture_renewal'}),200);
+  assert.equal((await record()).periodEnd,renewed.periodEnd);
+  assert.equal((await request('/api/dashboard',{sessionOverride})).data.balanceMicros,beforeRenewal.balanceMicros);
   assert.equal(await stripeEvent('invoice.payment_failed',{parent:{subscription_details:{subscription}}}),200);
   assert.equal((await record()).subscriptionStatus,'past_due');
   assert.equal(await stripeEvent('customer.subscription.deleted',{id:subscription,metadata}),200);

@@ -47,11 +47,13 @@ function stripeFixture(url,options) {
     if (!checkout || checkout.mode!=='subscription') throw new Error('Unexpected Stripe subscription lookup');
     const reads = subscriptionReads.get(id) ?? 0;
     subscriptionReads.set(id,reads+1);
-    return reply({id,object:'subscription',livemode:false,customer:'cus_fixture',status:['active','past_due','canceled'][Math.min(reads,2)],
-      metadata:checkout.metadata,items:{data:[{price:{id:checkout.metadata.opentoken_price},current_period_end:Math.floor(Date.now()/1000)+3_600}]}});
+    return reply({id,object:'subscription',livemode:false,customer:'cus_fixture',status:['active','active','past_due','canceled'][Math.min(reads,3)],
+      metadata:checkout.metadata,items:{data:[{price:{id:checkout.metadata.opentoken_price},
+        current_period_end:Math.floor(Date.now()/1000)+(reads===0 ? 3_600 : 7_200)}]}});
   }
   if (path==='/v1/billing_portal/sessions' && options.method==='POST') {
-    if (new URLSearchParams(String(options.body)).get('customer')!=='cus_fixture') throw new Error('Unexpected Stripe portal customer');
+    const form = new URLSearchParams(String(options.body));
+    if (form.get('customer')!=='cus_fixture' || form.get('configuration')!=='bpc_fixture') throw new Error('Unexpected Stripe portal customer or configuration');
     return reply({id:'bps_fixture',object:'billing_portal.session',livemode:false,url:'https://billing.stripe.com/p/session/fixture'});
   }
   throw new Error('Unexpected Stripe fixture request');

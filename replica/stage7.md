@@ -47,14 +47,20 @@ UPSTREAM_ADDITIONAL_MODELS_JSON='[{"alias":"deepseek-v4-pro","model":"deepseek-v
 ## 7.4 在线支付与订阅
 
 - [x] 接入 Stripe 测试 Checkout。在本地验证签名、币种和金额校验、钱包入账、相同事件重发及不同事件标识指向同一笔支付。
-- [x] 接入测试订阅和 Stripe Customer Portal。在本地验证开通、续费异常、取消、延迟回调防重复开通，以及账号隔离。
-- [ ] 使用真实 Stripe 沙盒价格、测试卡和实际回调验收支付、续费与取消。正式套餐权益、税费、币种及退款口径另行确认。
+- [x] 接入测试订阅和 Stripe Customer Portal。在本地验证开通、成功续费更新账期、续费异常、取消、延迟回调防重复开通，以及账号隔离。
+- [x] 2026-11-21 以 Stripe 沙盒验收充值、续费、取消和签名回调。Checkout 测试付款仅入账一次，已验证真实回调重放和错误签名。用 Test Clock 生成已付款的续费账单，OpenToken 同步新账期。已验证客户门户链接，并通过 Stripe 沙盒 API 取消订阅，取消回调同步了双方状态。续费和取消期间钱包余额与充值流水保持一致。
 
 使用独立的沙盒数据库，先迁移至 005，再用沙盒数据库管理员连接运行 `node --env-file=.env.local scripts/database.mjs stripe-sandbox`。命令会拒绝已有真实上游请求的数据库。启用标记后，网关会在该数据库禁用真实上游路由，Stripe 测试充值只用于模拟调用。
 
 在沙盒服务设置 `STRIPE_TEST_SECRET_KEY`（`sk_test_`）、`STRIPE_TEST_WEBHOOK_SECRET`、`STRIPE_TEST_CREDIT_PRICE_ID` 和 `STRIPE_TEST_SUBSCRIPTION_PRICE_ID`。价格分别使用美元一次性价和周期价。配置 Stripe 测试 Customer Portal，从 Stripe 测试事件转发至 `/api/stripe/webhook`。沙盒端到端验收使用 Stripe 测试卡。每笔充值按等额测试余额入账，订阅显示支付状态和当前账期。回跳页展示订单，钱包余额以通过验签的支付事件为准。
 
 订阅 Checkout 在 Stripe 确认已过期或终止前会阻止再次开通。若与 Stripe 的首次创建通信中断，可用原浏览器继续同一个结账请求。若订单已过期且缺少 Stripe 会话号，网关按订单创建时间和编号核对 Stripe 会话。已完成但待回调的结账继续阻止重复开通，确定没有创建会话时才放行。
+
+收到 `invoice.paid` 或 `invoice.payment_failed` 后，网关向 Stripe 读取订阅的最新状态和账期。订阅账单不进入充值流水。Webhook 重复投递按事件 ID 去重。
+
+如需使用专用的沙盒客户门户，可设置 `STRIPE_TEST_PORTAL_CONFIGURATION_ID`（`bpc_`）。留空时使用 Stripe 沙盒默认配置。
+
+正式套餐权益、税费、币种和退款口径另行确认。
 
 本机 PostgreSQL 演练已核对 17 张表、零账务异常，恢复后订单、事件、测试钱包和隔离标记一致。旧版 14 表归档仍可校验。
 

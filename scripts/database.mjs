@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { Client } from 'pg';
 import { postgresConnectionOptions } from '../lib/postgres-config.mjs';
 import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
+import { adminCommand } from './admin.mjs';
 import { billingCommand, scanBilling } from './billing.mjs';
 import { redeemCommand } from './redeem.mjs';
 import { stripeCommand } from './stripe-ops.mjs';
@@ -45,7 +46,7 @@ export async function migrate(client) {
     if (!rowCount) throw new Error('Create a restricted opentoken_app login role before migrating');
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
-      ['007','007-paid-pilot-preparation.sql']]) {
+      ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -143,6 +144,14 @@ export async function check(client) {
     NOT has_table_privilege(current_user,'gateway.redeem_attempts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_attempts_private,
     NOT has_table_privilege(current_user,'gateway.stripe_sandbox','INSERT,UPDATE,DELETE,TRUNCATE') AS stripe_sandbox_private,
     NOT has_function_privilege(current_user,'gateway.approve_stripe_refund(uuid,uuid,integer,text)','EXECUTE') AS refund_approval_private,
+    NOT has_table_privilege(current_user,'gateway.admin_roles','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS admin_roles_private,
+    NOT has_table_privilege(current_user,'gateway.admin_eligible_accounts','SELECT') AS admin_eligibility_private,
+    NOT has_table_privilege(current_user,'gateway.admin_audit_events','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS admin_audit_private,
+    NOT has_table_privilege(current_user,'gateway.login_events','SELECT,UPDATE,DELETE,TRUNCATE') AS login_events_immutable,
+    has_column_privilege(current_user,'gateway.login_events','request_id','INSERT') AS login_events_append,
+    has_function_privilege(current_user,'gateway.admin_role_for(uuid)','EXECUTE') AS admin_role_lookup,
+    has_function_privilege(current_user,'gateway.authorize_admin(uuid,uuid,text)','EXECUTE') AS admin_access_audit,
+    NOT has_function_privilege(current_user,'gateway.set_admin_role(uuid,text,text)','EXECUTE') AS admin_role_change_private,
     NOT coalesce((SELECT has_table_privilege(current_user,c.oid,'SELECT')
       FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
       WHERE n.nspname='auth' AND c.relname='users'),true) AS auth_private`);
@@ -164,13 +173,13 @@ export async function enableStripeSandbox(client) {
 
 async function main() {
   const [, , action, ...args] = process.argv;
-  if (!['migrate','seed','check','review-stale','billing','redeem','stripe-sandbox','stripe','paid-pilot'].includes(action)) {
-    throw new Error('Expected migrate, seed, check, review-stale, billing, redeem, stripe-sandbox, stripe, or paid-pilot');
+  if (!['migrate','seed','check','review-stale','billing','redeem','stripe-sandbox','stripe','paid-pilot','admin'].includes(action)) {
+    throw new Error('Expected migrate, seed, check, review-stale, billing, redeem, stripe-sandbox, stripe, paid-pilot, or admin');
   }
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–007 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–008 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');
@@ -179,6 +188,7 @@ async function main() {
     if (action==='review-stale') console.log(JSON.stringify(await scanBilling(client)));
     if (action==='billing') console.log(JSON.stringify(await billingCommand(client,args),null,2));
     if (action==='redeem') console.log(JSON.stringify(await redeemCommand(client,args),null,2));
+    if (action==='admin') console.log(JSON.stringify(await adminCommand(client,args),null,2));
     if (action==='stripe') {
       const result=await stripeCommand(client,args);
       console.log(JSON.stringify(result,null,2));

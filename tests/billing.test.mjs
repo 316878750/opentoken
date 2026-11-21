@@ -12,7 +12,8 @@ let admin;
 before(async () => {
   database = await PGlite.create();
   await database.exec(`CREATE SCHEMA auth;
-    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz);
+    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz,
+      banned_until timestamptz,deleted_at timestamptz);
     CREATE ROLE opentoken_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;`);
   await database.query('INSERT INTO auth.users VALUES ($1,$2,now())',[user,email]);
   admin = {query:async (sql,params) => {

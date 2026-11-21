@@ -13,7 +13,10 @@ async function checkDatabase() {
     has_column_privilege(to_regclass('gateway.wallets'),'refund_held_micros','SELECT') AND
     has_function_privilege(to_regprocedure('gateway.sandbox_billing_limits(uuid)'),'EXECUTE') AND
     has_table_privilege(to_regclass('gateway.wallets'),'SELECT') AND
-    has_function_privilege(to_regprocedure('gateway.redeem_trial_credit(uuid,bytea)'),'EXECUTE') AS ready`);
+    has_function_privilege(to_regprocedure('gateway.redeem_trial_credit(uuid,bytea)'),'EXECUTE') AND
+    has_column_privilege(to_regclass('gateway.login_events'),'request_id','INSERT') AND
+    has_function_privilege(to_regprocedure('gateway.admin_role_for(uuid)'),'EXECUTE') AND
+    has_function_privilege(to_regprocedure('gateway.authorize_admin(uuid,uuid,text)'),'EXECUTE') AS ready`);
   if (!row.ready) throw new Error('Gateway schema is unavailable');
 }
 

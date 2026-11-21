@@ -1,5 +1,6 @@
 import { cookies } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
+import { adminRole } from '@/lib/admin';
 import { sessionCookie, sessionUser } from '@/lib/session';
 import { Dashboard, Keys, Login, Pricing, Redeem, Usage } from '../console';
 
@@ -12,12 +13,14 @@ export default async function Screen({ params }: { params:Promise<{screen:string
   const user = await sessionUser((await cookies()).get(sessionCookie)?.value);
   if (screen === 'login') return user ? redirect('/dashboard') : <Login />;
   if (!user) redirect('/login?redirect=/' + screen);
+  const role = await adminRole(user);
   return <div className="shell">
     <aside>
       <a className="brand" href="/dashboard">OpenToken</a>
       <span className="badge">试点控制台</span>
       <nav aria-label="控制台">
         {screens.map((item,i) => <a key={item} href={'/'+item} aria-current={item===screen ? 'page' : undefined}>{labels[i]}</a>)}
+        {role && <a href="/admin">管理员后台</a>}
       </nav>
     </aside>
     <main>

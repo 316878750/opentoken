@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
+import { adminCommand } from '../scripts/admin.mjs';
 import { check,enableStripeSandbox,migrate,seed } from '../scripts/database.mjs';
 import { redeemCommand } from '../scripts/redeem.mjs';
 import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
@@ -14,7 +15,11 @@ import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
 const primary = '30000000-0000-4000-8000-000000000001';
 const secondary = '30000000-0000-4000-8000-000000000002';
 const trial = '30000000-0000-4000-8000-000000000003';
-const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial]]);
+const owner = '30000000-0000-4000-8000-000000000004';
+const staff = '30000000-0000-4000-8000-000000000005';
+const member = '30000000-0000-4000-8000-000000000006';
+const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
+  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member]]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -39,11 +44,12 @@ function fakeAuth() {
       response.end(JSON.stringify(payload));
     };
     const makeUser = (id,email) => ({id,email,aud:'authenticated',role:'authenticated',
-      app_metadata:{provider:'email'},user_metadata:{},created_at:new Date().toISOString()});
+      app_metadata:{provider:'email'},user_metadata:id===member ? {role:'system_admin'} : {},created_at:new Date().toISOString()});
     if (request.method==='POST' && request.url==='/auth/v1/token?grant_type=password') {
       let raw = '';
       for await (const chunk of request) raw += chunk;
       const {email,password} = JSON.parse(raw);
+      if (email==='limited@example.test') return json(429,{code:'over_request_rate_limit',msg:'Rate limited'});
       if (!identities.has(email) || password!=='fixture-test-password') {
         return json(400,{code:'invalid_credentials',msg:'Invalid credentials'});
       }
@@ -66,7 +72,8 @@ function fakeAuth() {
 test.before(async () => {
   database = await PGlite.create();
   await database.exec(`CREATE SCHEMA auth;
-    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz);
+    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz,
+      banned_until timestamptz,deleted_at timestamptz);
     CREATE ROLE opentoken_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;`);
   for (const [email,id] of identities) await database.query('INSERT INTO auth.users VALUES ($1,$2,now())',[id,email]);
   admin = {query:async (sql,params) => {
@@ -152,6 +159,140 @@ test('public readiness checks PostgreSQL and Auth without disclosing service con
   assert.equal(health.status,200);
   assert.deepEqual(health.data,{status:'ok'});
   assert.match(health.headers.get('cache-control'),/no-store/);
+});
+
+test('admin entry rejects ordinary sessions and valid gateway keys', async () => {
+  const login = await request('/api/session/login',loginPayload('member@example.test'));
+  assert.equal(login.status,200);
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const ordinary = await request('/api/admin/session',{sessionOverride});
+  assert.equal(ordinary.status,403);
+  assert.match(ordinary.headers.get('cache-control'),/no-store/);
+  const visitor = await fetch(base+'/admin',{redirect:'manual'});
+  assert.equal(visitor.status,307);
+  assert.equal(visitor.headers.get('location'),'/login?redirect=/admin');
+  const restrictedPage = await fetch(base+'/admin',{headers:{cookie:sessionOverride}});
+  assert.equal(restrictedPage.status,404);
+  assert.doesNotMatch(await restrictedPage.text(),/data-admin-entry/);
+  const consolePage = await fetch(base+'/dashboard',{headers:{cookie:sessionOverride}});
+  assert.doesNotMatch(await consolePage.text(),/href="\/admin"/);
+  const {data:catalog} = await request('/api/catalog',{sessionOverride});
+  const key = await request('/api/keys',{method:'POST',sessionOverride,body:{name:'admin boundary',groupId:catalog.rates[0].groupId,rpm:10}});
+  assert.equal(key.status,201);
+  const token = key.data.secret;
+  assert.equal((await request('/v1/models',{session:false,token})).status,200);
+  const blocked = await request('/api/admin/session',{session:false,token});
+  assert.equal(blocked.status,401);
+  const keyPage = await fetch(base+'/admin',{redirect:'manual',headers:{authorization:'Bearer '+token}});
+  assert.equal(keyPage.status,307);
+  assert.equal(keyPage.headers.get('location'),'/login?redirect=/admin');
+});
+
+async function withDatabaseOwner(work) {
+  await database.exec('RESET ROLE');
+  try { return await work(); }
+  finally { await database.exec('SET ROLE opentoken_app'); }
+}
+
+async function changeAdminRole(userId,role,reason='role_review') {
+  const args = role ? ['grant',userId,role,reason] : ['revoke',userId,reason];
+  return (await withDatabaseOwner(()=>adminCommand(admin,args))).role;
+}
+
+test('trusted role changes are audited and immediately affect the same validated session', async () => {
+  const unknown = '30000000-0000-4000-8000-000000000010';
+  await assert.rejects(changeAdminRole(unknown,'system_admin'),/confirmed/i);
+  await assert.rejects(changeAdminRole(staff,'operator'),/administrator first/i);
+  assert.equal(await changeAdminRole(owner,'system_admin','initial_setup'),'system_admin');
+  await assert.rejects(changeAdminRole(owner,null,'incident_response'),/last.*administrator/i);
+  const ownerLogin = await request('/api/session/login',loginPayload('owner@example.test'));
+  const ownerCookie = ownerLogin.headers.get('set-cookie').split(';')[0];
+  assert.equal((await request('/api/admin/session',{sessionOverride:ownerCookie})).data.role,'system_admin');
+  const consolePage = await fetch(base+'/dashboard',{headers:{cookie:ownerCookie}});
+  assert.match(await consolePage.text(),/href="\/admin"/);
+  const {data:catalog} = await request('/api/catalog',{sessionOverride:ownerCookie});
+  const ownerKey = await request('/api/keys',{method:'POST',sessionOverride:ownerCookie,
+    body:{name:'admin-owned gateway key',groupId:catalog.rates[0].groupId,rpm:10}});
+  assert.equal(ownerKey.status,201);
+  const token = ownerKey.data.secret;
+  assert.equal((await request('/v1/models',{session:false,token})).status,200);
+  assert.equal((await request('/api/admin/session',{session:false,token})).status,401);
+
+  const login = await request('/api/session/login',loginPayload('staff@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await request('/api/admin/session',{sessionOverride})).status,403);
+  assert.equal(await changeAdminRole(staff,'auditor'),'auditor');
+  const allowed = await request('/api/admin/session',{sessionOverride});
+  assert.equal(allowed.status,200);
+  assert.equal(allowed.data.role,'auditor');
+  const page = await fetch(base+'/admin',{headers:{cookie:sessionOverride}});
+  assert.equal(page.status,200);
+  assert.match(page.headers.get('cache-control'),/no-store/);
+  assert.match(await page.text(),/data-admin-entry/);
+  assert.equal(await changeAdminRole(staff,'operator'),'operator');
+  assert.equal((await request('/api/admin/session',{sessionOverride})).data.role,'operator');
+  assert.equal(await changeAdminRole(staff,null),null);
+  const denied = await request('/api/admin/session',{sessionOverride});
+  assert.equal(denied.status,403);
+  assert.equal((await fetch(base+'/admin',{headers:{cookie:sessionOverride}})).status,404);
+  assert.equal((await request('/api/dashboard',{sessionOverride})).status,200);
+
+  await assert.rejects(database.query('SELECT * FROM gateway.admin_roles'),{code:'42501'});
+  await assert.rejects(database.query('SELECT gateway.set_admin_role($1,$2,$3)',[member,'system_admin','role_review']),{code:'42501'});
+  await assert.rejects(database.query('UPDATE gateway.admin_audit_events SET outcome=\'denied\''),{code:'42501'});
+  await assert.rejects(database.query('SELECT * FROM gateway.login_events'),{code:'42501'});
+
+  await database.exec('RESET ROLE');
+  try {
+    const {rows} = await database.query(`SELECT request_id,actor_user_id,action,outcome,reason,details
+      FROM gateway.admin_audit_events WHERE request_id IN ($1,$2) ORDER BY occurred_at`,
+    [allowed.headers.get('x-request-id'),denied.headers.get('x-request-id')]);
+    assert.deepEqual(rows.map(row=>[row.actor_user_id,row.action,row.outcome,row.reason]),[
+      [staff,'admin.session','success','granted'],[staff,'admin.session','denied','role_required'],
+    ]);
+    const {rows:[revocation]} = await database.query(`SELECT actor_db_role, details FROM gateway.admin_audit_events
+      WHERE target_user_id=$1 AND action='admin.role_change' AND reason='revoked'`,[staff]);
+    assert.ok(revocation.actor_db_role);
+    assert.deepEqual(revocation.details,{before:'operator',after:null,requestedReason:'role_review'});
+    const {rows:[blocked]} = await database.query(`SELECT outcome,reason,details FROM gateway.admin_audit_events
+      WHERE target_user_id=$1 AND action='admin.role_change' AND outcome='denied'`,[owner]);
+    assert.equal(blocked.reason,'last_admin');
+    assert.deepEqual(blocked.details,{before:'system_admin',requestedRole:null,requestedReason:'incident_response'});
+  } finally { await database.exec('SET ROLE opentoken_app'); }
+});
+
+test('an inactive Supabase account cannot retain access or count as a backup administrator', async () => {
+  const login = await request('/api/session/login',loginPayload('staff@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  await changeAdminRole(staff,'system_admin');
+  try {
+    await withDatabaseOwner(()=>database.query("UPDATE auth.users SET banned_until=now()+interval '1 hour' WHERE id=$1",[staff]));
+    assert.equal((await request('/api/admin/session',{sessionOverride})).status,403);
+    await assert.rejects(changeAdminRole(owner,null),/last.*administrator/i);
+    await withDatabaseOwner(()=>database.query('UPDATE auth.users SET banned_until=NULL,deleted_at=now() WHERE id=$1',[staff]));
+    assert.equal((await request('/api/admin/session',{sessionOverride})).status,403);
+    await assert.rejects(changeAdminRole(owner,null),/last.*administrator/i);
+  } finally {
+    await withDatabaseOwner(()=>database.query('UPDATE auth.users SET banned_until=NULL,deleted_at=NULL WHERE id=$1',[staff]));
+    await changeAdminRole(staff,null);
+  }
+});
+
+test('application login events record outcomes without storing submitted credentials', async () => {
+  const accepted = await request('/api/session/login',loginPayload('staff@example.test'));
+  const rejected = await request('/api/session/login',loginPayload('staff@example.test','incorrect-fixture-password'));
+  const limited = await request('/api/session/login',loginPayload('limited@example.test'));
+  assert.deepEqual([accepted.status,rejected.status,limited.status],[200,401,429]);
+  await database.exec('RESET ROLE');
+  try {
+    const {rows} = await database.query(`SELECT * FROM gateway.login_events WHERE request_id IN ($1,$2,$3) ORDER BY occurred_at`,
+      [accepted,rejected,limited].map(result=>result.headers.get('x-request-id')));
+    assert.deepEqual(rows.map(row=>[row.outcome,row.user_id]),[['success',staff],['failure',null],['rate_limited',null]]);
+    assert.equal(rows[0].identifier_digest.length,32);
+    assert.deepEqual(rows[0].identifier_digest,rows[1].identifier_digest);
+    assert.notDeepEqual(rows[1].identifier_digest,rows[2].identifier_digest);
+    assert.doesNotMatch(JSON.stringify(rows),/example\.test|fixture-password|opentoken_session/);
+  } finally { await database.exec('SET ROLE opentoken_app'); }
 });
 
 test('mock call settles once, hides the API key and isolates independent users', async () => {

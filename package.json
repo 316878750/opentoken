@@ -18,6 +18,7 @@
     "db:backup": "node --env-file-if-exists=.env.local scripts/backup.mjs",
     "db:stripe": "node --env-file-if-exists=.env.local scripts/database.mjs stripe",
     "db:paid-pilot": "node --env-file-if-exists=.env.local scripts/database.mjs paid-pilot",
+    "db:admin": "node --env-file-if-exists=.env.local scripts/database.mjs admin",
     "pilot:invite": "node --env-file-if-exists=.env.local scripts/pilot-invite.mjs",
     "verify:live": "node --env-file-if-exists=.env.local scripts/verify-live.mjs"
   },

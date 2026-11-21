@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
+import { adminAccess, recordLoginEvent } from './admin';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
@@ -107,16 +109,36 @@ export async function handle(req: NextRequest) {
     }
     if (route === 'POST /api/session/login') {
       const input = parse(z.object({email:z.email().max(254),password:z.string().min(1).max(256)}),await body(req));
+      const requestId = randomUUID();
       const {data,error} = await loginSession(input.email,input.password);
-      if (error?.status===429) throw new Fault(429,'login_rate_limit','尝试次数较多，请稍后再登录。');
-      if (error && (!error.status || error.status>=500)) throw new Fault(503,'auth_unavailable','身份服务暂时无法使用。');
-      if (!data.session || !data.user) throw new Fault(401,'invalid_login','邮箱或密码有误，或账号尚未验证。');
+      if (error?.status===429) {
+        await recordLoginEvent(requestId,input.email,'rate_limited');
+        throw new Fault(429,'login_rate_limit','尝试次数较多，请稍后再登录。',requestId);
+      }
+      if (error && (!error.status || error.status>=500)) {
+        await recordLoginEvent(requestId,input.email,'unavailable');
+        throw new Fault(503,'auth_unavailable','身份服务暂时无法使用。',requestId);
+      }
+      if (!data.session || !data.user) {
+        await recordLoginEvent(requestId,input.email,'failure');
+        throw new Fault(401,'invalid_login','邮箱或密码有误，或账号尚未验证。',requestId);
+      }
       await ensureWallet(data.user.id);
+      await recordLoginEvent(requestId,input.email,'success',data.user.id);
       const response = json({ok:true});
+      response.headers.set('x-request-id',requestId);
       setSession(response,origin,data.session.access_token,data.session.expires_in);
       return response;
     }
     const token = req.cookies.get(sessionCookie)?.value;
+    if (route === 'GET /api/admin/session') {
+      const {userId,role,requestId} = await adminAccess(token,'admin.session');
+      if (!userId) throw new Fault(401,'session_required','请先登录。',requestId);
+      if (!role) throw new Fault(403,'admin_required','当前账号没有后台访问权限。',requestId);
+      const response = json({role});
+      response.headers.set('x-request-id',requestId);
+      return response;
+    }
     if (route === 'POST /api/session/logout') {
       await endSession(token).catch(() => console.error('Supabase session revoke failed'));
       const response = new NextResponse(null,{status:204,headers:{'cache-control':'no-store'}});

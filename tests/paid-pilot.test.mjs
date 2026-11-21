@@ -13,7 +13,8 @@ const email='pilot-owner@example.test';
 before(async()=>{
   db=await PGlite.create();
   await db.exec(`CREATE SCHEMA auth;
-    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text,email_confirmed_at timestamptz);
+    CREATE TABLE auth.users(id uuid PRIMARY KEY,email text,email_confirmed_at timestamptz,
+      banned_until timestamptz,deleted_at timestamptz);
     CREATE ROLE opentoken_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;`);
   await db.query("INSERT INTO auth.users VALUES ($1,$2,now()),($3,'unconfirmed@example.test',NULL)",
     [selected,email,other]);

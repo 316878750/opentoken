@@ -13,6 +13,7 @@ export default async function ModelsPage() {
   return <div className="shell">
     <aside><a className="brand" href="/dashboard">OpenToken</a><nav aria-label="管理员后台">
       <a href="/admin">管理员后台</a><a href="/admin/channels">渠道管理</a><a href="/admin/models" aria-current="page">模型管理</a>
+      <a href="/admin/users">用户管理</a>
     </nav></aside>
     <main><header className="top"><span>管理控制台</span><form action="/logout" method="post"><button>退出登录</button></form></header>
       <div className="workspace"><ModelManager /></div>

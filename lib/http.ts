@@ -6,11 +6,12 @@ import { issueAdminRedeem, listAdminRedeem, voidAdminRedeem } from './admin-rede
 import { channelDraftInput, channelProbeInput, channelDisableInput, channelPublishInput, changeChannel,
   listChannels, probeChannel, saveChannel } from './admin-channels';
 import { listAdminModels, modelAdminInput, writeAdminModel } from './admin-models';
+import { inviteAdminUser, listAdminUsers, userChangeInput, userInviteInput, userListInput, writeAdminUser } from './admin-users';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
 import { dashboard, usage, usageTrend } from './reports';
-import { appOrigin, endSession, loginSession, sessionCookie, sessionUser, setSession } from './session';
+import { accountRevision, appOrigin, endSession, loginSession, sealSession, sessionCookie, sessionUser, setSession } from './session';
 import { redeemCredit, walletEntries } from './wallet';
 
 const date = z.iso.datetime({ offset:true });
@@ -131,12 +132,19 @@ export async function handle(req: NextRequest) {
         await recordLoginEvent(requestId,input.email,'failure');
         throw new Fault(401,'invalid_login','邮箱或密码有误，或账号尚未验证。',requestId);
       }
+      const revision = await accountRevision(data.user.id);
+      if (revision===null) {
+        await recordLoginEvent(requestId,input.email,'failure');
+        await endSession(data.session.access_token).catch(()=>{});
+        throw new Fault(403,'account_unavailable','账号当前不可用，请联系试点运营。',requestId);
+      }
       await ensureWallet(data.user.id);
       await recordLoginEvent(requestId,input.email,'success',data.user.id);
       const response = json({ok:true});
       response.headers.set('x-request-id',requestId);
-      setSession(response,origin,data.session.access_token,data.session.expires_in);
-      setRecentAdminAuth(response,origin,data.session.access_token);
+      const sealed = sealSession(data.session.access_token,revision);
+      setSession(response,origin,sealed,data.session.expires_in);
+      setRecentAdminAuth(response,origin,sealed);
       return response;
     }
     const token = req.cookies.get(sessionCookie)?.value;
@@ -157,6 +165,19 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route==='GET /api/admin/users') {
+      return json(await listAdminUsers(user,parse(userListInput,Object.fromEntries(req.nextUrl.searchParams))));
+    }
+    if (route==='POST /api/admin/users/invitations') {
+      const invite = await inviteAdminUser(user,parse(userInviteInput,await body(req)),origin);
+      return json(invite,201,invite.requestId);
+    }
+    const userAction = method==='POST' && /^\/api\/admin\/users\/([^/]+)\/(state|role)$/.exec(path);
+    if (userAction) {
+      const change = parse(userChangeInput,{action:userAction[2],payload:await body(req)});
+      const saved = await writeAdminUser(user,parse(z.uuid(),userAction[1]),change,hasRecentAdminAuth(req,token));
+      return json(saved,200,saved.requestId);
+    }
     if (route === 'GET /api/admin/models') return json(await listAdminModels(user));
     const modelAction = method==='POST' && /^\/api\/admin\/models\/(create|state|group-create|group-rename|group-state|rate-publish)$/.exec(path);
     if (modelAction) {

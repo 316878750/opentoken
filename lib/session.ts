@@ -1,7 +1,24 @@
 import { createClient } from '@supabase/supabase-js';
 import type { NextRequest, NextResponse } from 'next/server';
+import { timingSafeEqual } from 'node:crypto';
+import { digest, store } from './data';
 
 export const sessionCookie = 'opentoken_session';
+const sessionPattern = /^([\w-]+\.[\w-]+\.[\w-]+)(?:~([a-f0-9]{64}))?$/;
+
+export async function accountRevision(userId:string) {
+  const {rows:[row]} = await store().db.query<{revision:string|null}>(
+    'SELECT gateway.account_access($1)::text AS revision',[userId]);
+  return row.revision;
+}
+
+function sessionProof(token:string,revision:string) {
+  return digest('session-revision',revision+'\0'+token);
+}
+
+export function sealSession(token:string,revision:string) {
+  return token+'~'+sessionProof(token,revision).toString('hex');
+}
 
 export function createAuthClient() {
   const { SUPABASE_URL:base, SUPABASE_PUBLISHABLE_KEY:key } = process.env;
@@ -18,15 +35,24 @@ export async function loginSession(email: string,password: string) {
   return createAuthClient().auth.signInWithPassword({email,password});
 }
 
-export async function sessionUser(token: string | undefined) {
-  if (!token || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) return null;
+export async function sessionUser(cookie: string | undefined) {
+  const parsed = sessionPattern.exec(cookie ?? '');
+  if (!parsed) return null;
+  const [,token,proof] = parsed;
   const {data,error} = await createAuthClient().auth.getUser(token);
   if (error && (!error.status || error.status>=500)) throw new Error('Supabase Auth is temporarily unavailable');
-  return data.user?.id ?? null;
+  const userId = data.user?.id;
+  if (!userId) return null;
+  const revision = await accountRevision(userId);
+  if (revision===null) return null;
+  // Cookies issued before this migration remain valid for never-suspended accounts.
+  if (!proof) return revision==='0' ? userId : null;
+  return timingSafeEqual(Buffer.from(proof,'hex'),sessionProof(token,revision)) ? userId : null;
 }
 
-export async function endSession(token: string | undefined) {
-  if (token && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) {
+export async function endSession(cookie: string | undefined) {
+  const token = sessionPattern.exec(cookie ?? '')?.[1];
+  if (token) {
     const {error} = await createAuthClient().auth.admin.signOut(token,'local');
     if (error && (!error.status || error.status>=500)) console.error('Supabase session revoke temporarily unavailable');
   }

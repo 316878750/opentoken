@@ -124,7 +124,8 @@ async function findKey(header: string | null) {
   const token = /^Bearer (mg_[a-zA-Z0-9_-]{43})$/.exec(header || '')?.[1];
   if (token) {
     const { db } = await store();
-    const { rows } = await db.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE secret_digest=$1`,
+    const { rows } = await db.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys
+      WHERE secret_digest=$1 AND gateway.account_access(user_id) IS NOT NULL`,
       [await digest('api-key',token)]);
     if (rows[0]?.status === 'active') return rows[0];
   }
@@ -154,12 +155,14 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
   const credentials = channelCredentials();
   const started = Date.now();
   const { id, rate, hold, live } = await transaction(async tx => {
+    await tx.query('SELECT pg_advisory_xact_lock_shared(961020037,hashtext($1))',[key.user_id]);
     if (body.model!==mockModel) await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
     await tx.query('SELECT pg_advisory_xact_lock_shared($1)',[channelRoutingLock]);
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros-refund_held_micros)::text AS available
       FROM gateway.wallets WHERE user_id=$1 FOR UPDATE`,[key.user_id]);
-    const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE id=$1 FOR UPDATE`,[key.id]);
-    if (lockedKey.status !== 'active') throw new Fault(401,'invalid_api_key','API 密钥已停用。');
+    const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys
+      WHERE id=$1 AND gateway.account_access(user_id) IS NOT NULL FOR UPDATE`,[key.id]);
+    if (lockedKey?.status !== 'active') throw new Fault(401,'invalid_api_key','API 密钥已停用。');
     if (retry) {
       const { rows:[existing] } = await tx.query<{id:string;status:string;fingerprint:string}>(`SELECT id,status,encode(request_fingerprint,'hex') AS fingerprint
         FROM gateway.usage_requests WHERE key_id=$1 AND idempotency_key=$2`,[key.id,retry]);

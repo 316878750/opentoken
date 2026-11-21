@@ -47,7 +47,7 @@ export async function migrate(client) {
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
       ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql'],
-      ['010','010-managed-channels.sql'],['011','011-admin-models.sql']]) {
+      ['010','010-managed-channels.sql'],['011','011-admin-models.sql'],['012','012-admin-users.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -148,6 +148,14 @@ export async function check(client) {
     NOT has_table_privilege(current_user,'gateway.models','INSERT,UPDATE,DELETE,TRUNCATE') AS models_private,
     NOT has_table_privilege(current_user,'gateway.pricing_groups','INSERT,UPDATE,DELETE,TRUNCATE') AS pricing_groups_private,
     has_function_privilege(current_user,'gateway.admin_write_model(uuid,uuid,text,jsonb,boolean,jsonb)','EXECUTE') AS admin_model_write,
+    NOT has_table_privilege(current_user,'gateway.account_states','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS account_states_private,
+    NOT has_table_privilege(current_user,'gateway.admin_user_invites','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS user_invites_private,
+    has_function_privilege(current_user,'gateway.account_access(uuid)','EXECUTE') AS account_access,
+    has_function_privilege(current_user,'gateway.admin_list_users(uuid,text,text,uuid,integer)','EXECUTE') AS admin_user_list,
+    has_function_privilege(current_user,'gateway.admin_write_user(uuid,uuid,uuid,text,jsonb,boolean)','EXECUTE') AS admin_user_write,
+    has_function_privilege(current_user,'gateway.admin_begin_user_invite(uuid,uuid,uuid,text,bytea)','EXECUTE') AS admin_invite_begin,
+    has_function_privilege(current_user,'gateway.admin_finish_user_invite(uuid,uuid,uuid,text)','EXECUTE') AS admin_invite_finish,
+    NOT has_function_privilege(current_user,'gateway.reconcile_user_invite(uuid,text,bytea)','EXECUTE') AS invite_reconcile_private,
     NOT has_table_privilege(current_user,'gateway.billing_resolutions','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS resolutions_private,
     NOT has_table_privilege(current_user,'gateway.billing_alerts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS alerts_private,
     NOT has_function_privilege(current_user,'gateway.resolve_billing_request(uuid,text,text,text,integer,integer,integer)','EXECUTE') AS resolve_private,
@@ -201,7 +209,7 @@ async function main() {
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–011 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–012 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');

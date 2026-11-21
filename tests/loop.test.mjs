@@ -42,6 +42,9 @@ const upstreamEnv = {
 let base;
 let cookie;
 let server, serverExit, socket, database, auth, admin;
+const inviteCalls = new Map();
+const invitedAccounts = new Map();
+const fixtureInviteHash = 'a'.repeat(56);
 
 function fakeAuth() {
   const activeTokens = new Map();
@@ -52,21 +55,56 @@ function fakeAuth() {
     };
     const makeUser = (id,email) => ({id,email,aud:'authenticated',role:'authenticated',
       app_metadata:{provider:'email'},user_metadata:id===member ? {role:'system_admin'} : {},created_at:new Date().toISOString()});
-    if (request.method==='POST' && request.url==='/auth/v1/token?grant_type=password') {
+    const readJson = async () => {
       let raw = '';
       for await (const chunk of request) raw += chunk;
-      const {email,password} = JSON.parse(raw);
+      return JSON.parse(raw);
+    };
+    const sessionFor = user => {
+      const token = 'eyJhbGciOiJIUzI1NiJ9.'+Buffer.from(JSON.stringify({sub:user.id,exp:Date.now()/1000+3600})).toString('base64url')+'.fixture';
+      activeTokens.set(token,user);
+      return {access_token:token,refresh_token:'unused',expires_in:3600,token_type:'bearer',user};
+    };
+    const authRequest = new URL(request.url,'http://127.0.0.1');
+    if (request.method==='POST' && authRequest.pathname==='/auth/v1/admin/generate_link') {
+      const {type,email} = await readJson();
+      if (type!=='invite' || request.headers.apikey!=='sb_secret_fixture' || authRequest.searchParams.get('redirect_to')!==base+'/invite' ||
+          !['invite@example.test','unknown-invite@example.test'].includes(email)) {
+        return json(400,{code:'unexpected_invitation',msg:'Unexpected invitation'});
+      }
+      inviteCalls.set(email,(inviteCalls.get(email) ?? 0)+1);
+      if (email==='unknown-invite@example.test') return json(503,{msg:'Fixture timeout'});
+      await sleep(200);
+      const user = {...makeUser(crypto.randomUUID(),email),invited_at:new Date().toISOString()};
+      invitedAccounts.set(email,{user});
+      await withDatabaseOwner(()=>database.query('INSERT INTO auth.users(id,email) VALUES ($1,$2)',[user.id,email]));
+      return json(200,{...user,verification_type:'invite',hashed_token:fixtureInviteHash});
+    }
+    if (request.method==='POST' && request.url==='/auth/v1/verify') {
+      const body = await readJson();
+      const account = invitedAccounts.get('invite@example.test');
+      if (body.type!=='invite' || body.token_hash!==fixtureInviteHash || !account || account.verified) return json(401,{msg:'Invalid invite'});
+      account.verified = true;
+      await withDatabaseOwner(()=>database.query('UPDATE auth.users SET email_confirmed_at=now() WHERE id=$1',[account.user.id]));
+      return json(200,sessionFor(account.user));
+    }
+    if (request.method==='POST' && request.url==='/auth/v1/token?grant_type=password') {
+      const {email,password} = await readJson();
       if (email==='limited@example.test') return json(429,{code:'over_request_rate_limit',msg:'Rate limited'});
+      const account = invitedAccounts.get(email);
+      if (account?.password && account.password===password) return json(200,sessionFor(account.user));
       if (!identities.has(email) || password!=='fixture-test-password') {
         return json(400,{code:'invalid_credentials',msg:'Invalid credentials'});
       }
-      const id = identities.get(email);
-      const token = 'eyJhbGciOiJIUzI1NiJ9.'+Buffer.from(JSON.stringify({sub:id,exp:Date.now()/1000+3600})).toString('base64url')+'.fixture';
-      const user = makeUser(id,email);
-      activeTokens.set(token,user);
-      return json(200,{access_token:token,refresh_token:'unused',expires_in:3600,token_type:'bearer',user});
+      return json(200,sessionFor(makeUser(identities.get(email),email)));
     }
     const token = request.headers.authorization?.slice('Bearer '.length);
+    if (request.method==='PUT' && request.url==='/auth/v1/user') {
+      const user = activeTokens.get(token), account = invitedAccounts.get(user?.email);
+      if (!account?.verified) return json(401,{msg:'Invalid session'});
+      account.password = (await readJson()).password;
+      return json(200,user);
+    }
     if (request.method==='GET' && request.url==='/auth/v1/user' && activeTokens.has(token)) return json(200,activeTokens.get(token));
     if (request.method==='GET' && request.url==='/auth/v1/settings' && request.headers.apikey==='fixture-key') return json(200,{});
     if (request.method==='POST' && request.url?.startsWith('/auth/v1/logout')) {
@@ -137,6 +175,7 @@ test.before(async () => {
     windowsHide:true,stdio:['ignore','pipe','inherit'],env:{...process.env,NEXT_TELEMETRY_DISABLED:'1',
       DATABASE_URL:appDatabaseUrl,
       SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
+      SUPABASE_SECRET_KEY:'sb_secret_fixture',
       STRIPE_TEST_SECRET_KEY:'sk_test_fixture',STRIPE_TEST_WEBHOOK_SECRET:'whsec_fixture',
       STRIPE_TEST_CREDIT_PRICE_ID:'price_fixture_credit',STRIPE_TEST_SUBSCRIPTION_PRICE_ID:'price_fixture_monthly',
       STRIPE_TEST_CREDIT_20_PRICE_ID:'price_fixture_credit_20',
@@ -299,10 +338,10 @@ test('an inactive Supabase account cannot retain access or count as a backup adm
   await changeAdminRole(staff,'system_admin');
   try {
     await withDatabaseOwner(()=>database.query("UPDATE auth.users SET banned_until=now()+interval '1 hour' WHERE id=$1",[staff]));
-    assert.equal((await request('/api/admin/session',{sessionOverride})).status,403);
+    assert.equal((await request('/api/admin/session',{sessionOverride})).status,401);
     await assert.rejects(changeAdminRole(owner,null),/last.*administrator/i);
     await withDatabaseOwner(()=>database.query('UPDATE auth.users SET banned_until=NULL,deleted_at=now() WHERE id=$1',[staff]));
-    assert.equal((await request('/api/admin/session',{sessionOverride})).status,403);
+    assert.equal((await request('/api/admin/session',{sessionOverride})).status,401);
     await assert.rejects(changeAdminRole(owner,null),/last.*administrator/i);
   } finally {
     await withDatabaseOwner(()=>database.query('UPDATE auth.users SET banned_until=NULL,deleted_at=NULL WHERE id=$1',[staff]));
@@ -1216,6 +1255,167 @@ test('model administration publishes versioned rates without changing in-flight 
   assert.equal(extendedRates.find(rate=>rate.group===group).id,extended.data.id);
   assert.equal(extendedRates.find(rate=>rate.group==='value').inputMicros,'300000');
   assert.ok(!(await catalog()).some(row=>row.model==='value-chat' && row.groupId===createdGroup.data.id));
+});
+
+test('user administration enforces roles and suspends access without interrupting a dispatched charge', async () => {
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(auditStaff,'auditor');
+  const signIn = async name => {
+    const response = await request('/api/session/login',loginPayload(name+'@example.test'));
+    assert.equal(response.status,200);
+    return response.headers.getSetCookie().map(value=>value.split(';')[0]).join('; ');
+  };
+  const adminCookie = await signIn('owner'), operatorCookie = await signIn('staff');
+  const auditorCookie = await signIn('auditor'), previous = await signIn('member');
+  const legacy = previous.split('~')[0];
+  const endpoint = '/api/admin/users';
+  const read = (sessionOverride,query='')=>request(endpoint+query,{sessionOverride});
+  const write = (action,id,body,sessionOverride=adminCookie)=>request(endpoint+'/'+id+'/'+action,{method:'POST',body,sessionOverride});
+  assert.equal((await read(previous)).status,403);
+  assert.equal((await request('/api/dashboard',{sessionOverride:legacy})).status,200);
+  assert.equal((await read(auditorCookie)).status,403);
+  assert.match(await (await fetch(base+'/admin/users',{headers:{cookie:adminCookie}})).text(),/用户管理/);
+  const exact = '?search='+member;
+  const operatorView = (await read(operatorCookie,exact)).data.items[0];
+  assert.equal(operatorView.id,member);
+  assert.equal(operatorView.email,'m***@example.test');
+  assert.equal(operatorView.wallet,null);
+  assert.equal((await read(adminCookie,'?search=MEMBER&status=active')).data.items[0].email,'member@example.test');
+  const first = (await read(adminCookie,'?limit=2')).data;
+  const next = (await read(adminCookie,'?limit=2&cursor='+first.nextCursor)).data;
+  assert.equal(first.items.length,2);
+  assert.equal(next.items.length,2);
+  assert.ok(!next.items.some(row=>first.items.some(item=>item.id===row.id)));
+
+  const promote = {role:'operator',expectedRole:null,reason:'隔离角色验收'};
+  assert.equal((await write('role',member,promote,operatorCookie)).status,403);
+  assert.equal((await write('role',member,promote,adminCookie.split('; ')[0])).status,403);
+  assert.equal((await write('role',owner,{...promote,expectedRole:'system_admin',role:null})).status,409);
+  assert.equal((await write('role',member,promote)).status,200);
+  assert.equal((await request('/api/admin/session',{sessionOverride:previous})).data.role,'operator');
+  assert.equal((await write('role',member,{...promote,role:'auditor'})).status,409);
+
+  const funding = await withDatabaseOwner(()=>redeemCommand(admin,['issue','3',new Date(Date.now()+3_600_000).toISOString()]));
+  assert.equal((await request('/api/redeem',{method:'POST',sessionOverride:previous,body:{code:funding.code}})).status,200);
+  const mock = (await request('/api/catalog',{sessionOverride:previous})).data.rates.find(row=>row.model==='mock-text');
+  const key = (await request('/api/keys',{method:'POST',sessionOverride:previous,body:{name:'user-state',groupId:mock.groupId,rpm:10}})).data;
+  assert.equal((await request(endpoint,{token:key.secret,session:false})).status,401);
+  const call = ()=>request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,body:{model:'mock-text',
+    messages:[{role:'user',content:'account suspension fixture'}],max_completion_tokens:128}});
+  const running = call();
+  let pending;
+  for (let attempt=0;attempt<35 && !pending;attempt++) {
+    pending = (await request('/api/usage?status=dispatched',{sessionOverride:previous})).data.items[0];
+    if (!pending) await sleep(75);
+  }
+  assert.ok(pending);
+  const suspension = {suspended:true,expectedRevision:'0',reason:'隔离停用验收'};
+  assert.equal((await write('state',member,suspension,operatorCookie)).status,403);
+  assert.equal((await write('state',owner,suspension)).status,409);
+  assert.equal((await write('state',member,{...suspension,reason:'意外粘贴 token_hash='+fixtureInviteHash})).status,400);
+  const paused = await write('state',member,suspension);
+  assert.equal(paused.status,200);
+  assert.equal((await read(adminCookie,exact+'&status=suspended')).data.items[0].status,'suspended');
+  assert.equal((await request('/api/session/login',loginPayload('member@example.test'))).status,403);
+  assert.equal((await request('/api/dashboard',{sessionOverride:previous})).status,401);
+  assert.equal((await request('/api/admin/session',{sessionOverride:previous})).status,401);
+  assert.equal((await request('/v1/models',{token:key.secret,session:false})).status,401);
+  assert.equal((await call()).status,401);
+  assert.equal((await running).status,200);
+  assert.equal((await write('state',member,{...suspension,suspended:false})).status,409);
+  assert.equal((await write('state',member,{...suspension,suspended:false,expectedRevision:paused.data.revision})).status,200);
+  assert.equal((await request('/api/dashboard',{sessionOverride:previous})).status,401);
+  assert.equal((await request('/api/dashboard',{sessionOverride:legacy})).status,401);
+  const current = await signIn('member');
+  const wallet = (await request('/api/dashboard',{sessionOverride:current})).data;
+  assert.deepEqual([wallet.balanceMicros,wallet.heldMicros],['2250000','0']);
+  const {data:history} = await request('/api/usage',{sessionOverride:current});
+  assert.equal(history.items.length,1);
+  const item = history.items[0];
+  assert.deepEqual([item.id,item.reservedMicros,item.chargedMicros,item.releasedMicros,item.ledgerDeltaMicros],
+    [pending.id,'2000000','750000','1250000','-750000']);
+  assert.deepEqual((await read(adminCookie,exact)).data.items[0].wallet.balanceMicros,wallet.balanceMicros);
+  assert.equal((await request('/v1/models',{token:key.secret,session:false})).status,200);
+  const revoke = {role:null,expectedRole:'operator',reason:'隔离撤权验收'};
+  assert.equal((await write('role',member,revoke)).status,200);
+  assert.equal((await request('/api/admin/session',{sessionOverride:current})).status,403);
+  assert.equal((await request('/api/dashboard',{sessionOverride:current})).status,200);
+  await withDatabaseOwner(async()=>{
+    const {rows:[event]} = await database.query('SELECT * FROM gateway.admin_audit_events WHERE request_id=$1',
+      [paused.headers.get('x-request-id')]);
+    assert.deepEqual([event.action,event.actor_user_id,event.target_user_id,event.outcome],['user.state',owner,member,'success']);
+    assert.deepEqual(event.details,{before:false,after:true,revision:'1'});
+  });
+  await withDatabaseOwner(()=>database.exec(`ALTER TABLE gateway.admin_audit_events ADD CONSTRAINT fixture_block_user_audit
+    CHECK (action<>'user.state') NOT VALID`));
+  try {
+    assert.equal((await write('state',member,{...suspension,expectedRevision:'2'})).status,500);
+    assert.equal((await request('/api/dashboard',{sessionOverride:current})).status,200);
+    assert.equal((await read(adminCookie,exact)).data.items[0].revision,'2');
+  } finally {
+    await withDatabaseOwner(()=>database.exec('ALTER TABLE gateway.admin_audit_events DROP CONSTRAINT fixture_block_user_audit'));
+  }
+  assert.equal((await write('role',member,{...promote,role:'system_admin'})).status,200);
+  const competing = [{target:member,revision:'2',actor:adminCookie},{target:owner,revision:'0',actor:current}];
+  const results = await Promise.all(competing.map(({target,revision,actor})=>write('state',target,{
+    ...suspension,expectedRevision:revision,
+  },actor)));
+  const winner = results.findIndex(response=>response.status===200);
+  assert.ok(winner>=0);
+  const loser = 1-winner;
+  assert.ok([401,403].includes(results[loser].status));
+  assert.equal((await request('/api/admin/session',{sessionOverride:competing[winner].actor})).data.role,'system_admin');
+  assert.equal((await write('state',competing[winner].target,{...suspension,suspended:false,
+    expectedRevision:results[winner].data.revision},competing[winner].actor)).status,200);
+  await changeAdminRole(member,null);
+});
+
+test('user invitations generate one link, preserve uncertain outcomes and use the existing login flow', async () => {
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  const login = await request('/api/session/login',loginPayload('staff@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const issue = (email,operationId=crypto.randomUUID())=>request('/api/admin/users/invitations',{method:'POST',sessionOverride,body:{email,operationId}});
+  const email = 'invite@example.test', operationId = crypto.randomUUID();
+  const existing = await issue('owner@example.test');
+  assert.equal(existing.status,409);
+  assert.equal(existing.data.error.code,'invite_recipient_unavailable');
+  const responses = await Promise.all([issue(email,operationId),issue(email,operationId),issue(email)]);
+  assert.deepEqual(responses.map(response=>response.status).sort(),[201,409,409]);
+  const issued = responses.find(response=>response.status===201);
+  assert.equal(issued.data.link,base+'/invite#token_hash='+fixtureInviteHash);
+  assert.match(issued.headers.get('cache-control'),/no-store/);
+  assert.equal(inviteCalls.get(email),1);
+  assert.equal((await issue(email,operationId)).data.error.code,'invite_already_issued');
+  const unknownEmail = 'unknown-invite@example.test';
+  const unknownId = crypto.randomUUID();
+  assert.equal((await issue(unknownEmail,unknownId)).data.error.code,'invite_unknown');
+  assert.equal((await issue(unknownEmail)).data.error.code,'invite_unknown');
+  assert.equal(inviteCalls.get(unknownEmail),1);
+  const environment = {GATEWAY_SECRET:'01'.repeat(32)};
+  const reconcile = recipient=>withDatabaseOwner(()=>adminCommand(admin,['reconcile-invite',unknownId,recipient],environment));
+  await assert.rejects(reconcile(unknownEmail),/still waiting/i);
+  await withDatabaseOwner(()=>database.query(
+    "UPDATE gateway.admin_user_invites SET started_at=clock_timestamp()-interval '3 minutes' WHERE id=$1",[unknownId]));
+  await assert.rejects(reconcile(email),/does not match/i);
+  const released = await reconcile(unknownEmail);
+  assert.equal(released.status,'failed');
+  assert.equal((await issue(unknownEmail)).data.error.code,'invite_unknown');
+  assert.equal(inviteCalls.get(unknownEmail),2);
+  const secret = 'fixture-invited-password';
+  assert.equal((await request('/api/invite',{method:'POST',session:false,body:{token_hash:fixtureInviteHash,password:secret}})).status,200);
+  const invited = await request('/api/session/login',loginPayload(email,secret));
+  assert.equal(invited.status,200);
+  const invitedCookie = invited.headers.get('set-cookie').split(';')[0];
+  assert.equal((await request('/api/admin/session',{sessionOverride:invitedCookie})).status,403);
+  await withDatabaseOwner(async()=>{
+    const {rows} = await database.query(`SELECT action,outcome,reason,details FROM gateway.admin_audit_events
+      WHERE action IN ('user.invite_started','user.invite_finished') AND (request_id=$1 OR details->>'operationId'=$2)`,[operationId,operationId]);
+    assert.ok(rows.some(row=>row.action==='user.invite_started' && row.outcome==='success'));
+    assert.ok(rows.some(row=>row.action==='user.invite_finished' && row.reason==='issued'));
+    assert.doesNotMatch(JSON.stringify(rows),/@|sb_secret_fixture|token_hash|fixture-invited-password/);
+  });
 });
 
 test('Stripe sandbox checkout uses signed paid events and credits the wallet exactly once', async () => {

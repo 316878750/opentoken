@@ -22,7 +22,8 @@
 - [x] 确认首批新增模型的 ID、费率和试点分组，并在隔离目录验证新旧模型并存。
 - [x] 兼容带结束原因的事件同时携带最终用量的 SSE 格式。缺失 `[DONE]`、用量重复或不一致时仍转待核对。在隔离环境重现该格式并核对预占、扣费、释放和单笔流水。
 - [x] 用真实 `deepseek-v4-pro` 流式请求验证网关读取带结束原因的最终用量事件，并在 `[DONE]` 后完成单笔结算。仪表盘、使用记录和账本的预占、扣费和释放一致。
-- [ ] 发布到正式试点目录。
+- [x] 在校验加密备份后，将 `deepseek-v4-pro` 的费率写入正式试点数据库，并以受限应用角色读回核对。
+- [ ] 完成 Render 发布并核对正式试点目录。
 
 `UPSTREAM_ADDITIONAL_MODELS_JSON` 是 JSON 数组。新增模型共用当前兼容上游的 URL 和密钥，按模型配置 `alias`、`model`、`inputUsdPerMtok`、`cachedUsdPerMtok`、`outputUsdPerMtok`。可选字段为 `responseModel`、`maxContextTokens`、`tokenField`、`streaming` 和 `groups`。每个分组填写 `code`、`name`、`multiplierBps`，如 `9000` 表示 0.9 倍。省略分组时使用试点分组。新增模型开启流式还需全局启用 `ENABLE_UPSTREAM_STREAMING`。运行 `db:seed` 后再更新托管环境。删除运行配置可撤出目录，历史请求及其引用的费率继续可查。
 
@@ -32,6 +33,8 @@
 ENABLE_UPSTREAM_STREAMING=1
 UPSTREAM_ADDITIONAL_MODELS_JSON='[{"alias":"deepseek-v4-pro","model":"deepseek-v4-pro","inputUsdPerMtok":"9","cachedUsdPerMtok":"0.3","outputUsdPerMtok":"27","maxContextTokens":8192,"streaming":true}]'
 ```
+
+正式试点原目录仅开放 `mock-text`。本次启用兼容上游时同时设置 `UPSTREAM_PUBLISH_PRIMARY=0`，只开放获准的新模型 `deepseek-v4-pro` 和既有的 `mock-text`。旧费率及历史记录仍可查询。
 
 既有模型调价时，数据库与服务配置切换期间会暂时隐藏该模型。持有旧分组密钥的客户端会收到明确的费率不一致错误，且不会预占或扣费。两个配置一致后恢复接入。
 

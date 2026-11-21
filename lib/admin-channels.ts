@@ -71,11 +71,11 @@ async function resolveBindings(tx:PoolClient,bindings:Binding[]) {
     r.input_micros_per_mtok::text AS input_rate,r.cached_input_micros_per_mtok::text AS cache_rate,
     r.output_micros_per_mtok::text AS output_rate,m.max_output_tokens
     FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS b(value,ordinality)
-    JOIN gateway.models m ON m.code=(b.value->>'model') AND m.enabled
-    JOIN gateway.pricing_groups g ON g.code=(b.value->>'group') AND g.enabled
+    JOIN gateway.models m ON m.code=(b.value->>'model')
+    JOIN gateway.pricing_groups g ON g.code=(b.value->>'group')
     JOIN gateway.model_rates r ON r.model_id=m.id AND r.group_id=g.id AND r.closed_at IS NULL
     ORDER BY b.ordinality`,[JSON.stringify(bindings)]);
-  if (rows.length!==bindings.length) throw new Fault(409,'channel_binding_unpriced','请先配置启用的模型、分组和对应费率。');
+  if (rows.length!==bindings.length) throw new Fault(409,'channel_binding_unpriced','请先配置模型、分组和对应费率。');
   return rows;
 }
 
@@ -164,7 +164,7 @@ export async function listChannels(userId:string) {
     r.output_micros_per_mtok::text AS "outputRate",r.multiplier_bps AS multiplier
     FROM gateway.model_rates r JOIN gateway.models m ON m.id=r.model_id JOIN gateway.pricing_groups g ON g.id=r.group_id
     LEFT JOIN gateway.channel_runtime_routes managed ON managed.model_id=m.id AND managed.group_id=g.id
-    WHERE r.closed_at IS NULL AND m.enabled AND g.enabled AND m.code<>$1 ORDER BY m.code,g.code`,[mockModel]);
+    WHERE r.closed_at IS NULL AND m.code<>$1 ORDER BY m.code,g.code`,[mockModel]);
   const legacy = resolveLiveUpstreams().flatMap(provider=>provider.groups.map(group=>{
     const stored = pairs.find(pair=>pair.model===provider.alias && pair.group===group.code);
     const matches = stored && stored.upstreamModel===provider.model && stored.context===provider.maxContextTokens &&
@@ -210,17 +210,19 @@ export async function probeChannel(userId:string,channelId:string,{versionId,bin
   const input = {model:candidate.upstreamModel,messages:[{role:'user',content:'Reply OK.'}],max_completion_tokens:maxTokens};
   const started = Date.now();
   let status = 'passed';
+  let cacheVerified = false;
   try {
-    await openAiCompletion(input,upstream);
-    if (candidate.streaming) await openAiStream(input,upstream,()=>{});
+    const completion = await openAiCompletion(input,upstream);
+    const streamed = candidate.streaming ? await openAiStream(input,upstream,()=>{}) : null;
+    cacheVerified = completion.cacheReported && (!streamed || streamed.cacheReported);
   } catch (error) {
     status = error instanceof UpstreamError ? error.category : 'unverified';
   }
   const elapsedMs = Date.now()-started;
   const requestId = randomUUID();
   await transaction(async tx=>{
-    const updated = await tx.query(`UPDATE gateway.channel_probes SET status=$2,elapsed_ms=$3,finished_at=clock_timestamp()
-      WHERE id=$1 AND status='pending'`,[probeId,status,elapsedMs]);
+    const updated = await tx.query(`UPDATE gateway.channel_probes SET status=$2,elapsed_ms=$3,finished_at=clock_timestamp(),cache_usage_verified=$4
+      WHERE id=$1 AND status='pending'`,[probeId,status,elapsedMs,cacheVerified]);
     if (!updated.rowCount) throw new Fault(409,'channel_probe_finished','测试结果已失效，请查询最新状态。');
     await audit(tx,userId,requestId,'probe_finished',status,{channelId,versionId,probeId,binding:index,elapsedMs},status==='passed'?'success':'denied');
   });

@@ -18,7 +18,11 @@ async function checkDatabase() {
     has_column_privilege(to_regclass('gateway.login_events'),'request_id','INSERT') AND
     has_function_privilege(to_regprocedure('gateway.admin_role_for(uuid)'),'EXECUTE') AND
     has_function_privilege(to_regprocedure('gateway.authorize_admin(uuid,uuid,text)'),'EXECUTE') AND
-    has_table_privilege(to_regclass('gateway.channel_runtime_routes'),'SELECT') AS ready`);
+    has_table_privilege(to_regclass('gateway.channel_runtime_routes'),'SELECT') AND
+    has_column_privilege(to_regclass('gateway.models'),'admin_managed','SELECT') AND
+    has_column_privilege(to_regclass('gateway.channel_probes'),'cache_usage_verified','UPDATE') AND
+    has_function_privilege(to_regprocedure('gateway.can_manage_model(uuid)'),'EXECUTE') AND
+    has_function_privilege(to_regprocedure('gateway.admin_write_model(uuid,uuid,text,jsonb,boolean,jsonb)'),'EXECUTE') AS ready`);
   if (!row.ready) throw new Error('Gateway schema is unavailable');
 }
 

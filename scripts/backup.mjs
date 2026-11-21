@@ -41,7 +41,8 @@ export function backupTables(versions) {
       version==='["001","002","003","004","005","006","007","008","009"]') {
     return [...paidPilotTables,'gateway.admin_roles','gateway.login_events','gateway.admin_audit_events'].sort();
   }
-  if (version==='["001","002","003","004","005","006","007","008","009","010"]') {
+  if (version==='["001","002","003","004","005","006","007","008","009","010"]' ||
+      version==='["001","002","003","004","005","006","007","008","009","010","011"]') {
     return [...paidPilotTables,'gateway.admin_roles','gateway.login_events','gateway.admin_audit_events',
       'gateway.channels','gateway.channel_versions','gateway.channel_routes','gateway.channel_probes'].sort();
   }

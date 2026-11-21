@@ -20,7 +20,7 @@ type CreditReceipt = {receipt:{id:string;amountMicros:string;createdAt:string};r
   wallet:Pick<Wallet,'balanceMicros'|'heldMicros'|'refundHeldMicros'|'availableMicros'>};
 
 export class ApiError extends Error {
-  constructor(public status:number, message:string, public requestId?:string) { super(message); }
+  constructor(public status:number, message:string, public requestId?:string, public code?:string) { super(message); }
 }
 
 export async function api<T>(url:string, options:RequestInit = {}): Promise<T> {
@@ -32,7 +32,7 @@ export async function api<T>(url:string, options:RequestInit = {}): Promise<T> {
     if (response.status===401 && url.startsWith('/api/') && url!=='/api/session/login') {
       location.replace('/login?redirect='+location.pathname);
     }
-    throw new ApiError(response.status,data.error?.message || '暂时无法完成操作。',data.error?.request_id);
+    throw new ApiError(response.status,data.error?.message || '暂时无法完成操作。',data.error?.request_id,data.error?.code);
   }
   return data;
 }
@@ -95,7 +95,7 @@ export function Login() {
     try {
       await api('/api/session/login',{method:'POST',body:JSON.stringify(Object.fromEntries(form)),signal:AbortSignal.timeout(22000)});
       const destination = new URLSearchParams(location.search).get('redirect');
-      location.replace(destination && ['/dashboard','/pricing','/keys','/usage','/redeem','/admin','/admin/channels'].includes(destination) ? destination : '/dashboard');
+      location.replace(destination && ['/dashboard','/pricing','/keys','/usage','/redeem','/admin','/admin/channels','/admin/models'].includes(destination) ? destination : '/dashboard');
     } catch (error) {
       setError(error instanceof ApiError ? error.message : '登录请求暂时无法完成。');
       setBusy(false);

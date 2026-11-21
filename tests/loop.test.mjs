@@ -23,8 +23,9 @@ const auditStaff = '30000000-0000-4000-8000-000000000007';
 const creditUserA = '30000000-0000-4000-8000-000000000008';
 const creditUserB = '30000000-0000-4000-8000-000000000009';
 const channelUser = '30000000-0000-4000-8000-000000000011';
+const modelUser = '30000000-0000-4000-8000-000000000012';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
-  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],
+  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],['model@example.test',modelUser],
   ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB]]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
@@ -1068,6 +1069,153 @@ test('managed channel lifecycle preserves one route and the billing snapshot', a
   assert.equal(await legacyListed(),true);
   assert.equal((await post(imported+'/disable',{reason})).status,200);
   assert.equal(await legacyListed(),false);
+});
+
+test('model administration publishes versioned rates without changing in-flight or historical billing', async () => {
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  const accounts = await Promise.all(['owner','staff','model'].map(name=>request('/api/session/login',loginPayload(name+'@example.test'))));
+  const [adminCookie,operatorCookie,userCookie] = accounts.map(login=>{
+    assert.equal(login.status,200);
+    return login.headers.getSetCookie().map(value=>value.split(';')[0]).join('; ');
+  });
+  const endpoint = '/api/admin/models';
+  const write = (action,body,sessionOverride=adminCookie)=>request(endpoint+'/'+action,{method:'POST',sessionOverride,body});
+  const read = sessionOverride=>request(endpoint,{sessionOverride});
+  const model = {code:'model-admin-fixture',maxContextTokens:8192,maxOutputTokens:128};
+  assert.equal((await read(userCookie)).status,403);
+  assert.equal((await write('create',model,operatorCookie)).status,403);
+  assert.equal((await read(operatorCookie)).status,200);
+  assert.match(await (await fetch(base+'/admin/models',{headers:{cookie:adminCookie}})).text(),/模型管理/);
+  assert.equal((await write('create',model)).status,201);
+  assert.equal((await write('create',model)).status,409);
+  const group = 'model-fixture';
+  const createdGroup = await write('group-create',{code:group,name:'模型验收分组'});
+  assert.equal(createdGroup.status,201);
+  assert.equal((await write('group-rename',{code:group,name:'隔离模型分组'})).status,200);
+  assert.equal((await write('group-state',{code:group,enabled:true,reason:'打开隔离分组'})).status,200);
+  const pair = {model:model.code,group};
+  const price = {...pair,inputUsd:'0.20',cachedUsd:'0.04',outputUsd:'0.60',multiplierBps:10000,
+    expectedRateId:null,reason:'首发费率'};
+  assert.equal((await write('rate-publish',price,adminCookie.split('; ')[0])).status,403);
+  const legacyRate = await write('rate-publish',{...price,model:'value-chat',group:'value'});
+  assert.equal(legacyRate.status,409);
+  assert.equal(legacyRate.data.error.code,'legacy_rate_managed');
+  const firstRate = await write('rate-publish',price);
+  assert.equal(firstRate.status,201);
+  const firstRateId = firstRate.data.id;
+  assert.equal((await write('state',{code:model.code,enabled:true,reason:'尝试提前上架'})).status,409);
+  const channelWrite = (path,body)=>request('/api/admin/channels'+path,{method:'POST',sessionOverride:adminCookie,body});
+  const channel = await channelWrite('',{name:'模型验收渠道',credentialRef:'blue',
+    bindings:[{...pair,upstreamModel:'vendor/managed',streaming:false,tokenField:'max_tokens'}],
+    policy:{priority:0,weight:100,automaticFailover:false,autoPublishModels:[]}});
+  assert.equal(channel.status,201);
+  const path = '/'+channel.data.id;
+  const versionId = channel.data.versionId;
+  assert.equal((await channelWrite(path+'/test',{versionId,binding:0})).data.status,'passed');
+  assert.equal((await channelWrite(path+'/enable',{versionId,reason:'准备绑定'})).status,200);
+  const catalog = async()=> (await request('/api/catalog',{sessionOverride:userCookie})).data.rates;
+  assert.ok(!(await catalog()).some(row=>row.model===model.code));
+  assert.equal((await write('state',{code:model.code,enabled:true,reason:'上架隔离模型'})).status,200);
+  const listed = (await catalog()).find(row=>row.model===model.code);
+  assert.equal(listed.inputMicros,'200000');
+  const funding = await withDatabaseOwner(()=>redeemCommand(admin,['issue','3',new Date(Date.now()+3_600_000).toISOString()]));
+  assert.equal((await request('/api/redeem',{method:'POST',sessionOverride:userCookie,body:{code:funding.code}})).status,200);
+  const key = (await request('/api/keys',{method:'POST',sessionOverride:userCookie,
+    body:{name:'model-stage',groupId:listed.groupId,rpm:20}})).data;
+  const visible = async()=> (await request('/v1/models',{token:key.secret,session:false})).data.data.map(row=>row.id);
+  assert.deepEqual(await visible(),[model.code]);
+  const run = ()=>request('/v1/chat/completions',{method:'POST',token:key.secret,session:false,body:{model:model.code,
+    messages:[{role:'user',content:'model admin billing'}],max_completion_tokens:16}});
+  const running = run();
+  let pending;
+  for (let attempt=0;attempt<40 && !pending;attempt++) {
+    pending = (await request('/api/usage?status=dispatched',{sessionOverride:userCookie})).data.items[0];
+    if (!pending) await sleep(25);
+  }
+  assert.equal(pending?.reservedMicros,'1648');
+  const revised = {...price,inputUsd:'1.20',expectedRateId:firstRateId,reason:'更新输入价'};
+  const revisions = await Promise.all([write('rate-publish',revised),write('rate-publish',revised)]);
+  assert.deepEqual(revisions.map(response=>response.status).sort(),[201,409]);
+  const secondRate = revisions.find(response=>response.status===201);
+  assert.notEqual(secondRate.data.id,firstRateId);
+  assert.equal((await write('rate-publish',{...revised,inputUsd:'0.40'})).status,409);
+  assert.equal((await running).status,200);
+  const later = await run();
+  assert.equal(later.status,200);
+  const rows = (await request('/api/usage',{sessionOverride:userCookie})).data.items;
+  const older = rows.find(row=>row.id===pending.id), newer = rows.find(row=>row.id===later.data.id);
+  assert.deepEqual([older.reservedMicros,older.chargedMicros,older.releasedMicros,older.ledgerDeltaMicros],['1648','4','1644','-4']);
+  assert.deepEqual([newer.reservedMicros,newer.chargedMicros,newer.releasedMicros,newer.ledgerDeltaMicros],['9840','14','9826','-14']);
+  const modelRates = (await read(operatorCookie)).data.models.find(item=>item.code===model.code).rates;
+  assert.deepEqual(modelRates.map(rate=>[rate.id,!!rate.closedAt]),[[secondRate.data.id,false],[firstRateId,true]]);
+  assert.equal((await write('group-state',{code:group,enabled:false,reason:'暂停隔离分组'})).status,200);
+  assert.deepEqual(await visible(),[]);
+  assert.equal((await run()).status,400);
+  assert.equal((await write('group-state',{code:group,enabled:true,reason:'恢复隔离分组'})).status,200);
+  assert.deepEqual(await visible(),[model.code]);
+  assert.equal((await write('state',{code:model.code,enabled:false,reason:'下架隔离模型'})).status,200);
+  assert.deepEqual(await visible(),[]);
+  assert.equal((await run()).status,400);
+  assert.equal((await request(endpoint,{session:false})).status,401);
+  assert.equal((await request(endpoint,{token:key.secret,session:false})).status,401);
+  await withDatabaseOwner(()=>database.query('INSERT INTO gateway.stripe_sandbox(enabled) VALUES(true)'));
+  try {
+    const sandboxBinding = (await read(operatorCookie)).data.models.find(item=>item.code===model.code).bindings[0];
+    assert.equal(sandboxBinding.effective,false);
+    assert.equal((await write('state',{code:model.code,enabled:true,reason:'验证沙盒隔离'})).data.error.code,'model_route_required');
+  } finally {
+    await withDatabaseOwner(()=>database.query('DELETE FROM gateway.stripe_sandbox'));
+  }
+  const summary = (await request('/api/dashboard',{sessionOverride:userCookie})).data;
+  assert.deepEqual([summary.balanceMicros,summary.heldMicros,summary.chargedMicros],['2999982','0','18']);
+  const ledger = (await request('/api/wallet/entries?kind=usage',{sessionOverride:userCookie})).data.items;
+  assert.deepEqual(Object.fromEntries(ledger.map(row=>[row.requestId,row.deltaMicros])),{[older.id]:'-4',[newer.id]:'-14'});
+  const history = await request('/api/usage',{sessionOverride:userCookie});
+  assert.equal(history.data.items.length,2);
+  await withDatabaseOwner(async()=>{
+    const {rows:requests} = await database.query(`SELECT rate_id,charged_micros::text FROM gateway.usage_requests
+      WHERE user_id=$1 ORDER BY created_at`,[modelUser]);
+    assert.deepEqual(requests.map(row=>[row.rate_id,row.charged_micros]),[[firstRateId,'4'],[secondRate.data.id,'14']]);
+    const {rows:[event]} = await database.query('SELECT action,outcome,details FROM gateway.admin_audit_events WHERE request_id=$1',
+      [secondRate.headers.get('x-request-id')]);
+    assert.equal(event.action,'model.rate_publish');
+    assert.equal(event.outcome,'success');
+    assert.equal(event.details.previousRateId,firstRateId);
+  });
+  await withDatabaseOwner(()=>seed(admin,undefined,[{...resolveLiveUpstreams(upstreamEnv)[0],alias:model.code,model:'vendor/new-env-model'}]));
+  assert.equal((await read(operatorCookie)).data.models.find(item=>item.code===model.code).rates.length,2);
+
+  // A successful equal-price probe need not prove cache usage. Do not activate a cache split on that evidence.
+  const equalRate = await write('rate-publish',{...revised,cachedUsd:'1.20',expectedRateId:secondRate.data.id});
+  assert.equal(equalRate.status,201);
+  const draft = await channelWrite(path+'/versions',{name:'无缓存指标渠道',credentialRef:'blue',
+    bindings:[{...pair,upstreamModel:'vendor/no-cache',streaming:true,tokenField:'max_tokens'}],
+    policy:{priority:0,weight:100,automaticFailover:false,autoPublishModels:[]}});
+  assert.equal(draft.status,201);
+  const noCacheVersion = draft.data.versionId;
+  assert.equal((await channelWrite(path+'/test',{versionId:noCacheVersion,binding:0})).data.status,'passed');
+  assert.equal((await channelWrite(path+'/enable',{versionId:noCacheVersion,reason:'无缓存指标测试'})).status,200);
+  const cacheSplit = await write('rate-publish',{...revised,expectedRateId:equalRate.data.id});
+  assert.equal(cacheSplit.status,409);
+  assert.equal(cacheSplit.data.error.code,'model_cache_probe_required');
+
+  const existing = await channelWrite('',{name:'环境模型接管',credentialRef:'blue',
+    bindings:[{model:'value-chat',group:'value',upstreamModel:'vendor/managed',streaming:false,tokenField:'max_tokens'}],
+    policy:{priority:0,weight:100,automaticFailover:false,autoPublishModels:[]}});
+  assert.equal(existing.status,201);
+  const adoptionVersion = existing.data.versionId;
+  const adoptionPath = '/'+existing.data.id;
+  assert.equal((await channelWrite(adoptionPath+'/test',{versionId:adoptionVersion,binding:0})).data.status,'passed');
+  assert.equal((await channelWrite(adoptionPath+'/enable',{versionId:adoptionVersion,reason:'接管环境模型'})).status,200);
+  const extended = await write('rate-publish',{...price,model:'value-chat',group,reason:'发布接管后的新分组'});
+  assert.equal(extended.status,201);
+  await withDatabaseOwner(()=>seed(admin,undefined,[{...resolveLiveUpstreams(upstreamEnv)[1],inputMicros:'900000',
+    groups:[{code:group,name:'环境不能覆盖该分组',multiplierBps:10000}]}]));
+  const extendedRates = (await read(operatorCookie)).data.models.find(item=>item.code==='value-chat').rates;
+  assert.equal(extendedRates.find(rate=>rate.group===group).id,extended.data.id);
+  assert.equal(extendedRates.find(rate=>rate.group==='value').inputMicros,'300000');
+  assert.ok(!(await catalog()).some(row=>row.model==='value-chat' && row.groupId===createdGroup.data.id));
 });
 
 test('Stripe sandbox checkout uses signed paid events and credits the wallet exactly once', async () => {

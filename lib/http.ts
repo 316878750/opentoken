@@ -5,6 +5,7 @@ import { adminAccess, hasRecentAdminAuth, recordLoginEvent, setRecentAdminAuth }
 import { issueAdminRedeem, listAdminRedeem, voidAdminRedeem } from './admin-redeem';
 import { channelDraftInput, channelProbeInput, channelDisableInput, channelPublishInput, changeChannel,
   listChannels, probeChannel, saveChannel } from './admin-channels';
+import { listAdminModels, modelAdminInput, writeAdminModel } from './admin-models';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
@@ -156,6 +157,13 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route === 'GET /api/admin/models') return json(await listAdminModels(user));
+    const modelAction = method==='POST' && /^\/api\/admin\/models\/(create|state|group-create|group-rename|group-state|rate-publish)$/.exec(path);
+    if (modelAction) {
+      const input = parse(modelAdminInput,{action:modelAction[1],payload:await body(req)});
+      const {id,requestId,status} = await writeAdminModel(user,input,hasRecentAdminAuth(req,token));
+      return json({id,requestId},status,requestId);
+    }
     if (route === 'GET /api/admin/channels') return json(await listChannels(user));
     if (route === 'POST /api/admin/channels') {
       const saved = await saveChannel(user,parse(channelDraftInput,await body(req)));

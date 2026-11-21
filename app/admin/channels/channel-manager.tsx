@@ -42,6 +42,7 @@ export function ChannelManager() {
   const availableCredentials = data?.credentials ?? [];
   const chosenCredential = availableCredentials.find(item=>item.ref===draft.credentialRef);
   const currentDraft = selected?.draft;
+  const otherPublished = selected?.active?.id!==currentDraft?.id ? selected?.active : null;
   const rollbackVersion = selected?.history.find(version=>version.id===rollbackId);
 
   function openDraft(channel?:Channel) {
@@ -176,8 +177,17 @@ export function ChannelManager() {
       <h2>{currentDraft.name}</h2>
       <p>当前生效版本 {selected.enabled ? selected.active?.id : '无'}</p>
       <p>草稿版本 {currentDraft.id}{currentDraft.endpoint && <> · {currentDraft.endpoint}</>}</p>
-      {selected.enabled && selected.active && selected.active.id!==currentDraft.id && <p>当前生效绑定
-        {' '}{selected.active.bindings.map(item=>item.model+' · '+item.group).join('、')}</p>}
+      {otherPublished && <>
+        <h3>{selected.enabled?'当前生效绑定':'上次生效绑定'}</h3>
+        <ul>{otherPublished.bindings.map((item,index)=>{
+          const result = tested(otherPublished,index);
+          return <li key={item.model+':'+item.group}>
+            {item.model} · {item.group} · {result ? statusLabels[result.status] : '未测试'}{' '}
+            {data?.canWrite && <button disabled={busy || !otherPublished.credentialAvailable}
+              onClick={()=>void probe(otherPublished.id,index)}>重新测试生效版本绑定</button>}
+          </li>;
+        })}</ul>
+      </>}
       {currentDraft.testModel && data?.canWrite && <button disabled={busy} onClick={()=>void probe(currentDraft.id,-1)}>测试 {currentDraft.testModel.upstreamModel}</button>}
       <ul>{currentDraft.bindings.map((item,index)=>{const result=tested(currentDraft,index);return <li key={item.model+':'+item.group}>
         {item.model} · {item.group} · {result ? statusLabels[result.status] : '未测试'}{result?.elapsedMs!=null && ` · ${result.elapsedMs} ms`}{' '}

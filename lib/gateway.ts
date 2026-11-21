@@ -37,7 +37,8 @@ const rateQuery = `SELECT r.id AS rate_id, m.id AS model_id, g.id AS group_id, m
     ON route.alias=m.code AND route.model=m.upstream_model AND route.group_code=g.code
   WHERE r.closed_at IS NULL AND m.enabled AND g.enabled
     AND ((m.code='${mockModel}' AND m.upstream_model='${mockModel}') OR
-      (NOT EXISTS (SELECT 1 FROM gateway.stripe_sandbox WHERE enabled) AND CASE WHEN managed.version_id IS NULL THEN route.alias IS NOT NULL
+      (NOT EXISTS (SELECT 1 FROM gateway.stripe_sandbox WHERE enabled) AND CASE WHEN managed.version_id IS NULL
+        THEN NOT m.admin_managed AND route.alias IS NOT NULL
         ELSE managed.effective AND ($1::jsonb->'credentials')->>managed.credential_ref=managed.credential_fingerprint END))`;
 const availableRateQuery = `${rateQuery} AND ${inSync}`;
 
@@ -153,10 +154,8 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
   const credentials = channelCredentials();
   const started = Date.now();
   const { id, rate, hold, live } = await transaction(async tx => {
-    if (body.model!==mockModel) {
-      await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
-      await tx.query('SELECT pg_advisory_xact_lock_shared($1)',[channelRoutingLock]);
-    }
+    if (body.model!==mockModel) await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
+    await tx.query('SELECT pg_advisory_xact_lock_shared($1)',[channelRoutingLock]);
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros-refund_held_micros)::text AS available
       FROM gateway.wallets WHERE user_id=$1 FOR UPDATE`,[key.user_id]);
     const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE id=$1 FOR UPDATE`,[key.id]);

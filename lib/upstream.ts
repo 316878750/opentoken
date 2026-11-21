@@ -16,6 +16,7 @@ export type TextDelta = {content?:string;refusal?:string};
 
 type Completion = {
   tokens: { input: number; cached: number; output: number };
+  cacheReported: boolean;
   choices: { index: number; message: { role: 'assistant'; content: string | null; refusal?: string | null }; finish_reason: string }[];
   requestId: string | null;
 };
@@ -90,7 +91,7 @@ function billedTokens(usage:z.infer<typeof usageSchema>,input:CompletionInput,up
   }
   const tokens = {input:usage.prompt_tokens,cached:cached[0] ?? 0,output:usage.completion_tokens};
   if (tokens.cached<0 || tokens.cached>tokens.input || tokens.output>input.max_completion_tokens) throw new UpstreamError('review',requestId);
-  return tokens;
+  return {tokens,cacheReported:cached.length>0};
 }
 
 export async function openAiCompletion(
@@ -105,11 +106,11 @@ export async function openAiCompletion(
   if (!parsed.success) throw new UpstreamError('review',headerId);
   const requestId = headerId ?? providerId(parsed.data.id,upstream.apiKey);
   if (parsed.data.model!==upstream.responseModel) throw new UpstreamError('review',requestId);
-  const tokens = billedTokens(parsed.data.usage,input,upstream,requestId);
+  const billed = billedTokens(parsed.data.usage,input,upstream,requestId);
   const hideKey = (value: string|null|undefined) => value?.replaceAll(upstream.apiKey,'[redacted]') ?? value;
   const choices = parsed.data.choices.map(choice=>({...choice,finish_reason:hideKey(choice.finish_reason)!,message:{...choice.message,
     content:hideKey(choice.message.content) ?? null,refusal:hideKey(choice.message.refusal)}}));
-  return {choices,tokens,requestId};
+  return {choices,...billed,requestId};
 }
 
 const streamFrame = z.object({
@@ -192,19 +193,19 @@ export async function openAiStream(
   let id:string|undefined;
   let requestId = headerId;
   let finishReason:string|undefined;
-  let tokens:Completion['tokens']|undefined;
+  let billed:ReturnType<typeof billedTokens>|undefined;
   const content = redactDeltas(upstream.apiKey,text=>emit({content:text}));
   const refusal = redactDeltas(upstream.apiKey,text=>emit({refusal:text}));
   try {
     for await (const data of readSse(response.body)) {
       if (data==='[DONE]') {
-        if (!finishReason || !tokens) break;
+        if (!finishReason || !billed) break;
         content.flush();
         refusal.flush();
-        return {requestId,tokens,choices:[{index:0,message:{role:'assistant',content:null},finish_reason:finishReason}]};
+        return {requestId,...billed,choices:[{index:0,message:{role:'assistant',content:null},finish_reason:finishReason}]};
       }
       const frame = streamFrame.parse(JSON.parse(data));
-      if (frame.model!==upstream.responseModel || (id && id!==frame.id) || tokens) break;
+      if (frame.model!==upstream.responseModel || (id && id!==frame.id) || billed) break;
       id ??= frame.id;
       requestId ??= providerId(id,upstream.apiKey);
       const [choice] = frame.choices;
@@ -218,7 +219,8 @@ export async function openAiStream(
       }
       if (frame.usage) {
         if (!finishReason) break;
-        tokens = billedTokens(frame.usage,input,upstream,requestId);
+        billed = billedTokens(frame.usage,input,upstream,requestId);
+        const {tokens} = billed;
         if (frame.usage.total_tokens!==undefined && frame.usage.total_tokens!==tokens.input+tokens.output) break;
       } else if (!choice) {
         break;
@@ -242,7 +244,7 @@ export async function mockCompletion(input: CompletionInput,onText?: (content:st
     await delay(duration);
   }
   return {
-    tokens:{input:375,cached:0,output:Math.min(48,input.max_completion_tokens)},requestId:null,
+    tokens:{input:375,cached:0,output:Math.min(48,input.max_completion_tokens)},cacheReported:true,requestId:null,
     choices:[{index:0,message:{role:'assistant',content:chunks.join('')},finish_reason:'stop'}],
   };
 }

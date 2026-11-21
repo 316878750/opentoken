@@ -47,7 +47,7 @@ export async function migrate(client) {
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
       ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql'],
-      ['010','010-managed-channels.sql']]) {
+      ['010','010-managed-channels.sql'],['011','011-admin-models.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -89,16 +89,21 @@ export async function seed(client,email,providers=resolveLiveUpstreams()) {
     for (const live of providers.filter(provider=>provider.mode==='compatible')) {
       await client.query(`INSERT INTO gateway.models (code,upstream_model,max_context_tokens,max_output_tokens)
         VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,[live.alias,live.model,live.maxContextTokens,live.maxOutputTokens]);
-      const {rows:[model]} = await client.query(`SELECT id,upstream_model,max_context_tokens,max_output_tokens
-        FROM gateway.models WHERE code=$1`,[live.alias]);
+      const {rows:[model]} = await client.query(`SELECT id,upstream_model,max_context_tokens,max_output_tokens,
+        coalesce((to_jsonb(m)->>'admin_managed')::boolean,false) AS admin_managed
+        FROM gateway.models m WHERE code=$1`,[live.alias]);
+      if (model.admin_managed) continue;
       for (const group of live.groups) {
         if (managed && (await client.query(`SELECT 1 FROM gateway.channel_routes p JOIN gateway.pricing_groups g ON g.id=p.group_id
           WHERE p.model_id=$1 AND g.code=$2`,[model.id,group.code])).rowCount) continue;
         if (model.upstream_model!==live.model || model.max_context_tokens!==live.maxContextTokens ||
           model.max_output_tokens!==live.maxOutputTokens) throw new Error('The compatible alias already belongs to a different model or context limit');
         await client.query('INSERT INTO gateway.pricing_groups (code,name) VALUES ($1,$2) ON CONFLICT DO NOTHING',[group.code,group.name]);
-        const {rows:[storedGroup]} = await client.query('SELECT id,name FROM gateway.pricing_groups WHERE code=$1',[group.code]);
-        if (group.code!=='pilot' && storedGroup.name!==group.name) throw new Error('The pricing group already uses a different name');
+        const {rows:[storedGroup]} = await client.query(`SELECT id,name,coalesce((to_jsonb(g)->>'admin_managed')::boolean,false) AS admin_managed
+          FROM gateway.pricing_groups g WHERE code=$1`,[group.code]);
+        if (!storedGroup.admin_managed && group.code!=='pilot' && storedGroup.name!==group.name) {
+          throw new Error('The pricing group already uses a different name');
+        }
         const {rows:[current]} = await client.query(`SELECT id,input_micros_per_mtok::text AS input,
           cached_input_micros_per_mtok::text AS cached,output_micros_per_mtok::text AS output,multiplier_bps
           FROM gateway.model_rates WHERE group_id=$1 AND model_id=$2 AND closed_at IS NULL`,[storedGroup.id,model.id]);
@@ -140,6 +145,9 @@ export async function check(client) {
     NOT has_column_privilege(current_user,'gateway.wallet_entries','redeem_code_id','INSERT') AS redemption_insert_private,
     NOT has_table_privilege(current_user,'gateway.wallet_entries','UPDATE,DELETE,TRUNCATE') AS entry_immutable,
     NOT has_table_privilege(current_user,'gateway.model_rates','INSERT,UPDATE,DELETE,TRUNCATE') AS rates_immutable,
+    NOT has_table_privilege(current_user,'gateway.models','INSERT,UPDATE,DELETE,TRUNCATE') AS models_private,
+    NOT has_table_privilege(current_user,'gateway.pricing_groups','INSERT,UPDATE,DELETE,TRUNCATE') AS pricing_groups_private,
+    has_function_privilege(current_user,'gateway.admin_write_model(uuid,uuid,text,jsonb,boolean,jsonb)','EXECUTE') AS admin_model_write,
     NOT has_table_privilege(current_user,'gateway.billing_resolutions','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS resolutions_private,
     NOT has_table_privilege(current_user,'gateway.billing_alerts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS alerts_private,
     NOT has_function_privilege(current_user,'gateway.resolve_billing_request(uuid,text,text,text,integer,integer,integer)','EXECUTE') AS resolve_private,
@@ -193,7 +201,7 @@ async function main() {
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–010 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–011 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');

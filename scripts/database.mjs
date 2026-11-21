@@ -7,6 +7,7 @@ import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
 import { billingCommand, scanBilling } from './billing.mjs';
 import { redeemCommand } from './redeem.mjs';
 import { stripeCommand } from './stripe-ops.mjs';
+import { paidPilotCommand } from './paid-pilot.mjs';
 
 function connection(name) {
   const value = process.env[name];
@@ -43,7 +44,8 @@ export async function migrate(client) {
         AND NOT rolcreatedb AND NOT rolinherit AND NOT rolbypassrls`);
     if (!rowCount) throw new Error('Create a restricted opentoken_app login role before migrating');
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
-      ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql']]) {
+      ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
+      ['007','007-paid-pilot-preparation.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -162,13 +164,13 @@ export async function enableStripeSandbox(client) {
 
 async function main() {
   const [, , action, ...args] = process.argv;
-  if (!['migrate','seed','check','review-stale','billing','redeem','stripe-sandbox','stripe'].includes(action)) {
-    throw new Error('Expected migrate, seed, check, review-stale, billing, redeem, stripe-sandbox, or stripe');
+  if (!['migrate','seed','check','review-stale','billing','redeem','stripe-sandbox','stripe','paid-pilot'].includes(action)) {
+    throw new Error('Expected migrate, seed, check, review-stale, billing, redeem, stripe-sandbox, stripe, or paid-pilot');
   }
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–006 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–007 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');
@@ -181,6 +183,11 @@ async function main() {
       const result=await stripeCommand(client,args);
       console.log(JSON.stringify(result,null,2));
       if (result.issues?.length) process.exitCode=1;
+    }
+    if (action==='paid-pilot') {
+      const result=await paidPilotCommand(client,args);
+      console.log(JSON.stringify(result,null,2));
+      if (args[0]==='preflight' && !result.ready) process.exitCode=1;
     }
     if (action==='stripe-sandbox') { await enableStripeSandbox(client); console.log('Stripe sandbox enabled. Real upstream routes are disabled for this database.'); }
   } finally { await client.end(); }

@@ -42,4 +42,22 @@ pnpm db:stripe sync-invoices ORDER_UUID
 
 ## 8.3 小范围付费试点
 
-经确认后向指定账号开放正式支付，核对 Stripe 订单、OpenToken 订单和钱包账本。
+- [x] 首轮范围已由运营确认。以只读查询核实指定账号在正式 Supabase 中唯一且邮箱已验证。生产库当前迁移为 004。
+- [x] 在开发分支准备 007 迁移。试点名单按用户 ID 保存，审批工具仅接受已验证账号。新结账许可默认关闭，沙盒和付费名单互斥。
+- [x] 准备 Stripe 正式配置的只读预检，校验账户收款状态、四个美元价格、客户门户、Webhook 和已确认的计税策略。预检仅报告配置与数据库状态。
+- [x] 在本机独立 PostgreSQL 验证 007 加密备份和恢复。22 张表摘要全部匹配，合成名单与暂停状态随归档恢复，账务异常为零。
+- [ ] Stripe 正式账户完成激活。确认首轮客户所在国家或地区、适用税费、收款主体、退款条款和隐私页面。 [Stripe 激活](https://docs.stripe.com/get-started/account/set-up) · [Stripe Tax 设置](https://docs.stripe.com/tax/set-up)
+- [ ] 完成正式收款、带税金额与退款处理的接线及验收，再准备独立试点发布。正式环境保存正式密钥与专用 Webhook 签名密钥。先备份并演练 004 至 007 升级，再登记获准账号。 [Stripe 上线检查](https://docs.stripe.com/get-started/checklist/go-live)
+- [ ] 只向名单开放。验收一笔获准的正式充值和原路退款，核对 Stripe、OpenToken 订单和钱包账本，并测试暂停新结账。
+
+准备期管理员可在独立配置下使用以下命令。正式账户、价格、客户门户、Webhook 和税费确认后，按 `.env.example` 提供相应的正式配置。预检会按 Stripe SDK 的 API 版本检查 Webhook。选择 Stripe Tax 时使用税额单列的价格，并核验相关地区设置。获准免收税费时，采用负责人确认后的地区口径。
+
+```sh
+pnpm db:paid-pilot status
+pnpm db:paid-pilot preflight
+pnpm db:paid-pilot allow EMAIL
+pnpm db:paid-pilot revoke EMAIL
+pnpm db:paid-pilot pause
+```
+
+当前的准入和暂停能力用于发布准备，实际正式 Checkout 和 Webhook 接线待上述配置确认。从备份恢复用于正式试点时，先核对名单与结账暂停状态，再接流量。

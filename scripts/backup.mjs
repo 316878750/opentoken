@@ -23,6 +23,7 @@ const pilotTables = [
   'gateway.usage_requests', 'gateway.wallet_entries', 'gateway.wallets',
 ];
 const stripeTables=[...pilotTables,'gateway.stripe_orders','gateway.stripe_events','gateway.stripe_sandbox'].sort();
+const reconciliationTables=[...stripeTables,'gateway.stripe_refunds','gateway.wallet_credit_lots','gateway.stripe_invoices'].sort();
 export function backupTables(versions) {
   const version = JSON.stringify(versions);
   if (version==='["001","002","003","004"]') return pilotTables;
@@ -30,7 +31,10 @@ export function backupTables(versions) {
     return stripeTables;
   }
   if (version==='["001","002","003","004","005","006"]') {
-    return [...stripeTables,'gateway.stripe_refunds','gateway.wallet_credit_lots','gateway.stripe_invoices'].sort();
+    return reconciliationTables;
+  }
+  if (version==='["001","002","003","004","005","006","007"]') {
+    return [...reconciliationTables,'gateway.paid_pilot_accounts','gateway.paid_pilot_settings'].sort();
   }
   throw new Error('Unsupported migration version for backup or restore');
 }

@@ -10,9 +10,9 @@
 - [x] 在 `lib/http.ts` 接受 `stream: true` 与可选的 `stream_options.include_usage`。在 `lib/gateway.ts` 让 JSON 和 SSE 共用派发及账务事务。先让 `mock-text` 用分块输出验证协议和结算。
 - [x] 接入带最终 usage 帧的 OpenAI Chat Completions SSE 协议。向上游发送 `include_usage: true`，仅在最终用量有效且收到 `[DONE]` 后结算。客户端断开后继续读取，用量缺失、超预算或上游异常中断时保留预占并转待核对。
 - [x] 用测试上游验收普通 JSON 路径兼容、并发限额、重复幂等键、客户端断开、上游断流、缺失和超预算用量，以及 SSE 正常结束。
-- [ ] 用指定供应商和模型完成一笔获授权的真实流式对账，确认上游返回最终 Token 用量、缓存拆分和 `[DONE]`。
+- [x] 用指定供应商和模型完成一笔获授权的真实流式对账，确认上游返回最终 Token 用量、缓存拆分和 `[DONE]`。
 
-开启 `ENABLE_UPSTREAM_STREAMING=1` 才允许已配置的真实上游响应流式请求。首批测试覆盖官方和兼容格式，真实第三方供应商的协议能力需在实测后确认。
+开启 `ENABLE_UPSTREAM_STREAMING=1` 才允许已配置的真实上游响应流式请求。首批测试覆盖官方和兼容格式。已用 `deepseek-v4.1-flash-1017` 在隔离的 OpenToken 实例验收真实 SSE，确认仪表盘的预占和余额、使用记录的结算和释放、账本的单笔扣费一致。
 
 ## 7.2 更多模型与分组
 

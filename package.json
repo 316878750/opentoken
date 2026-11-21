@@ -16,6 +16,7 @@
     "db:billing": "node --env-file-if-exists=.env.local scripts/database.mjs billing",
     "db:redeem": "node --env-file-if-exists=.env.local scripts/database.mjs redeem",
     "db:backup": "node --env-file-if-exists=.env.local scripts/backup.mjs",
+    "db:stripe": "node --env-file-if-exists=.env.local scripts/database.mjs stripe",
     "pilot:invite": "node --env-file-if-exists=.env.local scripts/pilot-invite.mjs",
     "verify:live": "node --env-file-if-exists=.env.local scripts/verify-live.mjs"
   },

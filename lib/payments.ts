@@ -2,8 +2,10 @@ import Stripe from 'stripe';
 import type { PoolClient } from 'pg';
 import { store, transaction } from './data';
 import { Fault } from './gateway';
+import { recordPaidInvoice } from './stripe-invoices.mjs';
 
 type Kind = 'credit'|'subscription';
+type RechargeCents = 500|2000|5000;
 type Order = {
   id:string;user_id:string;kind:Kind;price_id:string;amount_cents:number;state:'open'|'paid'|'expired';
   checkout_id:string|null;payment_id:string|null;customer_id:string|null;subscription_id:string|null;
@@ -15,7 +17,8 @@ function config() {
     STRIPE_TEST_CREDIT_PRICE_ID:credit,STRIPE_TEST_SUBSCRIPTION_PRICE_ID:subscription} = process.env;
   if (!key || !/^sk_test_[\w]+$/.test(key) || !signature || !/^whsec_[\w]+$/.test(signature) ||
     !credit || !/^price_[\w]+$/.test(credit) || !subscription || !/^price_[\w]+$/.test(subscription)) return null;
-  return {key,signature,credit,subscription};
+  const creditPrices = {500:credit,2000:process.env.STRIPE_TEST_CREDIT_20_PRICE_ID,5000:process.env.STRIPE_TEST_CREDIT_50_PRICE_ID};
+  return {key,signature,creditPrices,subscription};
 }
 
 function sandbox() {
@@ -45,16 +48,26 @@ function link(url:string|null,hostname:string) {
 }
 
 export async function billing(user:string) {
-  if (!config() || !await isSandboxDatabase()) return {enabled:false,orders:[],canManage:false};
-  const {rows:orders} = await store().db.query(`SELECT id,kind,amount_cents AS "amountCents",
-    state,
-    subscription_status AS "subscriptionStatus",period_end AS "periodEnd",created_at AS "createdAt",
-    (customer_id IS NOT NULL AND subscription_id IS NOT NULL AND kind='subscription') AS "hasCustomer"
-    FROM gateway.stripe_orders WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT 25`,[user]);
-  return {enabled:true,orders:orders.map(({hasCustomer,...order})=>order),canManage:orders.some(order=>order.hasCustomer)};
+  const settings=config();
+  if (!settings || !await isSandboxDatabase()) return {enabled:false,orders:[],canManage:false};
+  const db=store().db;
+  const {rows:orders} = await db.query(`SELECT o.id,o.kind,o.amount_cents AS "amountCents",o.state,
+    o.subscription_status AS "subscriptionStatus",o.period_end AS "periodEnd",o.created_at AS "createdAt",
+    (o.customer_id IS NOT NULL AND o.subscription_id IS NOT NULL AND o.kind='subscription') AS "hasCustomer",
+    coalesce((SELECT sum(r.amount_cents)::int FROM gateway.stripe_refunds r WHERE r.order_id=o.id AND r.state='succeeded'),0) AS "refundedCents",
+    EXISTS(SELECT 1 FROM gateway.stripe_refunds r WHERE r.order_id=o.id AND r.state IN ('approved','pending')) AS "refundPending"
+    FROM gateway.stripe_orders o WHERE o.user_id=$1 ORDER BY o.created_at DESC,o.id DESC LIMIT 25`,[user]);
+  const {rows:invoices}=await db.query(`SELECT i.stripe_id AS id,i.amount_cents AS "amountCents",i.reason,
+    i.period_start AS "periodStart",i.period_end AS "periodEnd"
+    FROM gateway.stripe_invoices i JOIN gateway.stripe_orders o ON o.id=i.order_id
+    WHERE o.user_id=$1 ORDER BY i.period_start DESC,i.stripe_id LIMIT 25`,[user]);
+  const {rows:[limits]}=await db.query('SELECT rpm,active_keys AS "activeKeys" FROM gateway.sandbox_billing_limits($1)',[user]);
+  const rechargeOptions=Object.entries(settings.creditPrices).filter(([,id])=>id && /^price_[\w]+$/.test(id)).map(([cents])=>Number(cents));
+  return {enabled:true,orders:orders.map(({hasCustomer,...order})=>order),invoices,limits,rechargeOptions,
+    canManage:orders.some(order=>order.hasCustomer)};
 }
 
-async function openOrder(user:string,kind:Kind,nonce:string,stripe:Stripe,priceId:string) {
+async function openOrder(user:string,kind:Kind,nonce:string,stripe:Stripe,priceId:string,expectedCents:number) {
   async function existing(db:PoolClient|ReturnType<typeof store>['db']) {
     return (await db.query<Order>('SELECT * FROM gateway.stripe_orders WHERE user_id=$1 AND nonce=$2',[user,nonce])).rows[0];
   }
@@ -64,8 +77,8 @@ async function openOrder(user:string,kind:Kind,nonce:string,stripe:Stripe,priceI
   const price = await stripe.prices.retrieve(priceId);
   const cents = price.unit_amount;
   if (price.livemode!==false || !price.active || price.currency!=='usd' || !cents ||
-    !Number.isSafeInteger(cents) || cents<1 || cents>2_147_483_647 ||
-    (kind==='credit' ? price.type!=='one_time' : price.type!=='recurring')) {
+    cents!==expectedCents || (kind==='credit' ? price.type!=='one_time' : price.type!=='recurring' ||
+      price.recurring?.interval!=='month' || price.recurring.interval_count!==1)) {
     throw new Fault(503,'stripe_price_invalid','请配置有效的美元 Stripe 测试价格。');
   }
   return transaction(async tx => {
@@ -90,11 +103,14 @@ async function openOrder(user:string,kind:Kind,nonce:string,stripe:Stripe,priceI
   });
 }
 
-export async function startCheckout(user:string,kind:Kind,nonce:string,origin:string) {
+export async function startCheckout(user:string,kind:Kind,nonce:string,origin:string,amount?:RechargeCents) {
   const {stripe,settings} = sandbox();
   await requireSandboxDatabase();
-  const order = await openOrder(user,kind,nonce,stripe,settings[kind]);
-  if (order.kind!==kind || order.state!=='open' || order.expires_at.getTime()<=Date.now()) {
+  const expectedCents=kind==='credit' ? amount??500 : 1000;
+  const priceId=kind==='credit' ? settings.creditPrices[amount??500] : settings.subscription;
+  if (!priceId || !/^price_[\w]+$/.test(priceId)) throw new Fault(503,'stripe_price_invalid','此金额的 Stripe 测试价格尚未配置。');
+  const order = await openOrder(user,kind,nonce,stripe,priceId,expectedCents);
+  if (order.kind!==kind || order.amount_cents!==expectedCents || order.state!=='open' || order.expires_at.getTime()<=Date.now()) {
     throw new Fault(409,'stripe_order_closed','此结账请求已完成、过期或不匹配。');
   }
   const metadata = {opentoken_order:order.id,opentoken_price:order.price_id};
@@ -103,7 +119,8 @@ export async function startCheckout(user:string,kind:Kind,nonce:string,origin:st
       mode:kind==='credit' ? 'payment' : 'subscription',line_items:[{price:order.price_id,quantity:1}],
       client_reference_id:order.id,metadata,expires_at:Math.floor(order.expires_at.getTime()/1000),
       success_url:origin+'/redeem?checkout=success',cancel_url:origin+'/redeem?checkout=cancel',
-      ...(kind==='subscription' ? {subscription_data:{metadata},...(order.customer_id ? {customer:order.customer_id} : {})} : {}),
+      ...(kind==='subscription' ? {subscription_data:{metadata},...(order.customer_id ? {customer:order.customer_id} : {})} :
+        {payment_intent_data:{metadata}}),
     },{idempotencyKey:'opentoken-checkout-'+order.id});
   if (session.livemode!==false || !session.id.startsWith('cs_test_') ||
     session.client_reference_id!==order.id || session.metadata?.opentoken_price!==order.price_id) {
@@ -130,7 +147,13 @@ export async function startPortal(user:string,origin:string) {
     WHERE user_id=$1 AND kind='subscription' AND customer_id IS NOT NULL AND subscription_id IS NOT NULL
     ORDER BY created_at DESC LIMIT 1`,[user]);
   if (!order) throw new Fault(404,'stripe_subscription_missing','没有可以管理的测试订阅。');
-  const portal = await stripe.billingPortal.sessions.create({customer:order.customer_id,return_url:origin+'/redeem',configuration});
+  const selected = configuration ? await stripe.billingPortal.configurations.retrieve(configuration) :
+    (await stripe.billingPortal.configurations.list({is_default:true,active:true,limit:1})).data[0];
+  if (!selected || selected.livemode!==false || !selected.active ||
+    !selected.features.subscription_cancel.enabled || selected.features.subscription_cancel.mode!=='at_period_end') {
+    throw new Fault(503,'stripe_portal_invalid','请将 Stripe 测试门户配置为账期结束时取消续费。');
+  }
+  const portal = await stripe.billingPortal.sessions.create({customer:order.customer_id,return_url:origin+'/redeem',configuration:selected.id});
   if (portal.livemode!==false) throw new Fault(502,'stripe_unavailable','Stripe 返回的订阅管理地址不匹配。');
   return {url:link(portal.url,'billing.stripe.com')};
 }
@@ -192,7 +215,7 @@ function validateCheckout(order:Order,session:Stripe.Checkout.Session) {
     (order.checkout_id && order.checkout_id!==session.id)) throw new Error('Stripe checkout does not match the test order');
 }
 
-async function checkoutEvent(tx:PoolClient,session:Stripe.Checkout.Session,closed?:'expired'|'failed') {
+async function checkoutEvent(tx:PoolClient,session:Stripe.Checkout.Session,closed?:'expired'|'failed',paidAt?:number) {
   const order = await lockOrder(tx,session.metadata?.opentoken_order);
   if (!order) return;
   validateCheckout(order,session);
@@ -207,7 +230,8 @@ async function checkoutEvent(tx:PoolClient,session:Stripe.Checkout.Session,close
   if (order.kind==='credit') {
     const payment = identifier(session.payment_intent);
     if (!payment?.startsWith('pi_') || (order.payment_id && order.payment_id!==payment)) throw new Error('Stripe test payment mismatch');
-    await tx.query("UPDATE gateway.stripe_orders SET state='paid',checkout_id=$2,payment_id=$3 WHERE id=$1",[order.id,session.id,payment]);
+    await tx.query("UPDATE gateway.stripe_orders SET state='paid',checkout_id=$2,payment_id=$3,paid_at=coalesce(paid_at,to_timestamp($4)) WHERE id=$1",
+      [order.id,session.id,payment,paidAt]);
     await tx.query('SELECT gateway.credit_stripe_test_order($1)',[order.id]);
     return;
   }
@@ -220,10 +244,13 @@ async function checkoutEvent(tx:PoolClient,session:Stripe.Checkout.Session,close
     [order.id,session.id,subscription,customer]);
 }
 
-async function syncSubscription(tx:PoolClient,stripe:Stripe,id:string,orderId?:string) {
+async function syncSubscription(tx:PoolClient,stripe:Stripe,id:string,orderId?:string,paidInvoice?:Stripe.Invoice) {
   const reference = orderId ?? (await tx.query<{id:string}>('SELECT id FROM gateway.stripe_orders WHERE subscription_id=$1',[id])).rows[0]?.id;
   const order = await lockOrder(tx,reference);
-  if (!order || order.subscription_status==='canceled' || order.subscription_status==='incomplete_expired') return;
+  if (!order) return;
+  if (order.subscription_id && order.subscription_id!==id) throw new Error('Stripe test subscription mismatch');
+  const ended=order.subscription_status==='canceled'||order.subscription_status==='incomplete_expired';
+  if (ended && !paidInvoice) return;
   // Read the authoritative state under the per-order lock so retries and out-of-order events cannot revert a subscription.
   const subscription = await stripe.subscriptions.retrieve(id);
   const customer = identifier(subscription.customer);
@@ -233,13 +260,30 @@ async function syncSubscription(tx:PoolClient,stripe:Stripe,id:string,orderId?:s
     (order.subscription_id && order.subscription_id!==subscription.id) ||
     subscription.items.data.length!==1 || item.price.id!==order.price_id ||
     !Number.isSafeInteger(item.current_period_end) || item.current_period_end<=0) throw new Error('Stripe test subscription mismatch');
+  if (paidInvoice) await recordPaidInvoice(tx,order,paidInvoice);
+  if (ended) return;
   await tx.query(`UPDATE gateway.stripe_orders SET subscription_id=$2,customer_id=$3,subscription_status=$4,
     period_end=to_timestamp($5) WHERE id=$1`,[order.id,subscription.id,customer,subscription.status,item.current_period_end]);
+}
+
+async function syncRefund(tx:PoolClient,stripe:Stripe,eventRefund:Stripe.Refund) {
+  if (!/^re_[\w]+$/.test(eventRefund.id)) throw new Error('Stripe refund id is invalid');
+  const request = eventRefund.metadata?.opentoken_refund;
+  const linked = uuid.test(request??'') ?
+    (await tx.query<{id:string;order_id:string}>('SELECT id,order_id FROM gateway.stripe_refunds WHERE id=$1',[request])).rows[0] :
+    (await tx.query<{id:string;order_id:string}>('SELECT id,order_id FROM gateway.stripe_refunds WHERE stripe_id=$1',[eventRefund.id])).rows[0];
+  if (!linked) return;
+  const refund=await stripe.refunds.retrieve(eventRefund.id);
+  if (refund.id!==eventRefund.id || refund.currency!=='usd' || refund.metadata?.opentoken_refund!==linked.id ||
+    refund.metadata?.opentoken_order!==linked.order_id) throw new Error('Stripe refund metadata does not match local approval');
+  const state=refund.status==='requires_action' ? 'pending' : refund.status;
+  await tx.query('SELECT gateway.apply_stripe_refund($1,$2,$3,$4,$5)',[linked.id,refund.id,identifier(refund.payment_intent),refund.amount,state]);
 }
 
 const handledEvents = new Set([
   'checkout.session.completed','checkout.session.async_payment_succeeded','checkout.session.async_payment_failed','checkout.session.expired',
   'customer.subscription.created','customer.subscription.updated','customer.subscription.deleted','invoice.paid','invoice.payment_failed',
+  'refund.created','refund.updated','refund.failed',
 ]);
 
 export async function receiveStripeWebhook(payload:string,signature:string|null) {
@@ -260,7 +304,7 @@ export async function receiveStripeWebhook(payload:string,signature:string|null)
     switch (event.type) {
       case 'checkout.session.completed':
       case 'checkout.session.async_payment_succeeded':
-        await checkoutEvent(tx,event.data.object);
+        await checkoutEvent(tx,event.data.object,undefined,event.created);
         break;
       case 'checkout.session.async_payment_failed':
         await checkoutEvent(tx,event.data.object,'failed');
@@ -275,10 +319,17 @@ export async function receiveStripeWebhook(payload:string,signature:string|null)
         break;
       case 'invoice.paid':
       case 'invoice.payment_failed': {
-        const subscription = identifier(event.data.object.parent?.subscription_details?.subscription);
-        if (subscription) await syncSubscription(tx,stripe,subscription);
+        const details=event.data.object.parent?.subscription_details;
+        const subscription = identifier(details?.subscription);
+        if (subscription) await syncSubscription(tx,stripe,subscription,details?.metadata?.opentoken_order,
+          event.type==='invoice.paid' ? event.data.object : undefined);
         break;
       }
+      case 'refund.created':
+      case 'refund.updated':
+      case 'refund.failed':
+        await syncRefund(tx,stripe,event.data.object);
+        break;
     }
   });
 }

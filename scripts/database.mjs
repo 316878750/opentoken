@@ -6,6 +6,7 @@ import { postgresConnectionOptions } from '../lib/postgres-config.mjs';
 import { resolveLiveUpstreams } from '../lib/upstream-config.mjs';
 import { billingCommand, scanBilling } from './billing.mjs';
 import { redeemCommand } from './redeem.mjs';
+import { stripeCommand } from './stripe-ops.mjs';
 
 function connection(name) {
   const value = process.env[name];
@@ -42,7 +43,7 @@ export async function migrate(client) {
         AND NOT rolcreatedb AND NOT rolinherit AND NOT rolbypassrls`);
     if (!rowCount) throw new Error('Create a restricted opentoken_app login role before migrating');
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
-      ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql']]) {
+      ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -52,7 +53,10 @@ export async function migrate(client) {
       REVOKE ALL ON SCHEMA gateway FROM PUBLIC;
       GRANT USAGE ON SCHEMA gateway TO opentoken_app;
       GRANT SELECT ON gateway.pricing_groups,gateway.models,gateway.model_rates TO opentoken_app;
-      GRANT SELECT,INSERT,UPDATE ON gateway.wallets,gateway.api_keys,gateway.usage_requests TO opentoken_app;
+      GRANT SELECT,INSERT,UPDATE ON gateway.api_keys,gateway.usage_requests TO opentoken_app;
+      REVOKE INSERT,UPDATE ON gateway.wallets FROM opentoken_app;
+      GRANT SELECT ON gateway.wallets TO opentoken_app;
+      GRANT INSERT (user_id),UPDATE (balance_micros,held_micros,updated_at) ON gateway.wallets TO opentoken_app;
       REVOKE INSERT ON gateway.wallet_entries FROM opentoken_app;
       GRANT SELECT ON gateway.wallet_entries TO opentoken_app;
       GRANT INSERT (user_id,request_id,kind,delta_micros) ON gateway.wallet_entries TO opentoken_app;
@@ -117,8 +121,10 @@ export async function check(client) {
   const { rows:[result] } = await client.query(`SELECT current_user AS role,
     NOT has_schema_privilege(current_user,'gateway','CREATE') AS schema_readonly,
     has_table_privilege(current_user,'gateway.wallets','SELECT') AS wallet_read,
-    has_table_privilege(current_user,'gateway.wallets','INSERT') AS wallet_insert,
-    has_table_privilege(current_user,'gateway.wallets','UPDATE') AS wallet_update,
+    has_column_privilege(current_user,'gateway.wallets','user_id','INSERT') AS wallet_insert,
+    (has_column_privilege(current_user,'gateway.wallets','balance_micros','UPDATE')
+      AND has_column_privilege(current_user,'gateway.wallets','held_micros','UPDATE')) AS wallet_update,
+    NOT has_column_privilege(current_user,'gateway.wallets','refund_held_micros','INSERT,UPDATE') AS refund_hold_private,
     (has_column_privilege(current_user,'gateway.wallet_entries','user_id','INSERT')
       AND has_column_privilege(current_user,'gateway.wallet_entries','request_id','INSERT')
       AND has_column_privilege(current_user,'gateway.wallet_entries','kind','INSERT')
@@ -134,6 +140,7 @@ export async function check(client) {
     NOT has_table_privilege(current_user,'gateway.redeem_codes','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_codes_private,
     NOT has_table_privilege(current_user,'gateway.redeem_attempts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_attempts_private,
     NOT has_table_privilege(current_user,'gateway.stripe_sandbox','INSERT,UPDATE,DELETE,TRUNCATE') AS stripe_sandbox_private,
+    NOT has_function_privilege(current_user,'gateway.approve_stripe_refund(uuid,uuid,integer,text)','EXECUTE') AS refund_approval_private,
     NOT coalesce((SELECT has_table_privilege(current_user,c.oid,'SELECT')
       FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
       WHERE n.nspname='auth' AND c.relname='users'),true) AS auth_private`);
@@ -155,13 +162,13 @@ export async function enableStripeSandbox(client) {
 
 async function main() {
   const [, , action, ...args] = process.argv;
-  if (!['migrate','seed','check','review-stale','billing','redeem','stripe-sandbox'].includes(action)) {
-    throw new Error('Expected migrate, seed, check, review-stale, billing, redeem, or stripe-sandbox');
+  if (!['migrate','seed','check','review-stale','billing','redeem','stripe-sandbox','stripe'].includes(action)) {
+    throw new Error('Expected migrate, seed, check, review-stale, billing, redeem, stripe-sandbox, or stripe');
   }
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–005 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–006 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');
@@ -170,6 +177,11 @@ async function main() {
     if (action==='review-stale') console.log(JSON.stringify(await scanBilling(client)));
     if (action==='billing') console.log(JSON.stringify(await billingCommand(client,args),null,2));
     if (action==='redeem') console.log(JSON.stringify(await redeemCommand(client,args),null,2));
+    if (action==='stripe') {
+      const result=await stripeCommand(client,args);
+      console.log(JSON.stringify(result,null,2));
+      if (result.issues?.length) process.exitCode=1;
+    }
     if (action==='stripe-sandbox') { await enableStripeSandbox(client); console.log('Stripe sandbox enabled. Real upstream routes are disabled for this database.'); }
   } finally { await client.end(); }
 }

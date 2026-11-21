@@ -7,14 +7,17 @@ type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cac
 type KeyRow = {id:string;name:string;prefix:string;status:string;groupName:string;rpm:number;capMicros:string|null};
 type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;releasedMicros:string|null;standardMicros:string|null;
   chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string;upstreamRequestId:string|null};
-type Wallet = {balanceMicros:string;heldMicros:string;availableMicros:string;asOf:string;activeKeys:number;
+type Wallet = {balanceMicros:string;heldMicros:string;refundHeldMicros?:string;availableMicros:string;asOf:string;activeKeys:number;
   requests:number;todayRequests:number;tokens:string;todayTokens:string;chargedMicros:string;standardMicros:string;
   todayChargedMicros:string;reviewCount:number};
 type UsagePage = {items:RequestRow[];nextCursor:string|null};
-type WalletEntry = {id:string;kind:'redemption'|'usage';deltaMicros:string;requestId:string|null;createdAt:string};
+type WalletEntry = {id:string;kind:'redemption'|'usage'|'stripe_refund'|'stripe_refund_reversal';deltaMicros:string;requestId:string|null;createdAt:string};
+const ledgerKind:Record<WalletEntry['kind'],string> = {
+  redemption:'额度到账',usage:'模型扣费',stripe_refund:'充值退款',stripe_refund_reversal:'退款失败返还',
+};
 type WalletPage = {items:WalletEntry[];nextCursor:string|null};
 type CreditReceipt = {receipt:{id:string;amountMicros:string;createdAt:string};replayed:boolean;
-  wallet:Pick<Wallet,'balanceMicros'|'heldMicros'|'availableMicros'>};
+  wallet:Pick<Wallet,'balanceMicros'|'heldMicros'|'refundHeldMicros'|'availableMicros'>};
 
 class ApiError extends Error {
   constructor(public status:number, message:string, public requestId?:string) { super(message); }
@@ -162,6 +165,7 @@ export function Dashboard() {
         <div><dt>可用余额</dt><dd data-testid="available">{money(data.availableMicros)}</dd></div>
         <div><dt>账面余额</dt><dd data-testid="balance">{money(data.balanceMicros)}</dd></div>
         <div><dt>预占金额</dt><dd data-testid="held">{money(data.heldMicros)}</dd></div>
+        {data.refundHeldMicros && data.refundHeldMicros!=='0' && <div><dt>退款冻结</dt><dd>{money(data.refundHeldMicros)}</dd></div>}
       </dl>
       <p className="muted">{data.heldMicros!=='0' ? '预占额度暂留给处理中或待核对的请求。' : '当前没有预占额度。'}</p>
       <small className="muted">更新于 {new Date(data.asOf).toLocaleTimeString('zh-CN')}</small>
@@ -436,7 +440,10 @@ export function Usage() {
 type CheckoutKind = 'credit'|'subscription';
 type TestOrder = {
   id:string;kind:CheckoutKind;amountCents:number;state:string;subscriptionStatus:string|null;periodEnd:string|null;createdAt:string;
+  refundedCents:number;refundPending:boolean;
 };
+type TestInvoice = {id:string;amountCents:number;reason:string;periodStart:string;periodEnd:string};
+const centsLabel=(cents:number)=>money(String(BigInt(cents)*10000n));
 const paymentStatus:Record<string,string> = {
   open:'待支付',paid:'已确认',expired:'已过期',active:'生效中',trialing:'试用中',
   past_due:'续费异常',unpaid:'未支付',incomplete:'待激活',incomplete_expired:'未激活',
@@ -447,12 +454,13 @@ function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
   const [busy,setBusy] = useState(false);
   const [feedback,setFeedback] = useState('');
   const [returned,setReturned] = useState<string|null>(null);
-  const nonces = useRef<Partial<Record<CheckoutKind,string>>>({});
+  const nonces = useRef<Partial<Record<string,string>>>({});
   useEffect(() => { setReturned(new URLSearchParams(location.search).get('checkout')); },[]);
-  const {data,error,refresh} = useData<{enabled:boolean;orders:TestOrder[];canManage:boolean}>(
+  const {data,error,refresh} = useData<{enabled:boolean;orders:TestOrder[];canManage:boolean;invoices:TestInvoice[];
+    rechargeOptions:number[];limits:{rpm:number;activeKeys:number}}>(
     '/api/billing',returned==='success' ? 8000 : 0);
 
-  function checkoutNonce(kind:CheckoutKind) {
+  function checkoutNonce(kind:string) {
     let nonce = nonces.current[kind] ?? crypto.randomUUID();
     try {
       const key = 'opentoken:stripe-test:'+kind;
@@ -464,18 +472,19 @@ function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
     return nonce;
   }
 
-  async function open(kind:CheckoutKind|'portal') {
+  async function open(kind:CheckoutKind|'portal',amountCents?:number) {
     if (busy) return;
     setBusy(true); setFeedback('');
+    const choice=amountCents===undefined || amountCents===500 ? kind : 'credit:'+amountCents;
     try {
       const result = kind==='portal' ? await api<{url:string}>('/api/billing/portal',{method:'POST'}) :
         await api<{url:string}>('/api/billing/checkout',{method:'POST',
-          body:JSON.stringify({kind,nonce:checkoutNonce(kind)}),signal:AbortSignal.timeout(22000)});
+          body:JSON.stringify({kind,nonce:checkoutNonce(choice),amountCents}),signal:AbortSignal.timeout(22000)});
       location.assign(result.url);
     } catch (error) {
       if (kind!=='portal' && error instanceof ApiError && error.status===409) {
-        delete nonces.current[kind];
-        try { sessionStorage.removeItem('opentoken:stripe-test:'+kind); } catch {}
+        delete nonces.current[choice];
+        try { sessionStorage.removeItem('opentoken:stripe-test:'+choice); } catch {}
       }
       setFeedback(error instanceof ApiError ? error.message : '连接 Stripe 超时。可重试同一结账请求。');
       setBusy(false);
@@ -486,11 +495,14 @@ function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
   return <section className="panel" aria-labelledby="test-billing-title">
     <h2 id="test-billing-title">Stripe 测试支付</h2>
     <div className="actions">
-      <button disabled={busy} onClick={()=>void open('credit')}>测试充值</button>
-      <button disabled={busy} onClick={()=>void open('subscription')}>开通测试订阅</button>
+      {data.rechargeOptions.map(cents=><button key={cents} disabled={busy} onClick={()=>void open('credit',cents)}>
+        测试充值 {centsLabel(cents)}
+      </button>)}
+      <button disabled={busy} onClick={()=>void open('subscription')}>测试 Pro · $10/月</button>
       {data.canManage && <button disabled={busy} onClick={()=>void open('portal')}>管理测试订阅</button>}
       <button onClick={()=>{refresh();refreshWallet();}}>刷新订单和余额</button>
     </div>
+    <p>当前套餐：{data.limits.rpm===60?'Pro':'基础版'}，每分钟 {data.limits.rpm} 次调用，可用密钥 {data.limits.activeKeys} 把。</p>
     {returned==='success' && <p role="status">已从 Stripe 返回。到账以订单和钱包流水为准。</p>}
     {returned==='cancel' && <p role="status">结账尚未完成。可重开同一笔结账继续。</p>}
     <ErrorNote error={feedback || error} />
@@ -499,11 +511,22 @@ function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
       <tbody>{data.orders.map(order=><tr key={order.id}>
         <td>{order.kind==='credit'?'测试充值':'测试订阅'}<br/><small>{new Date(order.createdAt).toLocaleString('zh-CN')}</small></td>
         <td>{money(String(BigInt(order.amountCents)*10000n))}</td>
-        <td>{paymentStatus[order.state] ?? '待确认'}</td>
+        <td>{paymentStatus[order.state] ?? '待确认'}
+          {order.refundedCents>0 && <><br/><small>已退款 {centsLabel(order.refundedCents)}</small></>}
+          {order.refundPending && <><br/><small>退款处理中</small></>}
+        </td>
         <td>{order.subscriptionStatus ? paymentStatus[order.subscriptionStatus] ?? '待确认' : '—'}
           {order.periodEnd && <><br/><small>账期截止 {new Date(order.periodEnd).toLocaleDateString('zh-CN')}</small></>}</td>
       </tr>)}</tbody>
     </table></div> : <p className="muted">还没有测试订单。</p>}
+    {data.invoices.length>0 && <div className="table-wrap"><table>
+      <thead><tr><th>订阅账单</th><th>金额</th><th>已付账期</th></tr></thead>
+      <tbody>{data.invoices.map(invoice=><tr key={invoice.id}>
+        <td>{invoice.reason==='subscription_cycle'?'续费':'开通'}</td>
+        <td>{centsLabel(invoice.amountCents)}</td>
+        <td>{new Date(invoice.periodStart).toLocaleDateString('zh-CN')} 至 {new Date(invoice.periodEnd).toLocaleDateString('zh-CN')}</td>
+      </tr>)}</tbody>
+    </table></div>}
   </section>;
 }
 
@@ -547,6 +570,7 @@ export function Redeem() {
         <div><dt>可用余额</dt><dd>{money(balances.availableMicros)}</dd></div>
         <div><dt>账面余额</dt><dd>{money(balances.balanceMicros)}</dd></div>
         <div><dt>预占金额</dt><dd>{money(balances.heldMicros)}</dd></div>
+        {balances.refundHeldMicros && balances.refundHeldMicros!=='0' && <div><dt>退款冻结</dt><dd>{money(balances.refundHeldMicros)}</dd></div>}
       </dl> : <p className="muted">{wallet.error ? '暂时无法读取余额。' : '正在读取余额…'}</p>}
       <ErrorNote error={wallet.error} />
       {wallet.error && <button onClick={wallet.refresh}>刷新余额</button>}
@@ -571,15 +595,16 @@ export function Redeem() {
     </section>
     <section className="panel" aria-labelledby="wallet-history"><h2 id="wallet-history">钱包流水</h2>
       <div className="filters"><label>流水类型<select value={kind} onChange={e=>{setKind(e.target.value);setCursors([]);}}>
-        <option value="">全部流水</option><option value="redemption">额度到账</option><option value="usage">模型扣费</option>
+        <option value="">全部流水</option>{Object.entries(ledgerKind).map(([value,label])=>
+          <option key={value} value={value}>{label}</option>)}
       </select></label><button onClick={()=>{history.refresh();wallet.refresh();}}>刷新余额与流水</button></div>
       <ErrorNote error={history.error} />
       {history.data ? history.data.items.length ? <>
         <div className="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>金额</th><th>编号</th></tr></thead>
           <tbody>{history.data.items.map(item=><tr key={item.id}>
             <td>{new Date(item.createdAt).toLocaleString('zh-CN')}</td>
-            <td>{item.kind==='redemption' ? '额度到账' : '模型扣费'}</td>
-            <td>{item.kind==='redemption' ? '+'+money(item.deltaMicros) : '−'+money(String(-BigInt(item.deltaMicros)))}</td>
+            <td>{ledgerKind[item.kind]}</td>
+            <td>{BigInt(item.deltaMicros)>0n ? '+'+money(item.deltaMicros) : '−'+money(String(-BigInt(item.deltaMicros)))}</td>
             <td>{item.requestId ? <a href={'/usage?request_id='+item.requestId}><code>{item.requestId}</code></a> : <code>{item.id}</code>}</td>
           </tr>)}</tbody></table></div>
         <div className="actions"><button disabled={!cursors.length} onClick={()=>setCursors(cursors.slice(0,-1))}>上一页</button>

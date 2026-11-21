@@ -14,6 +14,10 @@ function stripeFixture(url,options) {
   });
   if (path==='/v1/prices/price_fixture_monthly') return reply({
     id:'price_fixture_monthly',object:'price',livemode:false,active:true,currency:'usd',type:'recurring',unit_amount:1000,
+    recurring:{interval:'month',interval_count:1},
+  });
+  if (path==='/v1/prices/price_fixture_credit_20') return reply({
+    id:'price_fixture_credit_20',object:'price',livemode:false,active:true,currency:'usd',type:'one_time',unit_amount:2000,
   });
   if (path==='/v1/checkout/sessions' && options.method==='POST') {
     const form = new URLSearchParams(String(options.body));
@@ -22,12 +26,12 @@ function stripeFixture(url,options) {
     const price = form.get('line_items[0][price]');
     if (!order || new Headers(options.headers).get('idempotency-key')!=='opentoken-checkout-'+order ||
       form.get('metadata[opentoken_order]')!==order || form.get('metadata[opentoken_price]')!==price ||
-      (mode==='subscription' && form.get('subscription_data[metadata][opentoken_order]')!==order)) {
+      form.get((mode==='subscription'?'subscription_data':'payment_intent_data')+'[metadata][opentoken_order]')!==order) {
       throw new Error('Unexpected Stripe Checkout parameters');
     }
     const id = 'cs_test_'+order.replaceAll('-','');
     const session = {id,object:'checkout.session',livemode:false,client_reference_id:order,mode,status:'open',
-      amount_total:mode==='subscription'?1000:500,currency:'usd',payment_status:'unpaid',
+      amount_total:mode==='subscription'?1000:price==='price_fixture_credit_20'?2000:500,currency:'usd',payment_status:'unpaid',
       url:'https://checkout.stripe.com/c/pay/'+id,metadata:{opentoken_order:order,opentoken_price:price}};
     checkouts.set(id,session);
     return reply(session);
@@ -55,6 +59,17 @@ function stripeFixture(url,options) {
     const form = new URLSearchParams(String(options.body));
     if (form.get('customer')!=='cus_fixture' || form.get('configuration')!=='bpc_fixture') throw new Error('Unexpected Stripe portal customer or configuration');
     return reply({id:'bps_fixture',object:'billing_portal.session',livemode:false,url:'https://billing.stripe.com/p/session/fixture'});
+  }
+  if (path==='/v1/billing_portal/configurations/bpc_fixture') return reply({
+    id:'bpc_fixture',object:'billing_portal.configuration',livemode:false,active:true,
+    features:{subscription_cancel:{enabled:true,mode:'at_period_end'}},
+  });
+  if (path.startsWith('/v1/refunds/re_fixture_')) {
+    const id=path.split('/').pop();
+    const asUuid=hex=>hex.replace(/^(\w{8})(\w{4})(\w{4})(\w{4})(\w{12})$/,'$1-$2-$3-$4-$5');
+    const [order,request,state]=id.slice('re_fixture_'.length).split('_').map(asUuid);
+    return reply({id,object:'refund',currency:'usd',payment_intent:'pi_'+order,amount:200,status:state,
+      metadata:{opentoken_order:order,opentoken_refund:request}});
   }
   throw new Error('Unexpected Stripe fixture request');
 }

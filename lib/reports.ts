@@ -15,8 +15,8 @@ export async function dashboard(user: string, tz: string) {
       count(*) FILTER (WHERE status='review')::int AS "reviewCount"
     FROM gateway.usage_requests CROSS JOIN boundary WHERE user_id=$1
   )
-  SELECT balance_micros::text AS "balanceMicros",held_micros::text AS "heldMicros",
-    (balance_micros-held_micros)::text AS "availableMicros",now() AS "asOf",
+  SELECT balance_micros::text AS "balanceMicros",held_micros::text AS "heldMicros",refund_held_micros::text AS "refundHeldMicros",
+    (balance_micros-held_micros-refund_held_micros)::text AS "availableMicros",now() AS "asOf",
     (SELECT count(*)::int FROM gateway.api_keys WHERE user_id=$1 AND status='active') AS "activeKeys",totals.*
   FROM gateway.wallets CROSS JOIN totals WHERE user_id=$1`,[user,tz]);
   return row;

@@ -55,12 +55,15 @@ export async function catalog() {
 }
 
 export async function createKey(user: string, name: string, groupId: string, rpm: number, cap: string | null) {
-  const { db } = await store();
   const secret = 'mg_' + randomBytes(32).toString('base64url');
   const prefix = secret.slice(0, 12);
-  const { rows } = await db.query<{id: string}>(`INSERT INTO gateway.api_keys (user_id,group_id,name,public_prefix,secret_digest,rpm_limit,spend_cap_micros)
-    SELECT $2,group_id,$3,$4,$5,$6,$7 FROM (${availableRateQuery} AND g.id=$8 LIMIT 1) available RETURNING id`,
-    [routeParameters(resolveLiveUpstreams()),user,name,prefix,await digest('api-key',secret),rpm,cap,groupId]);
+  const {rows}=await transaction(async tx=>{
+    await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[user]);
+    await requireKeySlot(tx,user);
+    return tx.query<{id:string}>(`INSERT INTO gateway.api_keys (user_id,group_id,name,public_prefix,secret_digest,rpm_limit,spend_cap_micros)
+      SELECT $2,group_id,$3,$4,$5,$6,$7 FROM (${availableRateQuery} AND g.id=$8 LIMIT 1) available RETURNING id`,
+      [routeParameters(resolveLiveUpstreams()),user,name,prefix,await digest('api-key',secret),rpm,cap,groupId]);
+  });
   if (!rows[0]) throw new Fault(400,'invalid_group','请选择可用分组。');
   return { id:rows[0].id, name, prefix, secret };
 }
@@ -75,10 +78,23 @@ export async function listKeys(user: string) {
 }
 
 export async function updateKey(user: string, id: string, status: 'active' | 'disabled' | 'revoked') {
-  const { db } = await store();
-  const { rows } = await db.query(`UPDATE gateway.api_keys SET status=$3,updated_at=now()
-    WHERE user_id=$1 AND id=$2 AND (status<>'revoked' OR $3='revoked') RETURNING id`,[user,id,status]);
+  const {rows}=await transaction(async tx=>{
+    await tx.query('SELECT 1 FROM gateway.wallets WHERE user_id=$1 FOR UPDATE',[user]);
+    if (status==='active') {
+      const {rows:[key]}=await tx.query<{status:string}>("SELECT status FROM gateway.api_keys WHERE user_id=$1 AND id=$2",[user,id]);
+      if (key?.status==='disabled') await requireKeySlot(tx,user);
+    }
+    return tx.query(`UPDATE gateway.api_keys SET status=$3,updated_at=now()
+      WHERE user_id=$1 AND id=$2 AND (status<>'revoked' OR $3='revoked') RETURNING id`,[user,id,status]);
+  });
   if (!rows.length) throw new Fault(404,'key_not_found','找不到可操作的密钥。');
+}
+
+async function requireKeySlot(tx:import('pg').PoolClient,user:string) {
+  const {rows:[limit]}=await tx.query<{full:boolean}>(`SELECT active_keys<=(
+    SELECT count(*) FROM gateway.api_keys WHERE user_id=$1 AND status='active') AS full
+    FROM gateway.sandbox_billing_limits($1)`,[user]);
+  if (limit?.full) throw new Fault(409,'plan_key_limit','已达到套餐的可用密钥上限。');
 }
 
 type Key = { id: string; user_id: string; group_id: string; status: string; rpm_limit: number;
@@ -121,7 +137,7 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
   const started = Date.now();
   const { id, rate, hold } = await transaction(async tx => {
     if (live) await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
-    const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros)::text AS available
+    const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros-refund_held_micros)::text AS available
       FROM gateway.wallets WHERE user_id=$1 FOR UPDATE`,[key.user_id]);
     const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE id=$1 FOR UPDATE`,[key.id]);
     if (lockedKey.status !== 'active') throw new Fault(401,'invalid_api_key','API 密钥已停用。');
@@ -148,6 +164,14 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
     const { rows:[recent] } = await tx.query<{count:number}>(`SELECT count(*)::int AS count FROM gateway.usage_requests
       WHERE key_id=$1 AND created_at>=now()-interval '60 seconds'`, [key.id]);
     if (recent.count >= lockedKey.rpm_limit) throw new Fault(429,'rate_limit','已达到该密钥每分钟请求上限。');
+    const {rows:[tier]}=await tx.query<{full:boolean;key_allowed:boolean}>(`SELECT rpm<=(
+      SELECT count(*) FROM gateway.usage_requests WHERE user_id=$1 AND created_at>=now()-interval '60 seconds') AS full,
+      active_keys>(SELECT count(*) FROM gateway.api_keys k
+        WHERE k.user_id=$1 AND k.status='active' AND (k.created_at,k.id)<(
+          SELECT created_at,id FROM gateway.api_keys WHERE id=$2)) AS key_allowed
+      FROM gateway.sandbox_billing_limits($1)`,[key.user_id,key.id]);
+    if (tier && !tier.key_allowed) throw new Fault(403,'plan_key_limit','此密钥已超过当前套餐的可用密钥范围。');
+    if (tier?.full) throw new Fault(429,'account_rate_limit','已达到账号每分钟请求上限。');
     const { rows:[entry] } = await tx.query<{id:string}>(`INSERT INTO gateway.usage_requests
       (user_id,key_id,group_id,model_id,rate_id,upstream_model_snapshot,idempotency_key,request_fingerprint,reserved_micros,status,updated_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,'dispatched',clock_timestamp()) RETURNING id`,

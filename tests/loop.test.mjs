@@ -107,6 +107,7 @@ test.before(async () => {
       SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
       STRIPE_TEST_SECRET_KEY:'sk_test_fixture',STRIPE_TEST_WEBHOOK_SECRET:'whsec_fixture',
       STRIPE_TEST_CREDIT_PRICE_ID:'price_fixture_credit',STRIPE_TEST_SUBSCRIPTION_PRICE_ID:'price_fixture_monthly',
+      STRIPE_TEST_CREDIT_20_PRICE_ID:'price_fixture_credit_20',
       STRIPE_TEST_PORTAL_CONFIGURATION_ID:'bpc_fixture',
       GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',...upstreamEnv},
   });
@@ -723,13 +724,18 @@ test('Stripe sandbox subscription reflects authoritative status and protects the
   assert.equal(otherPortal.status,404);
   const initialPeriod = (await record()).periodEnd;
   const beforeRenewal = (await request('/api/dashboard',{sessionOverride})).data;
-  const invoice = {billing_reason:'subscription_cycle',parent:{subscription_details:{subscription}}};
+  const now=Math.floor(Date.now()/1000);
+  const invoice = {id:'in_fixture_renewal',livemode:false,status:'paid',currency:'usd',amount_paid:1000,
+    billing_reason:'subscription_cycle',parent:{subscription_details:{subscription}},
+    lines:{has_more:false,data:[{amount:1000,pricing:{price_details:{price:'price_fixture_monthly'}},period:{start:now-1,end:now+7_200}}]}};
   assert.equal(await stripeEvent('invoice.paid',invoice,{id:'evt_fixture_renewal'}),200);
   const renewed = await record();
   assert.equal(renewed.subscriptionStatus,'active');
   assert.ok(Date.parse(renewed.periodEnd)>Date.parse(initialPeriod),'A paid renewal must advance the displayed period');
   assert.equal(await stripeEvent('invoice.paid',invoice,{id:'evt_fixture_renewal'}),200);
   assert.equal((await record()).periodEnd,renewed.periodEnd);
+  assert.equal((await request('/api/billing',{sessionOverride})).data.invoices.length,1);
+  assert.equal((await request('/api/billing',{sessionOverride})).data.limits.rpm,60);
   assert.equal((await request('/api/dashboard',{sessionOverride})).data.balanceMicros,beforeRenewal.balanceMicros);
   assert.equal(await stripeEvent('invoice.payment_failed',{parent:{subscription_details:{subscription}}}),200);
   assert.equal((await record()).subscriptionStatus,'past_due');
@@ -747,4 +753,38 @@ test('Stripe sandbox subscription reflects authoritative status and protects the
   assert.equal(replacement.status,200,'A proven absent Stripe session no longer blocks a new subscription');
   const {data:{orders}} = await request('/api/billing',{sessionOverride});
   assert.equal(orders.find(item=>item.id===abandoned.id).state,'expired');
+});
+
+test('a signed refund event updates a scoped order and the wallet once',async ()=>{
+  await enableStripeFixture();
+  const sessionOverride=(await request('/api/session/login',loginPayload('pilot-b@example.test'))).headers.get('set-cookie').split(';')[0];
+  const nonce=crypto.randomUUID();
+  const checkout=await request('/api/billing/checkout',{method:'POST',sessionOverride,body:{kind:'credit',amountCents:2000,nonce}});
+  assert.equal(checkout.status,200);
+  assert.equal((await request('/api/billing/checkout',{method:'POST',sessionOverride,body:{kind:'credit',amountCents:500,nonce}})).status,409);
+  const order=checkout.data.id, refund=crypto.randomUUID();
+  const charge={id:'cs_test_'+order.replaceAll('-',''),mode:'payment',client_reference_id:order,livemode:false,
+    amount_total:2000,currency:'usd',metadata:{opentoken_order:order,opentoken_price:'price_fixture_credit_20'},
+    payment_status:'paid',payment_intent:'pi_'+order};
+  assert.equal(await stripeEvent('checkout.session.completed',charge),200);
+  const before=(await request('/api/dashboard',{sessionOverride})).data;
+  await database.exec('RESET ROLE');
+  try {await database.query("SELECT gateway.approve_stripe_refund($1,$2,200,'operator')",[refund,order]);}
+  finally {await database.exec('SET ROLE opentoken_app');}
+  const held=(await request('/api/dashboard',{sessionOverride})).data;
+  assert.equal(BigInt(before.availableMicros)-BigInt(held.availableMicros),2_000_000n);
+  assert.equal(held.refundHeldMicros,'2000000');
+  const event={id:'re_fixture_'+order.replaceAll('-','')+'_'+refund.replaceAll('-','')+'_succeeded',metadata:{opentoken_refund:refund}};
+  assert.equal(await stripeEvent('refund.created',event,{valid:false}),400);
+  assert.equal(await stripeEvent('refund.created',event,{id:'evt_fixture_partialrefund'}),200);
+  assert.equal(await stripeEvent('refund.created',event,{id:'evt_fixture_partialrefund'}),200);
+  assert.equal(await stripeEvent('refund.updated',event),200);
+  const {data:ledger}=await request('/api/wallet/entries?kind=stripe_refund',{sessionOverride});
+  assert.equal(ledger.items.length,1);
+  assert.equal(ledger.items[0].deltaMicros,'-2000000');
+  const {data:billing}=await request('/api/billing',{sessionOverride});
+  assert.deepEqual(billing.rechargeOptions,[500,2000]);
+  assert.equal(billing.orders.find(item=>item.id===order).refundedCents,200);
+  const another=(await request('/api/session/login',loginPayload('pilot-a@example.test'))).headers.get('set-cookie').split(';')[0];
+  assert.equal((await request('/api/billing',{sessionOverride:another})).data.orders.some(item=>item.id===order),false);
 });

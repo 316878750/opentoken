@@ -22,11 +22,15 @@ const pilotTables = [
   'gateway.redeem_attempts', 'gateway.redeem_codes', 'gateway.schema_migrations',
   'gateway.usage_requests', 'gateway.wallet_entries', 'gateway.wallets',
 ];
+const stripeTables=[...pilotTables,'gateway.stripe_orders','gateway.stripe_events','gateway.stripe_sandbox'].sort();
 export function backupTables(versions) {
   const version = JSON.stringify(versions);
   if (version==='["001","002","003","004"]') return pilotTables;
   if (version==='["001","002","003","004","005"]') {
-    return [...pilotTables,'gateway.stripe_orders','gateway.stripe_events','gateway.stripe_sandbox'].sort();
+    return stripeTables;
+  }
+  if (version==='["001","002","003","004","005","006"]') {
+    return [...stripeTables,'gateway.stripe_refunds','gateway.wallet_credit_lots','gateway.stripe_invoices'].sort();
   }
   throw new Error('Unsupported migration version for backup or restore');
 }
@@ -42,6 +46,20 @@ const paymentAccounting = `
     SELECT o.id FROM gateway.stripe_orders o LEFT JOIN gateway.wallet_entries e ON e.redeem_code_id=o.redeemed_code_id
       WHERE o.kind='credit' AND o.state='paid' AND (e.user_id IS DISTINCT FROM o.user_id
         OR e.delta_micros IS DISTINCT FROM o.amount_cents::bigint*10000)`;
+const refundAccounting = `
+    UNION ALL
+    SELECT w.user_id FROM gateway.wallets w
+      LEFT JOIN (SELECT user_id,sum(remaining_micros) AS total,sum(refund_held_micros) AS held
+        FROM gateway.wallet_credit_lots GROUP BY user_id) l USING (user_id)
+      LEFT JOIN (SELECT user_id,sum(amount_cents::bigint*10000) AS held FROM gateway.stripe_refunds
+        WHERE state IN ('approved','pending') GROUP BY user_id) r USING (user_id)
+      WHERE w.balance_micros<>coalesce(l.total,0) OR w.refund_held_micros<>coalesce(l.held,0)
+        OR w.refund_held_micros<>coalesce(r.held,0)
+    UNION ALL
+    SELECT r.id FROM gateway.stripe_refunds r
+      LEFT JOIN (SELECT refund_id,sum(delta_micros) AS net FROM gateway.wallet_entries
+        WHERE refund_id IS NOT NULL GROUP BY refund_id) l ON l.refund_id=r.id
+      WHERE coalesce(l.net,0)<>CASE WHEN r.state='succeeded' THEN r.amount_cents::bigint*-10000 ELSE 0 END`;
 const fingerprint = tables => `SELECT jsonb_build_object('versions', ${migrationVersions},
   'tables', jsonb_build_object(${tables.map(table => `'${table}', (SELECT jsonb_build_array(count(*)::text,
     coalesce(encode(sha256(convert_to(string_agg(digest,' ' ORDER BY digest COLLATE "C"),'UTF8')),'hex'), ''))
@@ -62,6 +80,7 @@ const fingerprint = tables => `SELECT jsonb_build_object('versions', ${migration
     SELECT u.id FROM gateway.usage_requests u LEFT JOIN gateway.wallet_entries e ON e.request_id=u.id
     WHERE (u.status='settled' AND e.delta_micros IS DISTINCT FROM -u.charged_micros)
       OR (u.status<>'settled' AND e.request_id IS NOT NULL)${tables.includes('gateway.stripe_orders') ? paymentAccounting : ''}
+    ${tables.includes('gateway.stripe_refunds') ? refundAccounting : ''}
   ) issues)) AS fingerprint`;
 
 export function encodeBackup(key, manifest, archive) {
@@ -222,6 +241,7 @@ function sqlLiteral(value) {
 async function restore(endpoint, manifest, sql, tables) {
   const {env} = await connectionSettings(endpoint);
   const expected = sqlLiteral(JSON.stringify(manifest.fingerprint));
+  const projectedCredits=tables.includes('gateway.wallet_credit_lots');
   const prepare = `SET standard_conforming_strings TO on; SET lock_timeout TO '5s'; SET statement_timeout TO '120s';
     LOCK TABLE ${tables.join(', ')} IN ACCESS EXCLUSIVE MODE;
     DO $check$ BEGIN
@@ -236,8 +256,10 @@ async function restore(endpoint, manifest, sql, tables) {
         RAISE SQLSTATE 'PBR04'; END IF;
     END $check$;
     DELETE FROM gateway.schema_migrations;
+    ${projectedCredits ? 'ALTER TABLE gateway.wallet_entries DISABLE TRIGGER track_wallet_credit;' : ''}
   `;
   const verify = `\n${formats}
+    ${projectedCredits ? 'ALTER TABLE gateway.wallet_entries ENABLE TRIGGER track_wallet_credit;' : ''}
     DO $check$ BEGIN
       IF (${fingerprint(tables)}) IS DISTINCT FROM ${expected}::jsonb THEN
         RAISE SQLSTATE 'PBR05'; END IF;

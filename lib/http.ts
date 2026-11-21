@@ -17,9 +17,12 @@ const keyInput = z.object({
   name:z.string().trim().min(1).max(80), groupId:z.uuid(), rpm:z.int().min(1).max(600),
   capMicros:z.string().regex(/^[1-9]\d{0,14}$/).nullish(),
 });
-const ledgerFilter = z.object({kind:z.enum(['redemption','usage']).optional(),cursor:z.uuid().optional()});
+const ledgerFilter = z.object({kind:z.enum(['redemption','usage','stripe_refund','stripe_refund_reversal']).optional(),cursor:z.uuid().optional()});
 const trendRange = z.enum(['7','30']).default('7');
-const checkoutInput = z.strictObject({kind:z.enum(['credit','subscription']),nonce:z.uuid()});
+const checkoutInput = z.discriminatedUnion('kind',[
+  z.strictObject({kind:z.literal('credit'),nonce:z.uuid(),amountCents:z.union([z.literal(500),z.literal(2000),z.literal(5000)]).optional()}),
+  z.strictObject({kind:z.literal('subscription'),nonce:z.uuid()}),
+]);
 const redemptionInput = z.strictObject({code:z.string().trim().min(1).max(128)});
 const callInput = z.strictObject({
   model:z.string().min(1).max(64), stream:z.boolean().default(false),
@@ -125,7 +128,7 @@ export async function handle(req: NextRequest) {
     if (route==='GET /api/billing') return json(await billing(user));
     if (route==='POST /api/billing/checkout') {
       const input = parse(checkoutInput,await body(req));
-      return json(await startCheckout(user,input.kind,input.nonce,origin));
+      return json(await startCheckout(user,input.kind,input.nonce,origin,input.kind==='credit' ? input.amountCents : undefined));
     }
     if (route==='POST /api/billing/portal') return json(await startPortal(user,origin));
     if (route === 'POST /api/redeem') {

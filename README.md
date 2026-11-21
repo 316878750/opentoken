@@ -1,5 +1,7 @@
 # OpenToken
 
+[开发进度表](replica/progress.md)记录正式试点、沙盒验收和暂停事项，并附对应的 GitHub 提交。
+
 受邀用户可登录、创建 API 密钥、调用模型，并在控制台核对预占、扣费和释放。试点额度可通过内部一次性兑换码到账，收据和扣费都可在钱包流水中查看。应用连接 Supabase Auth 和 PostgreSQL。`mock-text` 固定返回演示用量。真实非流式文本调用可以接到官方 OpenAI 或配置的 OpenAI 兼容服务。
 
 需要 Node.js 22.9+ 和 pnpm。将 [.env.example](.env.example) 复制到 `.env.local`，在后者配置 Supabase 项目、数据库连接和密钥。创建受邀测试用户后，从项目根目录运行：

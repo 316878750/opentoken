@@ -19,9 +19,19 @@
 - [x] 允许一个兼容上游配置多个模型，每个模型独立配置别名、价格、上限、流式能力和分组。
 - [x] 通过 `db:seed` 发布配置和费率版本。调价关闭原版本并创建新版本，历史请求继续引用原费率。控制台展示分组、倍率和请求方式。
 - [x] 用测试上游验证跨分组请求无法入场，以及两个分组的模型目录、上游选择和费用计算。
-- [ ] 确认新增真实模型的 ID、费率和协议能力，再发布正式目录。
+- [x] 确认首批新增模型的 ID、费率和试点分组，并在隔离目录验证新旧模型并存。
+- [x] 兼容带结束原因的事件同时携带最终用量的 SSE 格式。缺失 `[DONE]`、用量重复或不一致时仍转待核对。在隔离环境重现该格式并核对预占、扣费、释放和单笔流水。
+- [ ] 复验新增模型的真实流式请求能端到端结算。
+- [ ] 发布到正式试点目录。
 
 `UPSTREAM_ADDITIONAL_MODELS_JSON` 是 JSON 数组。新增模型共用当前兼容上游的 URL 和密钥，按模型配置 `alias`、`model`、`inputUsdPerMtok`、`cachedUsdPerMtok`、`outputUsdPerMtok`。可选字段为 `responseModel`、`maxContextTokens`、`tokenField`、`streaming` 和 `groups`。每个分组填写 `code`、`name`、`multiplierBps`，如 `9000` 表示 0.9 倍。省略分组时使用试点分组。新增模型开启流式还需全局启用 `ENABLE_UPSTREAM_STREAMING`。运行 `db:seed` 后再更新托管环境。删除运行配置可撤出目录，历史请求及其引用的费率继续可查。
+
+首批新增模型使用现有试点分组（1 倍），按每百万 Token 收取 9 美元输入费、0.3 美元缓存读取费、27 美元输出费。使用 8,192 Token 的 OpenToken 上下文限额。
+
+```dotenv
+ENABLE_UPSTREAM_STREAMING=1
+UPSTREAM_ADDITIONAL_MODELS_JSON='[{"alias":"deepseek-v4-pro","model":"deepseek-v4-pro","inputUsdPerMtok":"9","cachedUsdPerMtok":"0.3","outputUsdPerMtok":"27","maxContextTokens":8192,"streaming":true}]'
+```
 
 既有模型调价时，数据库与服务配置切换期间会暂时隐藏该模型。持有旧分组密钥的客户端会收到明确的费率不一致错误，且不会预占或扣费。两个配置一致后恢复接入。
 

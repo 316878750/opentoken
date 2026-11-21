@@ -198,14 +198,19 @@ export async function openAiStream(
       requestId ??= providerId(id,upstream.apiKey);
       const [choice] = frame.choices;
       if (choice) {
-        if (finishReason || frame.usage) break;
+        if (finishReason) break;
+        finishReason = choice.finish_reason ?? undefined;
+        // Some compatible providers include final usage in the same frame as the finish reason.
+        if (frame.usage && (upstream.mode!=='compatible' || !finishReason)) break;
         if (choice.delta.content) content.push(choice.delta.content);
         if (choice.delta.refusal) refusal.push(choice.delta.refusal);
-        finishReason = choice.finish_reason ?? undefined;
-      } else {
-        if (!finishReason || !frame.usage) break;
+      }
+      if (frame.usage) {
+        if (!finishReason) break;
         tokens = billedTokens(frame.usage,input,upstream,requestId);
         if (frame.usage.total_tokens!==undefined && frame.usage.total_tokens!==tokens.input+tokens.output) break;
+      } else if (!choice) {
+        break;
       }
     }
   } catch {

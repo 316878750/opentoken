@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
 import { adminAccess, recordLoginEvent } from './admin';
+import { issueAdminRedeem, listAdminRedeem, voidAdminRedeem } from './admin-redeem';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
@@ -26,6 +27,8 @@ const checkoutInput = z.discriminatedUnion('kind',[
   z.strictObject({kind:z.literal('subscription'),nonce:z.uuid()}),
 ]);
 const redemptionInput = z.strictObject({code:z.string().trim().min(1).max(128)});
+const adminRedeemIssueInput = z.strictObject({amountUsd:z.string().max(20),expiresAt:date,operationId:z.uuid()});
+const adminRedeemFilter = z.strictObject({status:z.enum(['active','expired','voided','redeemed']).optional(),cursor:z.uuid().optional()});
 const callInput = z.strictObject({
   model:z.string().min(1).max(64), stream:z.boolean().default(false),
   stream_options:z.strictObject({include_usage:z.boolean().optional()}).optional(),
@@ -33,8 +36,10 @@ const callInput = z.strictObject({
   max_completion_tokens:z.int().min(1).max(128).default(128),
 }).refine(request => request.stream || !request.stream_options);
 
-function json(data: unknown, status = 200) {
-  return NextResponse.json(data,{status,headers:{'cache-control':'no-store'}});
+function json(data: unknown, status = 200, requestId?:string) {
+  const headers:Record<string,string> = {'cache-control':'no-store'};
+  if (requestId) headers['x-request-id'] = requestId;
+  return NextResponse.json(data,{status,headers});
 }
 function parse<T>(schema: z.ZodType<T>, data: unknown): T {
   const result = schema.safeParse(data);
@@ -147,6 +152,18 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route === 'GET /api/admin/redeem-codes') {
+      return json(await listAdminRedeem(user,parse(adminRedeemFilter,Object.fromEntries(req.nextUrl.searchParams))));
+    }
+    if (route === 'POST /api/admin/redeem-codes') {
+      const issued = await issueAdminRedeem(user,parse(adminRedeemIssueInput,await body(req)));
+      return json(issued.body,issued.status,issued.requestId);
+    }
+    const voidCode = method==='POST' && /^\/api\/admin\/redeem-codes\/([^/]+)\/void$/.exec(path);
+    if (voidCode) {
+      const voided = await voidAdminRedeem(user,parse(z.uuid(),voidCode[1]));
+      return json(voided.body,200,voided.requestId);
+    }
     if (route==='GET /api/billing') return json(await billing(user));
     if (route==='POST /api/billing/checkout') {
       const input = parse(checkoutInput,await body(req));

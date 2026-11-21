@@ -2,6 +2,7 @@ import { cookies } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
 import { adminAccess, type AdminRole } from '@/lib/admin';
 import { sessionCookie } from '@/lib/session';
+import { RedeemCodes } from './redeem-codes';
 
 export const dynamic = 'force-dynamic';
 
@@ -31,6 +32,7 @@ export default async function AdminPage() {
           <h1>管理员后台</h1>
           <p>当前角色为{roleLabels[role]}。</p>
         </section>
+        <RedeemCodes key={userId} actorId={userId} canWrite={role!=='auditor'}/>
       </div>
     </main>
   </div>;

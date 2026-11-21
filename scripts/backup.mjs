@@ -37,7 +37,8 @@ export function backupTables(versions) {
   if (version==='["001","002","003","004","005","006","007"]') {
     return paidPilotTables;
   }
-  if (version==='["001","002","003","004","005","006","007","008"]') {
+  if (version==='["001","002","003","004","005","006","007","008"]' ||
+      version==='["001","002","003","004","005","006","007","008","009"]') {
     return [...paidPilotTables,'gateway.admin_roles','gateway.login_events','gateway.admin_audit_events'].sort();
   }
   throw new Error('Unsupported migration version for backup or restore');

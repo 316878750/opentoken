@@ -46,7 +46,7 @@ export async function migrate(client) {
     if (!rowCount) throw new Error('Create a restricted opentoken_app login role before migrating');
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
-      ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql']]) {
+      ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -140,6 +140,11 @@ export async function check(client) {
     NOT has_function_privilege(current_user,'gateway.resolve_billing_request(uuid,text,text,text,integer,integer,integer)','EXECUTE') AS resolve_private,
     NOT has_function_privilege(current_user,'gateway.run_billing_maintenance()','EXECUTE') AS maintenance_private,
     has_function_privilege(current_user,'gateway.redeem_trial_credit(uuid,bytea)','EXECUTE') AS redemption_execute,
+    NOT has_function_privilege(current_user,'gateway.redeem_trial_credit_base(uuid,bytea)','EXECUTE') AS redemption_base_private,
+    has_function_privilege(current_user,'gateway.admin_issue_redeem(uuid,uuid,bytea,bigint,timestamptz,bigint,bigint)','EXECUTE') AS admin_redeem_issue,
+    has_function_privilege(current_user,'gateway.admin_void_redeem(uuid,uuid)','EXECUTE') AS admin_redeem_void,
+    has_function_privilege(current_user,'gateway.admin_list_redeem(uuid,text,uuid)','EXECUTE') AS admin_redeem_list,
+    NOT has_function_privilege(current_user,'gateway.audit_redeem_admin(uuid,text,text,text,jsonb)','EXECUTE') AS redeem_audit_private,
     NOT has_table_privilege(current_user,'gateway.redeem_codes','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_codes_private,
     NOT has_table_privilege(current_user,'gateway.redeem_attempts','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS redeem_attempts_private,
     NOT has_table_privilege(current_user,'gateway.stripe_sandbox','INSERT,UPDATE,DELETE,TRUNCATE') AS stripe_sandbox_private,
@@ -179,7 +184,7 @@ async function main() {
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–008 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–009 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');

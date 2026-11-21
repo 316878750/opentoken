@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import test from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
+import { Client } from 'pg';
 import { adminCommand } from '../scripts/admin.mjs';
 import { check,enableStripeSandbox,migrate,seed } from '../scripts/database.mjs';
 import { redeemCommand } from '../scripts/redeem.mjs';
@@ -18,8 +19,12 @@ const trial = '30000000-0000-4000-8000-000000000003';
 const owner = '30000000-0000-4000-8000-000000000004';
 const staff = '30000000-0000-4000-8000-000000000005';
 const member = '30000000-0000-4000-8000-000000000006';
+const auditStaff = '30000000-0000-4000-8000-000000000007';
+const creditUserA = '30000000-0000-4000-8000-000000000008';
+const creditUserB = '30000000-0000-4000-8000-000000000009';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
-  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member]]);
+  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],
+  ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB]]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -70,7 +75,22 @@ function fakeAuth() {
 }
 
 test.before(async () => {
-  database = await PGlite.create();
+  const nativeUrl = process.env.OPENTOKEN_INTEGRATION_TEST_DATABASE_URL;
+  let appDatabaseUrl;
+  if (nativeUrl) {
+    const target = new URL(nativeUrl);
+    if (target.protocol!=='postgresql:' || target.hostname!=='127.0.0.1' || target.username!=='postgres' ||
+        target.password || !target.port || target.search || target.hash || !/^\/opentoken_test_[a-z0-9_]+$/.test(target.pathname)) {
+      throw new Error('Native integration tests require a fresh loopback opentoken_test_* database');
+    }
+    const client = new Client({connectionString:nativeUrl});
+    await client.connect();
+    database = {exec:sql=>client.query(sql),query:(sql,params)=>client.query(sql,params),close:()=>client.end()};
+    target.username = 'opentoken_app';
+    appDatabaseUrl = target.toString();
+  } else {
+    database = await PGlite.create();
+  }
   await database.exec(`CREATE SCHEMA auth;
     CREATE TABLE auth.users(id uuid PRIMARY KEY,email text NOT NULL,email_confirmed_at timestamptz,
       banned_until timestamptz,deleted_at timestamptz);
@@ -103,19 +123,23 @@ test.before(async () => {
     VALUES ($1,gen_random_uuid(),'redemption',100)`,[primary]),{code:'42501'});
   await assert.rejects(database.query('SELECT * FROM gateway.redeem_codes'),{code:'42501'});
   await assert.rejects(database.query('SELECT * FROM auth.users'),{code:'42501'});
-  socket = new PGLiteSocketServer({db:database,host:'127.0.0.1',port:0,maxConnections:5});
-  await socket.start();
+  if (!appDatabaseUrl) {
+    socket = new PGLiteSocketServer({db:database,host:'127.0.0.1',port:0,maxConnections:5});
+    await socket.start();
+    appDatabaseUrl = 'postgresql://opentoken_app@'+socket.getServerConn()+'/postgres';
+  }
   auth = fakeAuth();
   auth.listen(0,'127.0.0.1');
   await once(auth,'listening');
   server = spawn(process.execPath,['--import','./tests/openai-fixture.mjs','node_modules/next/dist/bin/next','start','--hostname','127.0.0.1','--port','0'],{
     windowsHide:true,stdio:['ignore','pipe','inherit'],env:{...process.env,NEXT_TELEMETRY_DISABLED:'1',
-      DATABASE_URL:'postgresql://opentoken_app@'+socket.getServerConn()+'/postgres',
+      DATABASE_URL:appDatabaseUrl,
       SUPABASE_URL:'http://127.0.0.1:'+auth.address().port,SUPABASE_PUBLISHABLE_KEY:'fixture-key',
       STRIPE_TEST_SECRET_KEY:'sk_test_fixture',STRIPE_TEST_WEBHOOK_SECRET:'whsec_fixture',
       STRIPE_TEST_CREDIT_PRICE_ID:'price_fixture_credit',STRIPE_TEST_SUBSCRIPTION_PRICE_ID:'price_fixture_monthly',
       STRIPE_TEST_CREDIT_20_PRICE_ID:'price_fixture_credit_20',
       STRIPE_TEST_PORTAL_CONFIGURATION_ID:'bpc_fixture',
+      OPERATOR_REDEEM_SINGLE_USD:'2.00',OPERATOR_REDEEM_DAILY_USD:'3.00',
       GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',...upstreamEnv},
   });
   serverExit = once(server,'exit');
@@ -293,6 +317,119 @@ test('application login events record outcomes without storing submitted credent
     assert.notDeepEqual(rows[1].identifier_digest,rows[2].identifier_digest);
     assert.doesNotMatch(JSON.stringify(rows),/example\.test|fixture-password|opentoken_session/);
   } finally { await database.exec('SET ROLE opentoken_app'); }
+});
+
+test('admin redeem codes are write-once secrets with scoped permissions and atomic operator quotas', async () => {
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(auditStaff,'auditor');
+  const emails = ['owner','staff','auditor','member','credit-a','credit-b'];
+  const sessions = await Promise.all(emails.map(async name=>{
+    const loggedIn = await request('/api/session/login',loginPayload(name+'@example.test'));
+    assert.equal(loggedIn.status,200);
+    return loggedIn.headers.get('set-cookie').split(';')[0];
+  }));
+  const [ownerSession,operatorSession,auditorSession,ordinarySession,...redeemerSessions] = sessions;
+  const endpoint = '/api/admin/redeem-codes';
+  const expiresAt = new Date(Date.now()+3_600_000).toISOString();
+  const draft = amountUsd=>({amountUsd,expiresAt,operationId:crypto.randomUUID()});
+  const issue = (sessionOverride,body)=>request(endpoint,{method:'POST',sessionOverride,body});
+  const voidCode = (sessionOverride,id)=>request(endpoint+'/'+id+'/void',{method:'POST',sessionOverride});
+
+  assert.equal((await request(endpoint,{sessionOverride:ordinarySession})).status,403);
+  assert.equal((await issue(ordinarySession,draft('1'))).status,403);
+  assert.equal((await issue(auditorSession,draft('1'))).status,403);
+  assert.equal((await issue(operatorSession,draft('2.01'))).data.error.code,'operator_single_limit');
+  assert.equal((await issue(operatorSession,{...draft('1'),expiresAt:'2000-01-01T00:00:00Z'})).status,400);
+  const ownerIssued = await issue(ownerSession,draft('5'));
+  assert.equal(ownerIssued.status,201);
+  const forbiddenVoid = await voidCode(operatorSession,ownerIssued.data.id);
+  assert.equal(forbiddenVoid.status,403);
+  assert.equal((await voidCode(auditorSession,ownerIssued.data.id)).status,403);
+  assert.equal((await voidCode(ordinarySession,ownerIssued.data.id)).status,403);
+
+  const operation = draft('2');
+  const duplicateIssue = await Promise.all([issue(operatorSession,operation),issue(operatorSession,operation)]);
+  assert.deepEqual(duplicateIssue.map(result=>result.status).sort(),[200,201]);
+  const issued = duplicateIssue.find(result=>result.status===201);
+  const replay = duplicateIssue.find(result=>result.status===200);
+  assert.match(issued.headers.get('cache-control'),/no-store/);
+  assert.match(issued.data.code,/^otc_[A-Za-z0-9_-]{32}$/);
+  assert.equal(replay.data.id,issued.data.id);
+  assert.equal(replay.data.code,undefined);
+  assert.equal((await issue(operatorSession,{...operation,amountUsd:'1'})).status,409);
+  const competing = await Promise.all([issue(operatorSession,draft('0.75')),issue(operatorSession,draft('0.75'))]);
+  assert.deepEqual(competing.map(result=>result.status).sort(),[201,409]);
+  const toVoid = competing.find(result=>result.status===201).data;
+  assert.equal(competing.find(result=>result.status===409).data.error.code,'operator_daily_limit');
+  assert.equal((await voidCode(operatorSession,toVoid.id)).data.status,'voided');
+  assert.equal((await voidCode(operatorSession,toVoid.id)).data.status,'voided');
+  assert.equal((await issue(operatorSession,draft('0.5'))).data.error.code,'operator_daily_limit');
+  const voided = await request(endpoint+'?status=voided',{sessionOverride:operatorSession});
+  assert.deepEqual(voided.data.items.map(row=>row.id),[toVoid.id]);
+  const operatorList = await request(endpoint,{sessionOverride:operatorSession});
+  assert.equal(operatorList.data.items.length,2);
+  const auditorList = await request(endpoint,{sessionOverride:auditorSession});
+  assert.equal(auditorList.data.items.length,3);
+  assert.ok(auditorList.data.items.every(item=>item.issuedBy===null && item.redeemedBy===null));
+  assert.doesNotMatch(JSON.stringify(auditorList.data),/otc_|secret_digest|operationId/);
+  const auditorPage = await fetch(base+'/admin',{headers:{cookie:auditorSession}});
+  const auditorHtml = await auditorPage.text();
+  assert.match(auditorHtml,/兑换码管理/);
+  assert.doesNotMatch(auditorHtml,/签发兑换码/);
+  const ownerPage = await fetch(base+'/admin',{headers:{cookie:ownerSession}});
+  assert.match(await ownerPage.text(),/签发兑换码/);
+  const redeem = (sessionOverride,code)=>request('/api/redeem',{method:'POST',sessionOverride,body:{code}});
+  assert.equal((await redeem(redeemerSessions[0],toVoid.code)).status,404);
+
+  const contenders = await Promise.all(redeemerSessions.map(session=>redeem(session,issued.data.code)));
+  assert.deepEqual(contenders.map(result=>result.status).sort(),[200,404]);
+  const winner = contenders.findIndex(result=>result.status===200);
+  const receipt = contenders[winner].data.receipt;
+  const repeat = await redeem(redeemerSessions[winner],issued.data.code);
+  assert.equal(repeat.data.replayed,true);
+  assert.deepEqual(repeat.data.receipt,receipt);
+  assert.equal(repeat.data.wallet.balanceMicros,'2000000');
+  assert.equal((await request('/api/dashboard',{sessionOverride:redeemerSessions[1-winner]})).data.balanceMicros,'0');
+  const wallet = await request('/api/wallet/entries?kind=redemption',{sessionOverride:redeemerSessions[winner]});
+  assert.deepEqual(wallet.data.items.map(row=>[row.id,row.deltaMicros]),[[receipt.id,'2000000']]);
+  assert.equal((await voidCode(ownerSession,issued.data.id)).status,409);
+  assert.equal((await request(endpoint+'?status=redeemed',{sessionOverride:operatorSession})).data.items[0].receiptId,receipt.id);
+
+  await withDatabaseOwner(async()=>{
+    await assert.rejects(redeemCommand(admin,['void',ownerIssued.data.id]),/administrator console/);
+    await database.exec(`ALTER TABLE gateway.admin_audit_events ADD CONSTRAINT fixture_block_credit_audit
+      CHECK (action<>'redeem.credit') NOT VALID`);
+  });
+  try {
+    const loserSession = redeemerSessions[1-winner];
+    assert.equal((await redeem(loserSession,ownerIssued.data.code)).status,500);
+    assert.equal((await request('/api/dashboard',{sessionOverride:loserSession})).data.balanceMicros,'0');
+    assert.deepEqual((await request('/api/wallet/entries?kind=redemption',{sessionOverride:loserSession})).data.items,[]);
+    assert.equal((await request(endpoint+'?status=active',{sessionOverride:ownerSession})).data.items[0].id,ownerIssued.data.id);
+  } finally {
+    await withDatabaseOwner(()=>database.exec('ALTER TABLE gateway.admin_audit_events DROP CONSTRAINT fixture_block_credit_audit'));
+  }
+
+  await withDatabaseOwner(async()=>{
+    const {rows} = await database.query(`SELECT request_id,action,actor_user_id,outcome,reason,details FROM gateway.admin_audit_events
+      WHERE details->>'codeId'=$1 ORDER BY occurred_at`,[issued.data.id]);
+    assert.deepEqual(rows.map(row=>[row.action,row.outcome]),[
+      ['redeem.issue','success'],['redeem.credit','success'],['redeem.void','denied'],
+    ]);
+    assert.equal(rows[0].actor_user_id,staff);
+    assert.equal(rows[0].request_id,issued.headers.get('x-request-id'));
+    assert.equal(rows[1].details.receiptId,receipt.id);
+    assert.equal(rows[1].details.amountMicros,receipt.amountMicros);
+    assert.equal(rows[1].actor_user_id,[creditUserA,creditUserB][winner]);
+    assert.doesNotMatch(JSON.stringify(rows),/otc_|secret_digest/);
+    const {rows:[denial]} = await database.query(`SELECT reason,outcome FROM gateway.admin_audit_events WHERE request_id=$1`,
+      [forbiddenVoid.headers.get('x-request-id')]);
+    assert.deepEqual(denial,{reason:'forbidden',outcome:'denied'});
+    const {rows:[voidAudit]} = await database.query(`SELECT count(*)::int AS count FROM gateway.admin_audit_events
+      WHERE action='redeem.void' AND outcome='success' AND details->>'codeId'=$1`,[toVoid.id]);
+    assert.equal(voidAudit.count,1);
+  });
 });
 
 test('mock call settles once, hides the API key and isolates independent users', async () => {

@@ -19,11 +19,11 @@ type WalletPage = {items:WalletEntry[];nextCursor:string|null};
 type CreditReceipt = {receipt:{id:string;amountMicros:string;createdAt:string};replayed:boolean;
   wallet:Pick<Wallet,'balanceMicros'|'heldMicros'|'refundHeldMicros'|'availableMicros'>};
 
-class ApiError extends Error {
+export class ApiError extends Error {
   constructor(public status:number, message:string, public requestId?:string) { super(message); }
 }
 
-async function api<T>(url:string, options:RequestInit = {}): Promise<T> {
+export async function api<T>(url:string, options:RequestInit = {}): Promise<T> {
   const response = await fetch(url,{ ...options,cache:'no-store',headers:{
     ...options.headers,...(options.body ? {'Content-Type':'application/json'} : {}),
   } });
@@ -37,7 +37,7 @@ async function api<T>(url:string, options:RequestInit = {}): Promise<T> {
   return data;
 }
 
-function useData<T>(url:string, interval = 0) {
+export function useData<T>(url:string, interval = 0) {
   const [snapshot,setSnapshot] = useState<{url:string;data:T}>();
   const [error,setError] = useState('');
   const [reload,refresh] = useState(0);
@@ -66,7 +66,7 @@ function useData<T>(url:string, interval = 0) {
     }};
 }
 
-function money(micros: string | null) {
+export function money(micros: string | null) {
   if (micros===null) return '待确认';
   const value = BigInt(micros);
   const remainder = (value % 1_000_000n).toString().padStart(6,'0').replace(/0+$/,'').padEnd(2,'0');

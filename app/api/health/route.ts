@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { digest, store } from '@/lib/data';
+import { channelCredentials } from '@/lib/channel-credentials';
 import { appOrigin } from '@/lib/session';
 import { resolveLiveUpstreams } from '@/lib/upstream-config.mjs';
 
@@ -16,7 +17,8 @@ async function checkDatabase() {
     has_function_privilege(to_regprocedure('gateway.redeem_trial_credit(uuid,bytea)'),'EXECUTE') AND
     has_column_privilege(to_regclass('gateway.login_events'),'request_id','INSERT') AND
     has_function_privilege(to_regprocedure('gateway.admin_role_for(uuid)'),'EXECUTE') AND
-    has_function_privilege(to_regprocedure('gateway.authorize_admin(uuid,uuid,text)'),'EXECUTE') AS ready`);
+    has_function_privilege(to_regprocedure('gateway.authorize_admin(uuid,uuid,text)'),'EXECUTE') AND
+    has_table_privilege(to_regclass('gateway.channel_runtime_routes'),'SELECT') AS ready`);
   if (!row.ready) throw new Error('Gateway schema is unavailable');
 }
 
@@ -40,6 +42,7 @@ async function checkAuth() {
 async function checkRuntime() {
   digest('health','readiness');
   resolveLiveUpstreams();
+  channelCredentials();
 }
 
 function ready() {

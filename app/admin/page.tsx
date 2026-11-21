@@ -22,6 +22,7 @@ export default async function AdminPage() {
       <a className="brand" href="/dashboard">OpenToken</a>
       <nav aria-label="管理员后台">
         <a href="/admin" aria-current="page">管理员后台</a>
+        {role!=='auditor' && <a href="/admin/channels">渠道管理</a>}
         <a href="/dashboard">返回控制台</a>
       </nav>
     </aside>

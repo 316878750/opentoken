@@ -22,8 +22,9 @@ const member = '30000000-0000-4000-8000-000000000006';
 const auditStaff = '30000000-0000-4000-8000-000000000007';
 const creditUserA = '30000000-0000-4000-8000-000000000008';
 const creditUserB = '30000000-0000-4000-8000-000000000009';
+const channelUser = '30000000-0000-4000-8000-000000000011';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
-  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],
+  ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],
   ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB]]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
@@ -140,6 +141,12 @@ test.before(async () => {
       STRIPE_TEST_CREDIT_20_PRICE_ID:'price_fixture_credit_20',
       STRIPE_TEST_PORTAL_CONFIGURATION_ID:'bpc_fixture',
       OPERATOR_REDEEM_SINGLE_USD:'2.00',OPERATOR_REDEEM_DAILY_USD:'3.00',
+      CHANNEL_CREDENTIALS_JSON:JSON.stringify({blue:{type:'compatible',baseUrl:'https://managed-provider.example/v1',env:'CHANNEL_FIXTURE_BLUE'},
+        green:{type:'compatible',baseUrl:'https://managed-provider.example/v1',env:'CHANNEL_FIXTURE_GREEN'},
+        legacy:{type:'compatible',baseUrl:'https://provider.example/v1',env:'CHANNEL_FIXTURE_LEGACY'},
+        rejected:{type:'compatible',baseUrl:'https://managed-provider.example/v1',env:'CHANNEL_FIXTURE_BAD'}}),
+      CHANNEL_FIXTURE_BLUE:'test-provider-blue',CHANNEL_FIXTURE_GREEN:'test-provider-green',CHANNEL_FIXTURE_BAD:'test-provider-bad',
+      CHANNEL_FIXTURE_LEGACY:'fixture-key',
       GATEWAY_SECRET:'01'.repeat(32),APP_ORIGIN:'',DEMO_DELAY_MS:'5000',...upstreamEnv},
   });
   serverExit = once(server,'exit');
@@ -924,6 +931,144 @@ async function enableStripeFixture() {
     }
   } finally { await database.exec('SET ROLE opentoken_app'); }
 }
+
+test('managed channel lifecycle preserves one route and the billing snapshot', async () => {
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  const logins = await Promise.all(['owner','staff','channel'].map(name=>request('/api/session/login',loginPayload(name+'@example.test'))));
+  const [adminCookie,operatorCookie,userCookie] = logins.map(login=>{
+    assert.equal(login.status,200);
+    return login.headers.getSetCookie().map(value=>value.split(';')[0]).join('; ');
+  });
+  const channelPage = (cookie)=>fetch(base+'/admin/channels',{headers:{cookie}});
+  assert.equal((await channelPage(userCookie)).status,404);
+  assert.match(await (await channelPage(adminCookie)).text(),/渠道管理/);
+  const expires = new Date(Date.now()+3_600_000).toISOString();
+  const funding = await withDatabaseOwner(async()=>{
+    await database.exec(`INSERT INTO gateway.models(code,upstream_model,max_context_tokens,max_output_tokens)
+      VALUES ('managed-chat','vendor/managed',8192,128);
+      INSERT INTO gateway.model_rates(model_id,group_id,input_micros_per_mtok,cached_input_micros_per_mtok,output_micros_per_mtok,multiplier_bps)
+      SELECT m.id,g.id,200000,40000,600000,10000 FROM gateway.models m CROSS JOIN gateway.pricing_groups g
+      WHERE m.code='managed-chat' AND g.code='pilot';`);
+    return redeemCommand(admin,['issue','3',expires]);
+  });
+  assert.equal((await request('/api/redeem',{method:'POST',sessionOverride:userCookie,body:{code:funding.code}})).status,200);
+  const catalog = await request('/api/catalog',{sessionOverride:userCookie});
+  const groupId = catalog.data.rates.find(rate=>rate.model==='mock-text').groupId;
+  const key = await request('/api/keys',{method:'POST',sessionOverride:userCookie,body:{name:'managed-test',groupId,rpm:20}});
+  const token = key.data.secret;
+  assert.equal(key.status,201);
+  const basePath = '/api/admin/channels';
+  const post = (path,body,sessionOverride=adminCookie)=>request(basePath+path,{method:'POST',sessionOverride,body});
+  const binding = {model:'managed-chat',group:'pilot',upstreamModel:'vendor/managed',streaming:false,tokenField:'max_tokens'};
+  const draft = (name,credentialRef,policy={priority:10,weight:100,automaticFailover:false,autoPublishModels:[]})=>
+    ({name,credentialRef,bindings:[binding],policy});
+  assert.equal((await request(basePath,{sessionOverride:userCookie})).status,403);
+  assert.equal((await post('',draft('Denied','blue'),operatorCookie)).status,403);
+  const standby = await post('',{...draft('Standby','green'),bindings:[{...binding,streaming:true}]});
+  assert.equal(standby.status,201);
+  const policy = {priority:20,weight:60,automaticFailover:true,standbyChannelId:standby.data.id,
+    failoverThreshold:4,failoverCooldownSeconds:120,autoPublishModels:['vendor/managed'],autoPublishGroup:'pilot',discoveryIntervalMinutes:30};
+  const first = await post('',draft('Primary','blue',policy));
+  assert.equal(first.status,201);
+  const path = '/'+first.data.id;
+  const oldVersion = first.data.versionId;
+  const reason = 'isolated verification';
+  const run = ()=>request('/v1/chat/completions',{method:'POST',token,session:false,body:{model:'managed-chat',
+    messages:[{role:'user',content:'managed test'}],max_completion_tokens:16}});
+  const listed = async()=> (await request('/v1/models',{token,session:false})).data.data.some(model=>model.id==='managed-chat');
+  assert.equal(await listed(),false);
+  assert.equal((await post(path+'/enable',{versionId:oldVersion,reason})).status,409);
+  assert.equal((await post(path+'/test',{versionId:oldVersion,binding:0})).data.status,'passed');
+  await withDatabaseOwner(()=>assert.rejects(enableStripeSandbox(admin),/separate database/));
+  const redacted = await request(basePath,{sessionOverride:operatorCookie});
+  assert.equal(redacted.status,200);
+  assert.doesNotMatch(JSON.stringify(redacted.data),/test-provider-|credentialRef/);
+  assert.equal((await post(path+'/enable',{versionId:oldVersion,reason})).status,200);
+
+  for (const [upstreamModel,expected] of Object.entries({'vendor/missing':'model_unavailable','vendor/timeout':'timeout','vendor/no-cache':'unverified'})) {
+    const invalid = await post(path+'/versions',{...draft('Primary','blue'),bindings:[{...binding,upstreamModel}]});
+    assert.equal(invalid.status,201);
+    assert.equal((await post(path+'/test',{versionId:invalid.data.versionId,binding:0})).data.status,expected);
+    assert.equal((await post(path+'/enable',{versionId:invalid.data.versionId,reason})).status,409);
+  }
+  assert.equal((await post(path+'/enable',{versionId:oldVersion,reason})).data.error.code,'channel_stale_draft');
+  assert.equal(await listed(),true);
+  assert.deepEqual((await request(basePath,{sessionOverride:adminCookie})).data.items.find(c=>c.id===first.data.id).active.policy,policy);
+  await withDatabaseOwner(async()=>{
+    const [legacy] = resolveLiveUpstreams(upstreamEnv);
+    await seed(admin,undefined,[{...legacy,alias:'managed-chat',model:'vendor/managed',inputMicros:'900000'}]);
+    const {rows:[rate]} = await database.query(`SELECT r.input_micros_per_mtok::text AS price FROM gateway.model_rates r
+      JOIN gateway.models m ON m.id=r.model_id WHERE r.closed_at IS NULL AND m.code='managed-chat'`);
+    assert.equal(rate.price,'200000');
+  });
+  const competing = '/'+standby.data.id;
+  assert.equal((await post(competing+'/test',{versionId:standby.data.versionId,binding:0})).data.status,'passed');
+  assert.equal((await post(competing+'/enable',{versionId:standby.data.versionId,reason})).status,409);
+
+  const running = run();
+  let pending;
+  for (let attempt=0;attempt<40 && !pending;attempt++) {
+    const result = await request('/api/usage?status=dispatched',{sessionOverride:userCookie});
+    pending = result.data.items[0];
+    if (!pending) await sleep(25);
+  }
+  assert.equal(pending?.reservedMicros,'1648');
+  assert.equal((await request('/api/dashboard',{sessionOverride:userCookie})).data.heldMicros,'1648');
+  assert.equal((await post(path+'/disable',{reason})).status,200);
+  assert.equal(await listed(),false);
+  assert.equal((await run()).status,400);
+  const completed = await running;
+  assert.equal(completed.status,200);
+  assert.equal(completed.data.choices[0].message.content,'blue');
+  const settled = (await request('/api/usage?request_id='+completed.data.id,{sessionOverride:userCookie})).data.items[0];
+  assert.deepEqual([settled.reservedMicros,settled.chargedMicros,settled.releasedMicros,settled.ledgerDeltaMicros],['1648','4','1644','-4']);
+  assert.equal((await request('/api/dashboard',{sessionOverride:userCookie})).data.heldMicros,'0');
+  assert.equal((await post(path+'/enable',{versionId:oldVersion,reason})).status,200);
+
+  const bad = await post(path+'/versions',draft('Primary','rejected',policy));
+  assert.equal((await post(path+'/test',{versionId:bad.data.versionId,binding:0})).data.status,'auth_failed');
+  assert.equal((await post(path+'/enable',{versionId:bad.data.versionId,reason})).status,409);
+  const rotated = await post(path+'/versions',{...draft('Primary','green',policy),bindings:[{...binding,streaming:true}]});
+  assert.equal(rotated.status,201);
+  assert.equal((await post(path+'/test',{versionId:rotated.data.versionId,binding:0})).data.status,'passed');
+  assert.equal((await post(path+'/enable',{versionId:rotated.data.versionId,reason},adminCookie.split('; ')[0])).status,403);
+  assert.equal((await post(path+'/enable',{versionId:rotated.data.versionId,reason})).status,200);
+  const green = await run();
+  assert.equal(green.data.choices[0].message.content,'green');
+  const streaming = await fetch(base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},
+    body:JSON.stringify({model:'managed-chat',stream:true,messages:[{role:'user',content:'managed SSE'}],max_completion_tokens:16})});
+  assert.equal(streaming.status,200);
+  const sse = await streaming.text();
+  assert.match(sse,/green/);
+  assert.match(sse,/\[DONE\]/);
+  assert.equal((await post(path+'/rollback',{versionId:oldVersion,reason})).status,200);
+  const reverted = await run();
+  assert.equal(reverted.data.choices[0].message.content,'blue');
+  await withDatabaseOwner(async()=>{
+    const {rows} = await database.query(`SELECT u.channel_version_id,u.charged_micros::text,e.delta_micros::text
+      FROM gateway.usage_requests u JOIN gateway.wallet_entries e ON e.request_id=u.id
+      WHERE u.user_id=$1 ORDER BY u.created_at`,[channelUser]);
+    assert.deepEqual(rows.map(row=>[row.channel_version_id,row.charged_micros,row.delta_micros]),
+      [[oldVersion,'4','-4'],[rotated.data.versionId,'4','-4'],[rotated.data.versionId,'4','-4'],[oldVersion,'4','-4']]);
+  });
+  assert.equal((await request('/api/dashboard',{sessionOverride:userCookie})).data.balanceMicros,'2999984');
+
+  const getLegacy = async()=> (await request(basePath,{sessionOverride:adminCookie})).data.legacy.find(item=>item.model==='compatible-chat');
+  const legacyListed = async()=> (await request('/v1/models',{token,session:false})).data.data.some(model=>model.id==='compatible-chat');
+  assert.deepEqual(await getLegacy(),{model:'compatible-chat',group:'pilot',status:'ready',credentialRegistered:true});
+  assert.equal(await legacyListed(),true);
+  const adoption = await post('',{...draft('Imported route','legacy'),bindings:[{...binding,model:'compatible-chat',upstreamModel:'vendor/text-model'}]});
+  assert.equal(adoption.status,201);
+  const imported = '/'+adoption.data.id;
+  const versionId = adoption.data.versionId;
+  assert.equal((await post(imported+'/test',{versionId,binding:0})).data.status,'passed');
+  assert.equal((await post(imported+'/enable',{versionId,reason})).status,200);
+  assert.equal((await getLegacy()).status,'managed');
+  assert.equal(await legacyListed(),true);
+  assert.equal((await post(imported+'/disable',{reason})).status,200);
+  assert.equal(await legacyListed(),false);
+});
 
 test('Stripe sandbox checkout uses signed paid events and credits the wallet exactly once', async () => {
   const login = await request('/api/session/login',loginPayload('pilot-a@example.test'));

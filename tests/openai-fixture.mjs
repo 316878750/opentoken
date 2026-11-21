@@ -78,6 +78,28 @@ globalThis.fetch = async (input,options) => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   if (url.origin==='http://127.0.0.1' || url.origin.startsWith('http://127.0.0.1:')) return originalFetch(input,options);
   if (url.origin==='https://api.stripe.com') return stripeFixture(url,options);
+  if (url.href==='https://managed-provider.example/v1/chat/completions') {
+    const model = JSON.parse(options.body).model;
+    const auth = new Headers(options.headers).get('authorization');
+    if (options.redirect!=='error' || !['Bearer test-provider-blue','Bearer test-provider-green','Bearer test-provider-bad'].includes(auth)) {
+      throw new Error('Unexpected managed channel credentials or redirect policy');
+    }
+    if (auth==='Bearer test-provider-bad') return new Response('denied',{status:401});
+    if (model==='vendor/timeout') return new Response(new ReadableStream({start(controller) {
+      controller.error(new DOMException('fixture timeout','TimeoutError'));
+    }}));
+    if (!['vendor/managed','vendor/no-cache'].includes(model)) return new Response('not found',{status:404});
+    await new Promise(resolve=>setTimeout(resolve,650));
+    const content = auth.endsWith('blue') ? 'blue' : 'green';
+    const body = JSON.parse(options.body);
+    const usage = {prompt_tokens:14,completion_tokens:2,...(model==='vendor/no-cache'?{}:{prompt_tokens_details:{cached_tokens:4}})};
+    if (body.stream) {
+      const frame = (choices,extra)=>'data: '+JSON.stringify({id:'managed-sse',model,object:'chat.completion.chunk',choices,...extra})+'\n\n';
+      return new Response(frame([{index:0,delta:{content},finish_reason:'stop'}])+frame([],{usage})+'data: [DONE]\n\n',
+        {headers:{'content-type':'text/event-stream'}});
+    }
+    return Response.json({model,choices:[{index:0,message:{role:'assistant',content},finish_reason:'stop'}],usage});
+  }
   if (url.href!=='https://provider.example/v1/chat/completions') throw new Error('Unexpected external request in integration test');
   const request = JSON.parse(options.body);
   await new Promise(resolve => setTimeout(resolve,1500));

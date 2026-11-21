@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
-import { adminAccess, recordLoginEvent } from './admin';
+import { adminAccess, hasRecentAdminAuth, recordLoginEvent, setRecentAdminAuth } from './admin';
 import { issueAdminRedeem, listAdminRedeem, voidAdminRedeem } from './admin-redeem';
+import { channelDraftInput, channelProbeInput, channelDisableInput, channelPublishInput, changeChannel,
+  listChannels, probeChannel, saveChannel } from './admin-channels';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
@@ -133,6 +135,7 @@ export async function handle(req: NextRequest) {
       const response = json({ok:true});
       response.headers.set('x-request-id',requestId);
       setSession(response,origin,data.session.access_token,data.session.expires_in);
+      setRecentAdminAuth(response,origin,data.session.access_token);
       return response;
     }
     const token = req.cookies.get(sessionCookie)?.value;
@@ -148,10 +151,37 @@ export async function handle(req: NextRequest) {
       await endSession(token).catch(() => console.error('Supabase session revoke failed'));
       const response = new NextResponse(null,{status:204,headers:{'cache-control':'no-store'}});
       setSession(response,origin);
+      setRecentAdminAuth(response,origin);
       return response;
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route === 'GET /api/admin/channels') return json(await listChannels(user));
+    if (route === 'POST /api/admin/channels') {
+      const saved = await saveChannel(user,parse(channelDraftInput,await body(req)));
+      return json(saved,201,saved.requestId);
+    }
+    const channelAction = method==='POST' && /^\/api\/admin\/channels\/([^/]+)\/(versions|test|enable|disable|rollback)$/.exec(path);
+    if (channelAction) {
+      const id = parse(z.uuid(),channelAction[1]);
+      const action = channelAction[2];
+      if (action==='versions') {
+        const saved = await saveChannel(user,parse(channelDraftInput,await body(req)),id);
+        return json(saved,201,saved.requestId);
+      }
+      if (action==='test') {
+        const tested = await probeChannel(user,id,parse(channelProbeInput,await body(req)));
+        return json(tested,200,tested.requestId);
+      }
+      if (action==='disable') {
+        const {reason} = parse(channelDisableInput,await body(req));
+        const updated = await changeChannel(user,id,action,reason);
+        return json(updated,200,updated.requestId);
+      }
+      const {versionId,reason} = parse(channelPublishInput,await body(req));
+      const updated = await changeChannel(user,id,action==='rollback'?'rollback':'enable',reason,versionId,hasRecentAdminAuth(req,token));
+      return json(updated,200,updated.requestId);
+    }
     if (route === 'GET /api/admin/redeem-codes') {
       return json(await listAdminRedeem(user,parse(adminRedeemFilter,Object.fromEntries(req.nextUrl.searchParams))));
     }

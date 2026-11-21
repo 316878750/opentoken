@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { after } from 'next/server';
 import { digest, store, transaction } from './data';
+import { channelCredentials, channelRoutingLock, type ChannelCredential } from './channel-credentials';
 import { mockCompletion, mockModel, openAiCompletion, openAiStream, UpstreamError, type CompletionInput, type TextDelta } from './upstream';
-import { resolveLiveUpstreams } from './upstream-config.mjs';
+import { resolveLiveUpstreams, type LiveUpstream } from './upstream-config.mjs';
 
 export class Fault extends Error {
   constructor(public status: number, public code: string, message: string, public requestId?: string) { super(message); }
@@ -12,46 +13,63 @@ type Rate = {
   rate_id: string; model_id: string; group_id: string; model: string; upstream_model: string;
   max_context_tokens: number; max_output_tokens: number; input_rate: string; cache_rate: string;
   output_rate: string; multiplier: number; group_name: string; in_sync:boolean;
+  route_mode:'official'|'compatible'|null; streaming:boolean; channel_version_id:string|null; credential_ref:string|null;
+  response_model:string|null; token_field:LiveUpstream['tokenField']|null;
 };
 
-const inSync = `(route.mode IS DISTINCT FROM 'compatible' OR (
+const inSync = `(managed.version_id IS NOT NULL OR route.mode IS DISTINCT FROM 'compatible' OR (
     m.max_context_tokens=route.max_context AND m.max_output_tokens=route.max_output
     AND r.input_micros_per_mtok=route.input_rate AND r.cached_input_micros_per_mtok=route.cache_rate
     AND r.output_micros_per_mtok=route.output_rate AND r.multiplier_bps=route.multiplier
   ))`;
 const rateQuery = `SELECT r.id AS rate_id, m.id AS model_id, g.id AS group_id, m.code AS model,
-  m.upstream_model, m.max_context_tokens, m.max_output_tokens, g.name AS group_name, ${inSync} AS in_sync,
+  coalesce(managed.upstream_model,m.upstream_model) AS upstream_model,
+  m.max_context_tokens, m.max_output_tokens, g.name AS group_name, ${inSync} AS in_sync,
+  coalesce(managed.adapter,route.mode) AS route_mode,
+  coalesce(managed.streaming AND ($1::jsonb->>'managedStreaming')='true',route.streaming,false) AS streaming,
+  managed.version_id AS channel_version_id,managed.credential_ref,managed.response_model,managed.token_field,
   r.input_micros_per_mtok::text AS input_rate, r.cached_input_micros_per_mtok::text AS cache_rate,
   r.output_micros_per_mtok::text AS output_rate, r.multiplier_bps AS multiplier
   FROM gateway.model_rates r JOIN gateway.models m ON m.id=r.model_id JOIN gateway.pricing_groups g ON g.id=r.group_id
-  LEFT JOIN jsonb_to_recordset($1::jsonb) AS route(alias text, model text, group_code text, mode text,
-    max_context integer, max_output integer, input_rate bigint, cache_rate bigint, output_rate bigint, multiplier integer)
+  LEFT JOIN gateway.channel_runtime_routes managed ON managed.model_id=m.id AND managed.group_id=g.id
+  LEFT JOIN jsonb_to_recordset($1::jsonb->'legacy') AS route(alias text, model text, group_code text, mode text,
+    max_context integer, max_output integer, input_rate bigint, cache_rate bigint, output_rate bigint, multiplier integer,streaming boolean)
     ON route.alias=m.code AND route.model=m.upstream_model AND route.group_code=g.code
   WHERE r.closed_at IS NULL AND m.enabled AND g.enabled
     AND ((m.code='${mockModel}' AND m.upstream_model='${mockModel}') OR
-      (route.alias IS NOT NULL AND NOT EXISTS (SELECT 1 FROM gateway.stripe_sandbox WHERE enabled)))`;
+      (NOT EXISTS (SELECT 1 FROM gateway.stripe_sandbox WHERE enabled) AND CASE WHEN managed.version_id IS NULL THEN route.alias IS NOT NULL
+        ELSE managed.effective AND ($1::jsonb->'credentials')->>managed.credential_ref=managed.credential_fingerprint END))`;
 const availableRateQuery = `${rateQuery} AND ${inSync}`;
 
-function routeParameters(providers:ReturnType<typeof resolveLiveUpstreams>) {
-  return JSON.stringify(providers.flatMap(provider=>provider.groups.map(group=>({
+function routeParameters(providers=resolveLiveUpstreams(),credentials=channelCredentials()) {
+  const legacy = providers.flatMap(provider=>provider.groups.map(group=>({
     alias:provider.alias,model:provider.model,mode:provider.mode,group_code:group.code,
     max_context:provider.maxContextTokens,max_output:provider.maxOutputTokens,
     input_rate:provider.inputMicros,cache_rate:provider.cacheMicros,output_rate:provider.outputMicros,multiplier:group.multiplierBps,
-  }))));
+    streaming:provider.streaming,
+  })));
+  const approved = process.env.ENABLE_OPENAI==='1' ? credentials : [];
+  return JSON.stringify({legacy,managedStreaming:process.env.ENABLE_UPSTREAM_STREAMING==='1',
+    credentials:Object.fromEntries(approved.map(entry=>[entry.ref,entry.fingerprint]))});
+}
+
+function managedUpstream(rate:Rate,credentials:ChannelCredential[]):LiveUpstream {
+  const credential = credentials.find(entry=>entry.ref===rate.credential_ref);
+  if (!credential || !rate.response_model || !rate.token_field) throw new Error('Invalid managed route');
+  return {mode:credential.type,alias:rate.model,model:rate.upstream_model,responseModel:rate.response_model,
+    endpoint:credential.endpoint,apiKey:credential.apiKey,tokenField:rate.token_field,maxContextTokens:rate.max_context_tokens,
+    maxOutputTokens:rate.max_output_tokens,streaming:rate.streaming,inputMicros:rate.input_rate,
+    cacheMicros:rate.cache_rate,outputMicros:rate.output_rate,groups:[]};
 }
 
 export async function catalog() {
   const { db } = await store();
-  const providers = resolveLiveUpstreams();
-  const { rows } = await db.query<Rate>(availableRateQuery,[routeParameters(providers)]);
-  return rows.map(r => {
-    const provider = providers.find(item=>item.alias===r.model);
-    return {groupId:r.group_id,groupName:r.group_name,model:r.model,inputMicros:r.input_rate,
+  const { rows } = await db.query<Rate>(availableRateQuery,[routeParameters()]);
+  return rows.map(r => ({groupId:r.group_id,groupName:r.group_name,model:r.model,inputMicros:r.input_rate,
       cacheMicros:r.cache_rate,outputMicros:r.output_rate,multiplierBps:r.multiplier,
       maxContextTokens:r.max_context_tokens,maxOutputTokens:r.max_output_tokens,
-      upstream:r.model===mockModel ? 'mock' : provider?.mode==='compatible' ? 'compatible' : 'openai',
-      streaming:r.model===mockModel || provider?.streaming===true};
-  });
+      upstream:r.model===mockModel ? 'mock' : r.route_mode==='compatible' ? 'compatible' : 'openai',
+      streaming:r.model===mockModel || r.streaming}));
 }
 
 export async function createKey(user: string, name: string, groupId: string, rpm: number, cap: string | null) {
@@ -62,7 +80,7 @@ export async function createKey(user: string, name: string, groupId: string, rpm
     await requireKeySlot(tx,user);
     return tx.query<{id:string}>(`INSERT INTO gateway.api_keys (user_id,group_id,name,public_prefix,secret_digest,rpm_limit,spend_cap_micros)
       SELECT $2,group_id,$3,$4,$5,$6,$7 FROM (${availableRateQuery} AND g.id=$8 LIMIT 1) available RETURNING id`,
-      [routeParameters(resolveLiveUpstreams()),user,name,prefix,await digest('api-key',secret),rpm,cap,groupId]);
+      [routeParameters(),user,name,prefix,await digest('api-key',secret),rpm,cap,groupId]);
   });
   if (!rows[0]) throw new Fault(400,'invalid_group','请选择可用分组。');
   return { id:rows[0].id, name, prefix, secret };
@@ -115,10 +133,9 @@ async function findKey(header: string | null) {
 export async function models(header: string | null) {
   const key = await findKey(header);
   const { db } = await store();
-  const providers = resolveLiveUpstreams();
-  const { rows } = await db.query<Rate>(availableRateQuery + ' AND g.id=$2',[routeParameters(providers),key.group_id]);
+  const { rows } = await db.query<Rate>(availableRateQuery + ' AND g.id=$2',[routeParameters(),key.group_id]);
   return { object:'list', data:rows.map(r => ({ id:r.model, object:'model', created:0,
-    owned_by:r.model===mockModel ? 'opentoken-mock' : providers.find(item=>item.alias===r.model)?.mode==='compatible' ? 'compatible' : 'openai' })) };
+    owned_by:r.model===mockModel ? 'opentoken-mock' : r.route_mode==='compatible' ? 'compatible' : 'openai' })) };
 }
 
 function price(rate: Rate, input: number, cache: number, output: number, multiplier: number) {
@@ -133,10 +150,13 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
   const { db } = await store();
   const fingerprint = retry ? (await digest('request-body',JSON.stringify(body))).toString('hex') : null;
   const providers = resolveLiveUpstreams();
-  const live = providers.find(provider=>provider.alias===body.model);
+  const credentials = channelCredentials();
   const started = Date.now();
-  const { id, rate, hold } = await transaction(async tx => {
-    if (live) await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
+  const { id, rate, hold, live } = await transaction(async tx => {
+    if (body.model!==mockModel) {
+      await tx.query('SELECT pg_advisory_xact_lock_shared(961020032)');
+      await tx.query('SELECT pg_advisory_xact_lock_shared($1)',[channelRoutingLock]);
+    }
     const { rows:[wallet] } = await tx.query<{available: string}>(`SELECT (balance_micros-held_micros-refund_held_micros)::text AS available
       FROM gateway.wallets WHERE user_id=$1 FOR UPDATE`,[key.user_id]);
     const { rows:[lockedKey] } = await tx.query<Key>(`SELECT ${keyFields} FROM gateway.api_keys WHERE id=$1 FOR UPDATE`,[key.id]);
@@ -147,10 +167,11 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
       if (existing) throw new Fault(409,existing.fingerprint === fingerprint ? 'duplicate_request' : 'idempotency_conflict',
         existing.fingerprint === fingerprint ? `请求已受理（${existing.status}），请查看使用记录。` : '该幂等键已用于其他请求。',existing.id);
     }
-    const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$2 AND m.code=$3',[routeParameters(providers),key.group_id,body.model]);
+    const { rows:[quote] } = await tx.query<Rate>(rateQuery + ' AND g.id=$2 AND m.code=$3',[routeParameters(providers,credentials),key.group_id,body.model]);
     if (!quote || body.max_completion_tokens > quote.max_output_tokens) {
       throw new Fault(400,'unsupported_model_or_limit','请选择可用模型，并将输出上限设为 1 至 128。');
     }
+    const live = quote.channel_version_id ? managedUpstream(quote,credentials) : providers.find(provider=>provider.alias===body.model);
     if (streaming && quote.model!==mockModel && !live?.streaming) {
       throw new Fault(400,'stream_not_supported','当前模型只支持非流式调用。');
     }
@@ -173,12 +194,12 @@ async function prepareCompletion(header:string|null,body:CompletionInput,retry:s
     if (tier && !tier.key_allowed) throw new Fault(403,'plan_key_limit','此密钥已超过当前套餐的可用密钥范围。');
     if (tier?.full) throw new Fault(429,'account_rate_limit','已达到账号每分钟请求上限。');
     const { rows:[entry] } = await tx.query<{id:string}>(`INSERT INTO gateway.usage_requests
-      (user_id,key_id,group_id,model_id,rate_id,upstream_model_snapshot,idempotency_key,request_fingerprint,reserved_micros,status,updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,'dispatched',clock_timestamp()) RETURNING id`,
-      [key.user_id,key.id,key.group_id,quote.model_id,quote.rate_id,quote.upstream_model,retry,fingerprint,reserve.toString()]);
+      (user_id,key_id,group_id,model_id,rate_id,upstream_model_snapshot,idempotency_key,request_fingerprint,reserved_micros,status,updated_at,channel_version_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,decode($8,'hex'),$9,'dispatched',clock_timestamp(),$10) RETURNING id`,
+      [key.user_id,key.id,key.group_id,quote.model_id,quote.rate_id,quote.upstream_model,retry,fingerprint,reserve.toString(),quote.channel_version_id]);
     await tx.query('UPDATE gateway.wallets SET held_micros=held_micros+$2,updated_at=now() WHERE user_id=$1',[key.user_id,reserve.toString()]);
     await tx.query('UPDATE gateway.api_keys SET held_micros=held_micros+$2,updated_at=now() WHERE id=$1',[key.id,reserve.toString()]);
-    return { id:entry.id, rate:quote, hold:reserve };
+    return { id:entry.id, rate:quote, hold:reserve, live };
   });
 
   return {key,db,live,started,id,rate,hold};

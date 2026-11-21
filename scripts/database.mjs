@@ -46,7 +46,8 @@ export async function migrate(client) {
     if (!rowCount) throw new Error('Create a restricted opentoken_app login role before migrating');
     for (const [version,file] of [['002','002-billing-reconciliation.sql'],['003','003-billing-maintenance-recovery.sql'],
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
-      ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql']]) {
+      ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql'],
+      ['010','010-managed-channels.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -70,6 +71,8 @@ export async function migrate(client) {
 export async function seed(client,email,providers=resolveLiveUpstreams()) {
   await inTransaction(client,async () => {
     await client.query('SELECT pg_advisory_xact_lock(961020031)');
+    await client.query('SELECT pg_advisory_xact_lock(961020036)');
+    const {rows:[{managed}]} = await client.query("SELECT to_regclass('gateway.channel_routes') IS NOT NULL AS managed");
     await client.query(`
       INSERT INTO gateway.pricing_groups (code,name) VALUES ('pilot','试点分组') ON CONFLICT DO NOTHING;
       INSERT INTO gateway.models (code,upstream_model,max_context_tokens,max_output_tokens) VALUES
@@ -88,9 +91,11 @@ export async function seed(client,email,providers=resolveLiveUpstreams()) {
         VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,[live.alias,live.model,live.maxContextTokens,live.maxOutputTokens]);
       const {rows:[model]} = await client.query(`SELECT id,upstream_model,max_context_tokens,max_output_tokens
         FROM gateway.models WHERE code=$1`,[live.alias]);
-      if (model.upstream_model!==live.model || model.max_context_tokens!==live.maxContextTokens ||
-        model.max_output_tokens!==live.maxOutputTokens) throw new Error('The compatible alias already belongs to a different model or context limit');
       for (const group of live.groups) {
+        if (managed && (await client.query(`SELECT 1 FROM gateway.channel_routes p JOIN gateway.pricing_groups g ON g.id=p.group_id
+          WHERE p.model_id=$1 AND g.code=$2`,[model.id,group.code])).rowCount) continue;
+        if (model.upstream_model!==live.model || model.max_context_tokens!==live.maxContextTokens ||
+          model.max_output_tokens!==live.maxOutputTokens) throw new Error('The compatible alias already belongs to a different model or context limit');
         await client.query('INSERT INTO gateway.pricing_groups (code,name) VALUES ($1,$2) ON CONFLICT DO NOTHING',[group.code,group.name]);
         const {rows:[storedGroup]} = await client.query('SELECT id,name FROM gateway.pricing_groups WHERE code=$1',[group.code]);
         if (group.code!=='pilot' && storedGroup.name!==group.name) throw new Error('The pricing group already uses a different name');
@@ -168,6 +173,10 @@ export async function check(client) {
 export async function enableStripeSandbox(client) {
   await inTransaction(client,async () => {
     await client.query('SELECT pg_advisory_xact_lock(961020032)');
+    const {rows:[{managed}]} = await client.query("SELECT to_regclass('gateway.channel_probes') IS NOT NULL AS managed");
+    if (managed && (await client.query('SELECT 1 FROM gateway.channel_probes LIMIT 1')).rowCount) {
+      throw new Error('Use a separate database without real upstream use for Stripe testing');
+    }
     const {rows:[{has_live_usage}]} = await client.query(`SELECT EXISTS (
       SELECT 1 FROM gateway.usage_requests u JOIN gateway.models m ON m.id=u.model_id WHERE m.code <> 'mock-text'
     ) AS has_live_usage`);
@@ -184,7 +193,7 @@ async function main() {
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–009 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–010 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');

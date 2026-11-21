@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { setRecentAdminAuth } from '@/lib/admin';
 import { appOrigin, endSession, sessionCookie, setSession } from '@/lib/session';
 
 export async function POST(req: NextRequest) {
@@ -9,5 +10,6 @@ export async function POST(req: NextRequest) {
   await endSession(req.cookies.get(sessionCookie)?.value).catch(() => console.error('Supabase session revoke failed'));
   const res = NextResponse.redirect(new URL('/login',origin),303);
   setSession(res,origin);
+  setRecentAdminAuth(res,origin);
   return res;
 }

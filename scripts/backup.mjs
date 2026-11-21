@@ -41,6 +41,10 @@ export function backupTables(versions) {
       version==='["001","002","003","004","005","006","007","008","009"]') {
     return [...paidPilotTables,'gateway.admin_roles','gateway.login_events','gateway.admin_audit_events'].sort();
   }
+  if (version==='["001","002","003","004","005","006","007","008","009","010"]') {
+    return [...paidPilotTables,'gateway.admin_roles','gateway.login_events','gateway.admin_audit_events',
+      'gateway.channels','gateway.channel_versions','gateway.channel_routes','gateway.channel_probes'].sort();
+  }
   throw new Error('Unsupported migration version for backup or restore');
 }
 const formats = `SET TIME ZONE 'UTC'; SET DateStyle TO 'ISO, YMD';

@@ -23,10 +23,12 @@ type Completion = {
 export class UpstreamError extends Error {
   readonly disposition: 'release' | 'review';
   readonly requestId: string | null;
-  constructor(disposition: 'release' | 'review', requestId: string | null) {
+  readonly category: 'auth_failed' | 'model_unavailable' | 'timeout' | 'upstream_unavailable' | 'unverified';
+  constructor(disposition: 'release' | 'review', requestId: string | null, category: UpstreamError['category'] = 'unverified') {
     super(disposition === 'release' ? '上游拒绝了请求，未扣费。' : '上游结果未确认，费用待核对。');
     this.disposition = disposition;
     this.requestId = requestId;
+    this.category = category;
   }
 }
 
@@ -52,6 +54,10 @@ function providerId(value:string|null|undefined,apiKey:string) {
   return value && /^[\w.:-]{1,128}$/.test(value) && !value.includes(apiKey) ? value : null;
 }
 
+function timedOut(error:unknown) {
+  return error instanceof Error && (error.name==='TimeoutError' || error.name==='AbortError');
+}
+
 async function fetchCompletion(input:CompletionInput,upstream:LiveUpstream,stream:boolean,fetcher:typeof fetch) {
   let response: Response;
   try {
@@ -62,14 +68,15 @@ async function fetchCompletion(input:CompletionInput,upstream:LiveUpstream,strea
         ...(upstream.mode==='official' ? {reasoning_effort:'none',service_tier:'default',store:false} : {})}),
       redirect:'error',signal:AbortSignal.timeout(25000),
     });
-  } catch {
-    throw new UpstreamError('review',null);
+  } catch (error) {
+    throw new UpstreamError('review',null,timedOut(error) ? 'timeout' : 'upstream_unavailable');
   }
   const headerId = providerId(response.headers.get('x-request-id'),upstream.apiKey);
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
     const confirmedRejection = upstream.mode==='official' && [400,401,403,404,422,429].includes(response.status);
-    throw new UpstreamError(confirmedRejection ? 'release' : 'review',headerId);
+    const category = [401,403].includes(response.status) ? 'auth_failed' : response.status===404 ? 'model_unavailable' : 'upstream_unavailable';
+    throw new UpstreamError(confirmedRejection ? 'release' : 'review',headerId,category);
   }
   return {response,headerId};
 }
@@ -90,7 +97,11 @@ export async function openAiCompletion(
   input: CompletionInput, upstream: LiveUpstream, fetcher: typeof fetch = fetch,
 ): Promise<Completion> {
   const {response,headerId} = await fetchCompletion(input,upstream,false,fetcher);
-  const parsed = responseSchema.safeParse(await response.json().catch(() => null));
+  const payload:unknown = await response.json().catch(error=>{
+    if (timedOut(error)) throw new UpstreamError('review',headerId,'timeout');
+    return null;
+  });
+  const parsed = responseSchema.safeParse(payload);
   if (!parsed.success) throw new UpstreamError('review',headerId);
   const requestId = headerId ?? providerId(parsed.data.id,upstream.apiKey);
   if (parsed.data.model!==upstream.responseModel) throw new UpstreamError('review',requestId);
@@ -213,8 +224,8 @@ export async function openAiStream(
         break;
       }
     }
-  } catch {
-    throw new UpstreamError('review',requestId);
+  } catch (error) {
+    throw new UpstreamError('review',requestId,timedOut(error) ? 'timeout' : 'unverified');
   }
   throw new UpstreamError('review',requestId);
 }

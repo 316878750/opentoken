@@ -49,7 +49,8 @@ export function backupTables(versions) {
   if (version==='["001","002","003","004","005","006","007","008","009","010","011","012"]') {
     return [...backupTables(versions.slice(0,-1)),'gateway.account_states','gateway.admin_user_invites'].sort();
   }
-  if (version==='["001","002","003","004","005","006","007","008","009","010","011","012","013"]') {
+  if (version==='["001","002","003","004","005","006","007","008","009","010","011","012","013"]' ||
+      version==='["001","002","003","004","005","006","007","008","009","010","011","012","013","014"]') {
     return backupTables(versions.slice(0,-1));
   }
   throw new Error('Unsupported migration version for backup or restore');

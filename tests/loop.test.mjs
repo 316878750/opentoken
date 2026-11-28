@@ -25,9 +25,11 @@ const creditUserB = '30000000-0000-4000-8000-000000000009';
 const channelUser = '30000000-0000-4000-8000-000000000011';
 const modelUser = '30000000-0000-4000-8000-000000000012';
 const deleteUser = '30000000-0000-4000-8000-000000000013';
+const auditCreditUser = '30000000-0000-4000-8000-000000000014';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
   ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],['model@example.test',modelUser],
-  ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],['delete@example.test',deleteUser]]);
+  ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],
+  ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser]]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -600,9 +602,17 @@ test('concurrent requests on separate keys cannot over-reserve a shared wallet',
   const reserved = 2_000_000n;
   const admitted = Number(BigInt(before.availableMicros)/reserved);
   assert.ok(admitted>0 && admitted<6,'Fixture must have a small, positive wallet balance');
-  const keys = await Promise.all(Array.from({length:admitted+1},(_,i)=>request('/api/keys',{
-    method:'POST',body:{name:'concurrent wallet '+i,groupId,rpm:10},
-  })));
+  const createKey = (index)=>request('/api/keys',{
+    method:'POST',body:{name:'concurrent wallet '+index,groupId,rpm:10},
+  });
+  const indexes = Array.from({length:admitted+1},(_,index)=>index);
+  const keys = [];
+  if (process.env.OPENTOKEN_INTEGRATION_TEST_DATABASE_URL) {
+    keys.push(...await Promise.all(indexes.map(createKey)));
+  } else {
+    // PGlite uses one engine behind its socket server. Prepare keys sequentially, then race the wallet calls below.
+    for (const index of indexes) keys.push(await createKey(index));
+  }
   assert.ok(keys.every(key=>key.status===201),JSON.stringify(keys.filter(key=>key.status!==201)
     .map(key=>({status:key.status,code:key.data?.error?.code}))));
   const calls = keys.map(key=>request('/v1/chat/completions',{method:'POST',token:key.data.secret,session:false,
@@ -1530,6 +1540,112 @@ test('user invitations generate one link, preserve uncertain outcomes and use th
     assert.ok(rows.some(row=>row.action==='user.invite_finished' && row.reason==='issued'));
     assert.doesNotMatch(JSON.stringify(rows),/@|sb_secret_fixture|token_hash|fixture-invited-password/);
   });
+});
+
+test('login logs are read-only, scoped and filterable without exposing login inputs',async ()=>{
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(auditStaff,'auditor');
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.get('set-cookie').split(';')[0];
+  const [admin,operator,auditor,ordinary] = await Promise.all([
+    signIn('owner@example.test'),signIn('staff@example.test'),signIn('auditor@example.test'),signIn('pilot-b@example.test'),
+  ]);
+  const endpoint = '/api/admin/login-logs';
+  const read = (sessionOverride,query='') => request(endpoint+query,{sessionOverride});
+  assert.equal((await read(operator)).status,403);
+  assert.equal((await read(ordinary)).status,403);
+  assert.equal((await request(endpoint,{session:false})).status,401);
+  assert.match(await (await fetch(base+'/admin/login-logs',{headers:{cookie:admin}})).text(),/登录日志/);
+  const good = await request('/api/session/login',loginPayload('pilot-b@example.test'));
+  const bad = await request('/api/session/login',loginPayload('pilot-b@example.test','wrong-private-password'));
+  const limit = await request('/api/session/login',loginPayload('limited@example.test'));
+  const readOne = async (session,id)=> (await read(session,'?requestId='+id)).data.items[0];
+  const found = await readOne(admin,good.headers.get('x-request-id'));
+  const refused = await readOne(auditor,bad.headers.get('x-request-id'));
+  const limited = await readOne(auditor,limit.headers.get('x-request-id'));
+  assert.deepEqual([found.userId,found.outcome,refused.userId,refused.outcome,limited.outcome],
+    [secondary,'success',null,'failure','rate_limited']);
+  assert.equal(found.identifier,refused.identifier);
+  assert.match(found.identifier,/^[0-9a-f]{12}$/);
+  assert.doesNotMatch(JSON.stringify([found,refused,limited]),/@example\.test|wrong-private-password|identifier_digest|access_token/);
+  const byCode = (await read(auditor,'?identifier='+found.identifier+'&outcome=failure')).data.items;
+  assert.ok(byCode.some(event=>event.requestId===refused.requestId));
+  const first = (await read(admin,'?limit=2')).data;
+  const next = (await read(admin,'?limit=2&cursor='+first.nextCursor)).data;
+  assert.equal(first.items.length,2);
+  assert.equal(next.items.length,2);
+  assert.ok(next.items.every(event=>first.items.every(before=>before.requestId!==event.requestId)));
+  assert.equal((await read(admin,'?from=2090-01-01T00%3A00%3A00Z')).data.items.length,0);
+  assert.equal((await read(admin,'?limit=51')).status,400);
+  assert.equal((await read(admin,'?from=0000-01-01T00%3A00%3A00Z')).status,400);
+  assert.equal((await read(admin,'?from=2026-11-21T23%3A00%3A00%2B23%3A59')).status,200);
+});
+
+test('operation logs keep operator reads actor-scoped and expose only approved audit fields',async ()=>{
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(auditStaff,'auditor');
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.get('set-cookie').split(';')[0];
+  const [admin,operator,auditor,ordinary] = await Promise.all([
+    signIn('owner@example.test'),signIn('staff@example.test'),signIn('auditor@example.test'),signIn('audit-credit@example.test'),
+  ]);
+  const endpoint = '/api/admin/operation-logs';
+  const read = (sessionOverride,query='') => request(endpoint+query,{sessionOverride});
+  const [issue,remove,probe] = Array.from({length:3},()=>crypto.randomUUID());
+  const [codeId,channelId] = Array.from({length:2},()=>crypto.randomUUID());
+  await withDatabaseOwner(async()=>{
+    await database.query(`INSERT INTO gateway.admin_audit_events(request_id,occurred_at,action,outcome,reason,actor_user_id,target_user_id,details)
+      VALUES ($1,'2040-01-01T00:00:00Z','redeem.issue','success','issued',$4,NULL,$7),
+        ($2,'2040-01-01T00:00:00Z','user.delete','success','timeout',$5,$6,$8),
+        ($3,'2040-01-01T00:00:00Z','channel.probe_finished','denied','timeout',$5,NULL,$9)`,
+      [issue,remove,probe,staff,owner,secondary,
+        {codeId,amountMicros:'3000000',secret:'otc_PRIVATE',before:'free-text-private'},
+        {before:{suspended:false,role:'operator',password:'private-pwd'},after:'deleted',revokedKeys:2,notes:'private-notes'},
+        {channelId,elapsedMs:1000,credentialRef:'private-ref'}]);
+  });
+  assert.equal((await read(ordinary)).status,403);
+  assert.match(await (await fetch(base+'/admin/operation-logs',{headers:{cookie:operator}})).text(),/操作日志/);
+  const own = (await read(operator,'?object='+codeId)).data.items;
+  assert.equal(own.length,1);
+  assert.equal(own[0].requestId,issue);
+  assert.equal(own[0].details.amountMicros,'3000000');
+  assert.deepEqual((await read(operator,'?actorId='+owner)).data.items,[]);
+  assert.deepEqual((await read(operator,'?cursor='+remove)).data.items,[]);
+  const archived = (await read(auditor,'?action=user.delete&object='+secondary)).data.items.find(event=>event.requestId===remove);
+  assert.deepEqual([archived.actorId,archived.targetId,archived.reason], [owner,secondary,'recorded']);
+  assert.deepEqual(archived.details.before,{suspended:false,role:'operator'});
+  assert.equal(archived.details.after,'deleted');
+  const timed = (await read(admin,'?outcome=denied&object='+channelId)).data.items[0];
+  assert.equal(timed.requestId,probe);
+  assert.equal(timed.reason,'timeout');
+  assert.doesNotMatch(JSON.stringify([own,archived,timed]),/private-|otc_PRIVATE|credentialRef|password/);
+  const timeFilter = '?limit=2&from=2040-01-01T00%3A00%3A00Z&to=2040-01-02T00%3A00%3A00Z';
+  const first = (await read(auditor,timeFilter)).data;
+  const second = (await read(auditor,timeFilter+'&cursor='+first.nextCursor)).data;
+  assert.deepEqual([...first.items,...second.items].map(row=>row.requestId),[issue,remove,probe].sort().reverse());
+  const issued = await request('/api/admin/redeem-codes',{method:'POST',sessionOverride:admin,body:{
+    amountUsd:'1',expiresAt:new Date(Date.now()+3600_000).toISOString(),operationId:crypto.randomUUID(),
+  }});
+  assert.equal(issued.status,201);
+  const recorded = (await read(auditor,'?requestId='+issued.headers.get('x-request-id'))).data.items[0];
+  assert.deepEqual([recorded.action,recorded.details.amountMicros],['redeem.issue','1000000']);
+  assert.doesNotMatch(JSON.stringify(recorded),/otc_/);
+  const redeemed = await request('/api/redeem',{method:'POST',sessionOverride:ordinary,body:{code:issued.data.code}});
+  assert.equal(redeemed.status,200);
+  const credited = (await read(auditor,'?action=redeem.credit&object='+issued.data.id)).data.items[0];
+  assert.deepEqual([credited.actorId,credited.reason,credited.details.receiptId],[auditCreditUser,'credited',redeemed.data.receipt.id]);
+  const untrusted = 'fixture-credential-looking-model-code';
+  const failedModel = await request('/api/admin/models/state',{method:'POST',sessionOverride:admin,body:{
+    code:untrusted,enabled:false,reason:'隔离日志脱敏',
+  }});
+  assert.equal(failedModel.status,404);
+  const rejectedModel = (await read(auditor,'?requestId='+failedModel.headers.get('x-request-id'))).data.items[0];
+  assert.equal(rejectedModel.action,'model.state');
+  assert.doesNotMatch(JSON.stringify(rejectedModel),new RegExp(untrusted));
+  assert.equal((await request(endpoint,{method:'DELETE',sessionOverride:admin})).status,404);
+  await changeAdminRole(staff,null);
+  assert.equal((await read(operator)).status,403);
+  await changeAdminRole(staff,'operator');
 });
 
 test('Stripe sandbox checkout uses signed paid events and credits the wallet exactly once', async () => {

@@ -6,6 +6,7 @@ import { issueAdminRedeem, listAdminRedeem, voidAdminRedeem } from './admin-rede
 import { channelDraftInput, channelProbeInput, channelDisableInput, channelPublishInput, changeChannel,
   listChannels, probeChannel, saveChannel } from './admin-channels';
 import { listAdminModels, modelAdminInput, writeAdminModel } from './admin-models';
+import { listAdminLogs, loginLogFilter, operationLogFilter } from './admin-logs';
 import { inviteAdminUser, listAdminUsers, userChangeInput, userInviteInput, userListInput, writeAdminUser } from './admin-users';
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
@@ -165,6 +166,12 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route==='GET /api/admin/login-logs') {
+      return json(await listAdminLogs(user,{kind:'login',filters:parse(loginLogFilter,Object.fromEntries(req.nextUrl.searchParams))}));
+    }
+    if (route==='GET /api/admin/operation-logs') {
+      return json(await listAdminLogs(user,{kind:'operation',filters:parse(operationLogFilter,Object.fromEntries(req.nextUrl.searchParams))}));
+    }
     if (route==='GET /api/admin/users') {
       return json(await listAdminUsers(user,parse(userListInput,Object.fromEntries(req.nextUrl.searchParams))));
     }

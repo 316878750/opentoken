@@ -23,6 +23,8 @@ export default async function AdminPage() {
       <nav aria-label="管理员后台">
         <a href="/admin" aria-current="page">管理员后台</a>
         {role!=='auditor' && <><a href="/admin/channels">渠道管理</a><a href="/admin/models">模型管理</a><a href="/admin/users">用户管理</a></>}
+        {role!=='operator' && <a href="/admin/login-logs">登录日志</a>}
+        <a href="/admin/operation-logs">操作日志</a>
         <a href="/dashboard">返回控制台</a>
       </nav>
     </aside>

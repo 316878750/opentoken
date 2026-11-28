@@ -95,7 +95,9 @@ export function Login() {
     try {
       await api('/api/session/login',{method:'POST',body:JSON.stringify(Object.fromEntries(form)),signal:AbortSignal.timeout(22000)});
       const destination = new URLSearchParams(location.search).get('redirect');
-      location.replace(destination && ['/dashboard','/pricing','/keys','/usage','/redeem','/admin','/admin/channels','/admin/models','/admin/users'].includes(destination) ? destination : '/dashboard');
+      const destinations = ['/dashboard','/pricing','/keys','/usage','/redeem','/admin','/admin/channels','/admin/models',
+        '/admin/users','/admin/login-logs','/admin/operation-logs'];
+      location.replace(destination && destinations.includes(destination) ? destination : '/dashboard');
     } catch (error) {
       setError(error instanceof ApiError ? error.message : '登录请求暂时无法完成。');
       setBusy(false);

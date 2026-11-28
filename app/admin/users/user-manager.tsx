@@ -99,19 +99,19 @@ export function UserManager({timeZone}:{timeZone:string}) {
       {users.error && <p className="error" role="alert">{users.error}</p>}
       {!data && !users.error && <p role="status">正在读取用户…</p>}
       {data?.items.length===0 && <p className="list-empty">{filters.search || filters.status?'没有符合条件的用户，可重置筛选。':'暂无在册用户。'}</p>}
-      {!!data?.items.length && <div className="table-wrap"><table aria-label="用户列表">
-        <thead><tr><th>账号</th><th>状态</th><th>后台角色</th>{data.canWrite && <><th>钱包</th><th>操作</th></>}</tr></thead>
+      {!!data?.items.length && <div className="table-wrap"><table className="phone-records" aria-label="用户列表">
+        <thead><tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">后台角色</th>{data.canWrite && <><th scope="col">钱包</th><th scope="col">操作</th></>}</tr></thead>
         <tbody>{data.items.map(user=><tr key={user.id}>
-          <td>{user.email ?? '邮箱不可用'}<br/><code>{user.id}</code></td>
-          <td>{statuses[user.status]}<br/>{user.deletedAt
+          <td data-label="账号" className="record-wide">{user.email ?? '邮箱不可用'}<br/><code>{user.id}</code></td>
+          <td data-label="状态">{statuses[user.status]}<br/>{user.deletedAt
             ? <time dateTime={user.deletedAt}>{new Date(user.deletedAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time>
             : user.emailConfirmed?'邮箱已验证':'邮箱待验证'}</td>
-          <td>{user.role ? roleNames[user.role] : '普通用户'}</td>
-          {data.canWrite && <><td>{user.wallet ? <>
+          <td data-label="后台角色">{user.role ? roleNames[user.role] : '普通用户'}</td>
+          {data.canWrite && <><td data-label="钱包" className="record-wide">{user.wallet ? <>
             余额 {money(user.wallet.balanceMicros)}<br/>
             用量预占 {money(user.wallet.heldMicros)}<br/>
             退款冻结 {money(user.wallet.refundHeldMicros)}
-          </> : '尚未开户'}</td><td>{user.status==='deleted' ? '已归档' : data.actorId===user.id ? '当前账号' : <>
+          </> : '尚未开户'}</td><td data-label="操作" className="record-wide">{user.status==='deleted' ? '已归档' : data.actorId===user.id ? '当前账号' : <>
             <button disabled={busy || !!inviteLink || user.status==='auth_blocked'} onClick={()=>openEditor('state',user)}>{user.suspended?'恢复':'停用'}</button>{' '}
             <button disabled={busy || !!inviteLink} onClick={()=>openEditor('role',user)}>变更角色</button>{' '}
             <button className="danger" disabled={busy || !!inviteLink} onClick={()=>openEditor('delete',user)}>删除</button>

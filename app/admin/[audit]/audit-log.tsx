@@ -96,16 +96,16 @@ export function AuditLog({screen,ownOnly,timeZone}:{timeZone:string;screen:'logi
     {(rangeError || audit.error) && <p className="error" role="alert">{rangeError || audit.error}</p>}
     {!data && !audit.error && <p role="status">正在读取日志…</p>}
     {data?.items.length===0 && <p className="list-empty">{Object.keys(filters).length?'没有符合条件的日志，可重置筛选。':'暂无日志记录。'}</p>}
-    {!!data?.items.length && <div className="table-wrap"><table aria-label={login?'登录日志列表':'操作日志列表'}>
-      <thead><tr><th>时间（{timeZone}）</th><th>{login?'用户与标识':'操作者'}</th>{!login && <th>动作</th>}
-        <th>结果</th><th>原因</th>{!login && <th>对象与变更</th>}<th>请求编号</th></tr></thead>
+    {!!data?.items.length && <div className="table-wrap"><table className="phone-records" aria-label={login?'登录日志列表':'操作日志列表'}>
+      <thead><tr><th scope="col">时间（{timeZone}）</th><th scope="col">{login?'用户与标识':'操作者'}</th>{!login && <th scope="col">动作</th>}
+        <th scope="col">结果</th><th scope="col">原因</th>{!login && <th scope="col">对象与变更</th>}<th scope="col">请求编号</th></tr></thead>
       <tbody>{data.items.map(event=><tr key={event.requestId}>
-        <td><time dateTime={event.occurredAt}>{new Date(event.occurredAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
-        {'identifier' in event ? <td>{event.userId && <><code>{event.userId}</code><br/></>}<code>{event.identifier}</code></td> :
-          <><td>{event.source==='database'?'运维命令':<code>{event.actorId}</code>}</td><td>{actions[event.action]??event.action}</td></>}
-        <td>{outcomes[event.outcome]??event.outcome}</td><td>{reasons[event.reason]??event.reason}</td>
-        {'action' in event && <td><OperationDetails event={event}/></td>}
-        <td><code>{event.requestId}</code></td>
+        <td data-label="时间" className="record-wide"><time dateTime={event.occurredAt}>{new Date(event.occurredAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
+        {'identifier' in event ? <td data-label="用户与标识" className="record-wide">{event.userId && <><code>{event.userId}</code><br/></>}<code>{event.identifier}</code></td> :
+          <><td data-label="操作者" className="record-wide">{event.source==='database'?'运维命令':<code>{event.actorId}</code>}</td><td data-label="动作">{actions[event.action]??event.action}</td></>}
+        <td data-label="结果">{outcomes[event.outcome]??event.outcome}</td><td data-label="原因">{reasons[event.reason]??event.reason}</td>
+        {'action' in event && <td data-label="对象与变更" className="record-wide"><OperationDetails event={event}/></td>}
+        <td data-label="请求编号" className="record-wide"><code>{event.requestId}</code></td>
       </tr>)}</tbody>
     </table></div>}
     <ListPager page={cursors.length+1} count={data?.items.length}

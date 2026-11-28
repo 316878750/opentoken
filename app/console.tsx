@@ -242,15 +242,15 @@ export function Pricing() {
       <ErrorNote error={error}/>
       {!data ? <p role="status">{error?'暂时无法读取目录，请刷新重试。':'正在读取目录…'}</p> :
         !rows.length ? <p className="list-empty">{!rates.length?'暂无可用模型。':compare?'该模型已退出目录。':'没有符合条件的模型，可重置筛选。'}</p> :
-        <div className="table-wrap" role="region" aria-label="费率表格" tabIndex={0}><table aria-label={compare?'模型分组比价':'模型费率'}>
+        <div className="table-wrap" role="region" aria-label="费率表格" tabIndex={0}><table className="phone-records" aria-label={compare?'模型分组比价':'模型费率'}>
           <caption>{basis==='group'?'分组单价':'基础单价'} · 美元 / 百万 Token</caption>
           <thead><tr>{['模型','分组','输入','缓存读取','输出','倍率','请求方式','接入'].map(label=><th key={label} scope="col">{label}</th>)}</tr></thead>
           <tbody>{rows.map(rate=>{
             const multiplier = basis==='group'?rate.multiplierBps:10000;
             return <tr key={rate.groupId+rate.model}><th scope="row"><code>{rate.model}</code><br/><small>{providers[rate.upstream]}</small></th>
-              <td>{rate.groupName}</td><td>{catalogPrice(rate.inputMicros,multiplier)}</td><td>{catalogPrice(rate.cacheMicros,multiplier)}</td>
-              <td>{catalogPrice(rate.outputMicros,multiplier)}</td><td>{rate.multiplierBps/10000}×</td><td>{rate.streaming?'流式 / 非流式':'非流式'}</td>
-              <td><a href={guidePath({model:rate.model,groupId:rate.groupId})}>接入此模型</a>
+              <td data-label="分组">{rate.groupName}</td><td data-label="输入">{catalogPrice(rate.inputMicros,multiplier)}</td><td data-label="缓存读取">{catalogPrice(rate.cacheMicros,multiplier)}</td>
+              <td data-label="输出">{catalogPrice(rate.outputMicros,multiplier)}</td><td data-label="倍率">{rate.multiplierBps/10000}×</td><td data-label="请求方式">{rate.streaming?'流式 / 非流式':'非流式'}</td>
+              <td data-label="接入" className="record-wide"><a href={guidePath({model:rate.model,groupId:rate.groupId})}>接入此模型</a>
                 {!compare && (modelCounts.get(rate.model)??0)>1 && <button onClick={()=>setCompare(rate.model)}>比较分组</button>}</td>
             </tr>;
           })}</tbody></table></div>}
@@ -452,10 +452,10 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
           <p>当前分组暂无可调用模型，请查看<a href="/pricing">模型价格</a>或选择其他密钥。</p>}</>}
     </section>
     {keys.data ? <section className="panel table-wrap"><h2>密钥列表</h2>
-      {keys.data.items.length ? <table><thead><tr><th>名称与前缀</th><th>分组</th><th>状态</th><th>额度 / RPM</th><th>操作</th></tr></thead>
-        <tbody>{keys.data.items.map(row => <tr key={row.id}><td>{row.name}<br/><code>{row.prefix}…</code></td><td>{row.groupName}</td>
-          <td><span className="badge">{statusLabel(row.status)}</span></td><td>{row.capMicros===null?'不限':money(row.capMicros)} / {row.rpm}</td>
-          <td>{row.status!=='revoked' && <div className="actions"><button onClick={() => void changeKey(row)}>{row.status==='active'?'停用':'恢复'}</button>
+      {keys.data.items.length ? <table className="phone-records" aria-label="密钥列表"><thead><tr><th scope="col">名称与前缀</th><th scope="col">分组</th><th scope="col">状态</th><th scope="col">额度 / RPM</th><th scope="col">操作</th></tr></thead>
+        <tbody>{keys.data.items.map(row => <tr key={row.id}><td data-label="名称与前缀" className="record-wide">{row.name}<br/><code>{row.prefix}…</code></td><td data-label="分组">{row.groupName}</td>
+          <td data-label="状态"><span className="badge">{statusLabel(row.status)}</span></td><td data-label="额度 / RPM">{row.capMicros===null?'不限':money(row.capMicros)} / {row.rpm}</td>
+          <td data-label="操作" className="record-wide">{row.status!=='revoked' && <div className="actions"><button onClick={() => void changeKey(row)}>{row.status==='active'?'停用':'恢复'}</button>
             <button onClick={e => { revokeTrigger.current=e.currentTarget; setRevoke(row); revokeDialog.current?.showModal(); }}>撤销</button></div>}</td></tr>)}</tbody></table>
         : <p>还没有密钥。创建一把密钥即可发起第一次调用。</p>}</section> : <Placeholder error={keys.error} />}
     <dialog ref={dialog} aria-labelledby="key-title" onCancel={event => {event.preventDefault();close();}}
@@ -746,12 +746,12 @@ export function Redeem({tz}:{tz:string}) {
       </select></label><button onClick={()=>{history.refresh();wallet.refresh();}}>刷新余额与流水</button></div>
       <ErrorNote error={history.error} />
       {history.data ? history.data.items.length ? <>
-        <div className="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>金额</th><th>编号</th></tr></thead>
+        <div className="table-wrap"><table className="phone-records" aria-label="钱包流水"><thead><tr><th scope="col">时间</th><th scope="col">类型</th><th scope="col">金额</th><th scope="col">编号</th></tr></thead>
           <tbody>{history.data.items.map(item=><tr key={item.id}>
-            <td>{new Date(item.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</td>
-            <td>{ledgerKind[item.kind]}</td>
-            <td>{BigInt(item.deltaMicros)>0n ? '+'+money(item.deltaMicros) : '−'+money(String(-BigInt(item.deltaMicros)))}</td>
-            <td>{item.requestId ? <a href={'/usage?request_id='+item.requestId}><code>{item.requestId}</code></a> : <code>{item.id}</code>}</td>
+            <td data-label="时间">{new Date(item.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</td>
+            <td data-label="类型">{ledgerKind[item.kind]}</td>
+            <td data-label="金额">{BigInt(item.deltaMicros)>0n ? '+'+money(item.deltaMicros) : '−'+money(String(-BigInt(item.deltaMicros)))}</td>
+            <td data-label="编号" className="record-wide">{item.requestId ? <a href={'/usage?request_id='+item.requestId}><code>{item.requestId}</code></a> : <code>{item.id}</code>}</td>
           </tr>)}</tbody></table></div>
         <div className="actions"><button disabled={!cursors.length} onClick={()=>setCursors(cursors.slice(0,-1))}>上一页</button>
           <button disabled={!history.data.nextCursor} onClick={()=>setCursors([...cursors,history.data!.nextCursor!])}>下一页</button></div>

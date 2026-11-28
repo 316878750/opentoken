@@ -5,6 +5,7 @@ import { adminRole } from '@/lib/admin';
 import { sessionCookie, sessionUser } from '@/lib/session';
 import { Dashboard, Keys, Login, Pricing, Redeem, Usage } from '../console';
 import { guidePath } from '@/lib/catalog-display';
+import { NavigationMenu } from '../navigation-menu';
 
 const screens = ['dashboard','pricing','keys','usage','redeem'] as const;
 const labels = ['概览','模型价格','API 密钥','使用记录','兑换与流水'];
@@ -27,10 +28,10 @@ export default async function Screen({ params,searchParams }: {
     <aside>
       <a className="brand" href="/dashboard">OpenToken</a>
       <span className="badge">试点控制台</span>
-      <nav aria-label="控制台">
+      <NavigationMenu><nav aria-label="控制台">
         {screens.map((item,i) => <a key={item} href={'/'+item} aria-current={item===screen ? 'page' : undefined}>{labels[i]}</a>)}
         {role && <a href="/admin">管理员后台</a>}
-      </nav>
+      </nav></NavigationMenu>
     </aside>
     <main>
       <header className="top"><span>模型接入控制台</span><form action="/logout" method="post"><button>退出登录</button></form></header>

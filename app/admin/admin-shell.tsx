@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import type { AdminRole } from '@/lib/admin';
+import { NavigationMenu } from '../navigation-menu';
 
 const modules = [
   ['/admin','兑换码管理'],
@@ -22,10 +23,10 @@ export function AdminShell({role,path,children}:{
   return <div className="shell admin-shell" data-admin-entry>
     <aside>
       <a className="brand" href="/dashboard">OpenToken</a>
-      <nav aria-label="管理员后台">
+      <NavigationMenu><nav aria-label="管理员后台">
         {visible.map(([href,label])=><a key={href} href={href} aria-current={path===href?'page':undefined}>{label}</a>)}
         <a className="console-return" href="/dashboard">返回用户控制台</a>
-      </nav>
+      </nav></NavigationMenu>
     </aside>
     <main><header className="top"><span>管理员后台 · {roleNames[role]}</span>
       <form action="/logout" method="post"><button>退出登录</button></form></header>

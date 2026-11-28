@@ -113,11 +113,11 @@ export function ChannelManager({timeZone}:{timeZone:string}) {
       {channels.error && <p className="error" role="alert">{channels.error}</p>}
       {!data && !channels.error && <p role="status">正在读取渠道…</p>}
       {filtered?.length===0 && <p className="list-empty">{search || type || status?'没有符合条件的渠道，可重置筛选。':'暂无已登记的渠道。'}</p>}
-      {!!filtered?.length && <div className="table-wrap"><table aria-label="渠道列表"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>生效绑定</th><th>操作</th></tr></thead>
+      {!!filtered?.length && <div className="table-wrap"><table className="phone-records" aria-label="渠道列表"><thead><tr><th scope="col">名称</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">生效绑定</th><th scope="col">操作</th></tr></thead>
         <tbody>{filtered.map(channel=>{const version=channel.active??channel.draft;return <tr key={channel.id}>
-          <td>{version?.name}</td><td>{version?.type==='official'?'官方 OpenAI':'OpenAI 兼容'}</td>
-          <td>{channel.enabled?'已启用':channel.active?'已停用':'草稿'}</td><td>{channel.enabled ? channel.active?.bindings.length : 0}</td>
-          <td><button disabled={busy} onClick={()=>{setSelected(channel.id);setEditing(null);setRollbackId('');setReason('');}}>详情</button></td>
+          <td data-label="名称" className="record-wide">{version?.name}</td><td data-label="类型">{version?.type==='official'?'官方 OpenAI':'OpenAI 兼容'}</td>
+          <td data-label="状态">{channel.enabled?'已启用':channel.active?'已停用':'草稿'}</td><td data-label="生效绑定">{channel.enabled ? channel.active?.bindings.length : 0}</td>
+          <td data-label="操作" className="record-wide"><button disabled={busy} onClick={()=>{setSelected(channel.id);setEditing(null);setRollbackId('');setReason('');}}>详情</button></td>
         </tr>;})}</tbody></table></div>}
       {!!data?.legacy?.length && <details><summary>旧环境配置比对</summary><ul>{data.legacy.map(item=><li key={item.model+':'+item.group}>
         {item.model} · {item.group} · {{managed:'已接管',ready:'模型与费率一致',mismatch:'模型或费率有差异'}[item.status]} ·

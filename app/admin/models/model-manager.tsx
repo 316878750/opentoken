@@ -157,13 +157,13 @@ export function ModelManager({timeZone}:{timeZone:string}) {
     </form>}
     {model && group && <section className="panel">
       <h2>费率版本</h2>
-      {rates.length===0 ? <p className="list-empty">所选模型与分组暂无费率版本。</p> : <div className="table-wrap"><table>
+      {rates.length===0 ? <p className="list-empty">所选模型与分组暂无费率版本。</p> : <div className="table-wrap"><table className="phone-records">
         <caption>每百万 Token 的基础价格</caption>
-        <thead><tr><th>版本</th><th>状态</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th><th>发布时间</th></tr></thead>
-        <tbody>{rates.map(rate=><tr key={rate.id}><td><code title={rate.id}>{rate.id.slice(0,8)}</code></td>
-          <td>{rate.closedAt?'历史':'当前'}</td><td>{money(rate.inputMicros)}</td><td>{money(rate.cacheMicros)}</td>
-          <td>{money(rate.outputMicros)}</td><td>{rate.multiplierBps/10000}×</td>
-          <td><time dateTime={rate.createdAt}>{new Date(rate.createdAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
+        <thead><tr><th scope="col">版本</th><th scope="col">状态</th><th scope="col">输入</th><th scope="col">缓存读取</th><th scope="col">输出</th><th scope="col">倍率</th><th scope="col">发布时间</th></tr></thead>
+        <tbody>{rates.map(rate=><tr key={rate.id}><td data-label="版本"><code title={rate.id}>{rate.id.slice(0,8)}</code></td>
+          <td data-label="状态">{rate.closedAt?'历史':'当前'}</td><td data-label="输入">{money(rate.inputMicros)}</td><td data-label="缓存读取">{money(rate.cacheMicros)}</td>
+          <td data-label="输出">{money(rate.outputMicros)}</td><td data-label="倍率">{rate.multiplierBps/10000}×</td>
+          <td data-label="发布时间" className="record-wide"><time dateTime={rate.createdAt}>{new Date(rate.createdAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
         </tr>)}</tbody>
       </table></div>}
     </section>}

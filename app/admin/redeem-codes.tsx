@@ -139,15 +139,15 @@ export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId
     {!codes.error && !page && <p role="status">正在读取兑换码…</p>}
     {page && page.items.length===0 && <p className="list-empty">{filter?'没有符合条件的兑换码，可重置筛选。':'暂无兑换码记录。'}</p>}
     {page && page.items.length>0 && <div className="table-wrap">
-      <table aria-label="兑换码记录">
+      <table className="phone-records" aria-label="兑换码记录">
         <thead><tr><th scope="col">记录编号</th><th scope="col">面额</th><th scope="col">状态</th>
           <th scope="col">有效期</th><th scope="col">核销收据</th>{canWrite && <th scope="col">签发账号</th>}
           {canWrite && <th scope="col">操作</th>}</tr></thead>
         <tbody>{page.items.map(row=><tr key={row.id}>
-          <td>{row.id}</td><td>{money(row.amountMicros)}</td><td>{statuses[row.status]}</td>
-          <td><time dateTime={row.expiresAt}>{new Date(row.expiresAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
-          <td>{row.receiptId??'—'}</td>{canWrite && <td>{row.issuedBy??'—'}</td>}
-          {canWrite && <td>{row.status==='active' && <button disabled={busy || !!voiding}
+          <td data-label="记录编号" className="record-wide">{row.id}</td><td data-label="面额">{money(row.amountMicros)}</td><td data-label="状态">{statuses[row.status]}</td>
+          <td data-label="有效期"><time dateTime={row.expiresAt}>{new Date(row.expiresAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
+          <td data-label="核销收据" className="record-wide">{row.receiptId??'—'}</td>{canWrite && <td data-label="签发账号" className="record-wide">{row.issuedBy??'—'}</td>}
+          {canWrite && <td data-label="操作" className="record-wide">{row.status==='active' && <button disabled={busy || !!voiding}
             onClick={()=>{setVoiding(row.id);setError('');setMessage('');}}>作废</button>}</td>}
         </tr>)}</tbody>
       </table>

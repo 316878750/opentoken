@@ -1,6 +1,20 @@
 # OpenToken 小范围试点部署
 
-## 上线前核对
+## 第 9 阶段正式试点发布记录
+
+2026 年 11 月 28 日，先核对正式 Supabase 项目标识、运行角色与迁移角色。发布前创建并独立验证 AES-256-GCM 快照，覆盖 14 张表，账务差异和未解决账务告警均为 0。原始归档和验证凭据仅存放在本机。
+
+在同一事务应用迁移 005–015，随后以 `opentoken_app` 核对权限。数据库中原有的 4 条生效费率逐项匹配，钱包余额、额度明细、使用预占及退款冻结核对差异为 0。Stripe 正式结账、付费试点名单和沙盒标记均关闭。
+
+发布前重新构建并通过 68 项隔离测试。`main` 原有的七个独有提交均能在候选分支找到等效补丁，合并保留了两边的历史。发布提交的文件树与通过验收的候选版本一致。[第 9 阶段发布提交](https://github.com/316878750/opentoken/commit/eafef033ca82ffab7570e40df44265783435e1cf)
+
+管理员入口为 [OpenToken 管理员后台](https://opentoken-pilot.onrender.com/admin)。访客跳转到登录页，登录成功后返回后台。首开授权前，同一已验证账号访问后台页面返回 404，访问后台会话与系统设置接口返回 403。通过受控的运维流程将指定账号授予首个系统管理员角色后，重新登录返回 `system_admin`。正式域名使用带 Secure、HttpOnly、SameSite=Strict 属性的会话 Cookie，首开授权可在操作日志中查询。
+
+七个后台模块的页面和读取接口均已在正式站点验证。健康检查返回 200，仪表盘、使用记录和兑换页面可读。用户目录中展示的两个模型与分组组合，其费率、倍率和流式能力与上线前一致。本次上线验证使用只读业务操作，没有产生模型调用或资金流水。8.3 继续暂停。
+
+有两项功能依赖后续生产配置。渠道管理报告可用密钥引用为 0，数据库管理的渠道为 0，现有供应商继续使用原试点配置。新增托管渠道时先在 Render 登记渠道密钥引用，再按模型与分组测试和启用。用户管理报告 `canInvite=false`，后台签发邀请需要单独配置正式项目的服务端 `SUPABASE_SECRET_KEY`。
+
+## 历史上线前核对
 
 | 项目 | 状态 |
 | --- | --- |
@@ -53,6 +67,8 @@ APP_ORIGIN="${APP_ORIGIN:-$RENDER_EXTERNAL_URL}" node node_modules/next/dist/bin
 
 ## 监控
 
+下列定时检查为早期试点记录。2026 年 11 月 23 日起，GitHub 和 Windows 的 15 分钟探针及本机每日加密备份已取消。本次发布只执行了一次备份。
+
 - 配置仓库的 Actions 变量 `OPENTOKEN_PILOT_URL` 为正式 HTTPS 源地址。**Pilot health** 每 15 分钟检查登录页和健康接口，可手动运行。Render 免费实例闲置后会休眠，健康检查允许等待启动并重试一次。健康接口核对数据库权限、Supabase Auth、关闭公开注册的设置和网关配置，探针只读取服务状态。[Render 免费实例限制](https://render.com/docs/free)
 - 在托管平台查看应用错误日志，在 Supabase Cron 查看 `opentoken-billing-maintenance` 的运行结果。用 `pnpm db:billing alerts` 检查账务告警。
 - UptimeRobot 在云端监控正式试点的 `/api/health`。2026-11-21，运营人员在电脑断网时通过手机发送模拟 DOWN 通知，并确认 QQ 邮箱收到邮件。复验可在监控详情页使用 **Test Notification**。 [第 8 阶段验收记录](stage8.md) · [UptimeRobot 测试通知说明](https://help.uptimerobot.com/en/articles/11602913-how-to-test-notifications-in-uptimerobot-quick-guide)
@@ -76,4 +92,4 @@ APP_ORIGIN="${APP_ORIGIN:-$RENDER_EXTERNAL_URL}" node node_modules/next/dist/bin
 
 ## 备份恢复
 
-试点开启前和线上验收后均生成了加密快照。2026-11-20 通过 Windows 一次性任务自动完成了快照生成与校验。日常继续由 Codex 本机自动化「OpenToken 每日加密备份」在每天 02:15（北京时间）执行。需要本机可运行且能连接 Supabase。密钥和备份分开保存。恢复演练使用隔离目标库，并比对登录用户标识、钱包、预占和流水。详见 [加密备份与恢复手册](backup.md)。
+试点开启前和线上验收后均生成了加密快照。2026-11-20 通过 Windows 一次性任务自动完成了快照生成与校验。早期曾由 Codex 本机自动化「OpenToken 每日加密备份」在每天 02:15（北京时间）执行。需要本机可运行且能连接 Supabase。密钥和备份分开保存。恢复演练使用隔离目标库，并比对登录用户标识、钱包、预占和流水。详见 [加密备份与恢复手册](backup.md)。

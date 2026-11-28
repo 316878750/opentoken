@@ -96,7 +96,7 @@ export function Login() {
       await api('/api/session/login',{method:'POST',body:JSON.stringify(Object.fromEntries(form)),signal:AbortSignal.timeout(22000)});
       const destination = new URLSearchParams(location.search).get('redirect');
       const destinations = ['/dashboard','/pricing','/keys','/usage','/redeem','/admin','/admin/channels','/admin/models',
-        '/admin/users','/admin/login-logs','/admin/operation-logs'];
+        '/admin/users','/admin/settings','/admin/login-logs','/admin/operation-logs'];
       location.replace(destination && destinations.includes(destination) ? destination : '/dashboard');
     } catch (error) {
       setError(error instanceof ApiError ? error.message : '登录请求暂时无法完成。');
@@ -154,8 +154,7 @@ function UsageTrend({tz}:{tz:string}) {
   </section>;
 }
 
-export function Dashboard() {
-  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+export function Dashboard({tz}:{tz:string}) {
   const {data,error,refresh} = useData<Wallet>('/api/dashboard?tz='+encodeURIComponent(tz),1200);
   return <><Heading title="概览" description="核对可用额度、预占和已结算费用。" />
     <div className="actions"><a className="action primary" href="/keys">管理密钥</a><a className="action" href="/usage">查看使用记录</a>
@@ -170,10 +169,10 @@ export function Dashboard() {
         {data.refundHeldMicros && data.refundHeldMicros!=='0' && <div><dt>退款冻结</dt><dd>{money(data.refundHeldMicros)}</dd></div>}
       </dl>
       <p className="muted">{data.heldMicros!=='0' ? '预占额度暂留给处理中或待核对的请求。' : '当前没有预占额度。'}</p>
-      <small className="muted">更新于 {new Date(data.asOf).toLocaleTimeString('zh-CN')}</small>
+      <small className="muted">更新于 {new Date(data.asOf).toLocaleTimeString('zh-CN',{timeZone:tz})}</small>
       {data.reviewCount>0 && <p><a href="/usage?status=review">查看 {data.reviewCount} 笔待核对请求</a></p>}
     </section>
-    <section className="panel"><h2>用量与已结算费用</h2>
+    <section className="panel"><h2>用量与已结算费用</h2><p>统计时区 {tz}</p>
       <dl className="metrics">
         <div><dt>今日 / 累计请求</dt><dd>{data.todayRequests} / {data.requests}</dd></div>
         <div><dt>今日 / 累计计费 Token</dt><dd>{data.todayTokens} / {data.tokens}</dd></div>
@@ -376,7 +375,7 @@ export function Keys() {
   </>;
 }
 
-export function Usage() {
+export function Usage({tz}:{tz:string}) {
   const [filter,setFilter] = useState({key_id:'',request_id:'',status:'',from:'',to:''});
   const [cursors,setCursors] = useState<string[]>([]);
   const [copyNotice,setCopyNotice] = useState('');
@@ -384,11 +383,9 @@ export function Usage() {
   if (filter.key_id) query.set('key_id',filter.key_id);
   if (filter.request_id) query.set('request_id',filter.request_id);
   if (filter.status) query.set('status',filter.status);
-  if (filter.from) query.set('from',new Date(filter.from+'T00:00:00').toISOString());
-  if (filter.to) {
-    const end = new Date(filter.to+'T00:00:00');
-    end.setDate(end.getDate()+1); query.set('to',end.toISOString());
-  }
+  if (filter.from) query.set('fromDay',filter.from);
+  if (filter.to) query.set('throughDay',filter.to);
+  if (filter.from || filter.to) query.set('tz',tz);
   if (cursors.length) query.set('cursor',cursors.at(-1)!);
   const keys = useData<{items:KeyRow[]}>('/api/keys');
   const records = useData<UsagePage>('/api/usage?'+query,1200);
@@ -406,7 +403,7 @@ export function Usage() {
         {keys.data?.items.map(k => <option key={k.id} value={k.id}>{k.name} · {k.prefix}…</option>)}</select></label>
       <label>状态<select value={filter.status} onChange={e => update('status',e.target.value)}><option value="">全部状态</option>
         {['dispatched','review','settled','released'].map(s => <option key={s} value={s}>{statusLabel(s)}</option>)}</select></label>
-      <label>开始日期<input type="date" value={filter.from} max={filter.to||undefined} onChange={e => update('from',e.target.value)} /></label>
+      <label>开始日期（{tz}）<input type="date" value={filter.from} max={filter.to||undefined} onChange={e => update('from',e.target.value)} /></label>
       <label>结束日期<input type="date" value={filter.to} min={filter.from||undefined} onChange={e => update('to',e.target.value)} /></label>
       <button onClick={records.refresh}>刷新</button>
       <button onClick={() => {setFilter({key_id:'',request_id:'',status:'',from:'',to:''});setCursors([]);}}>清空筛选</button>
@@ -414,7 +411,7 @@ export function Usage() {
     <ErrorNote error={records.error || keys.error} />
     {records.data ? <section className="panel"><h2>请求明细</h2>
       {records.data.items.length ? records.data.items.map(row => <details key={row.id} className="request-row">
-        <summary><span>{new Date(row.createdAt).toLocaleString('zh-CN')}</span><code>{row.model} · {row.prefix}…</code>
+        <summary><span>{new Date(row.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</span><code>{row.model} · {row.prefix}…</code>
           <span className="badge" data-status={row.status}>{statusLabel(row.status)}</span>
           <strong data-testid="request-fee">{row.status==='released'?'无扣费':row.status==='settled'?money(row.chargedMicros):
             row.status==='review'?'待确认':'结算中'}</strong>
@@ -430,7 +427,7 @@ export function Usage() {
         {row.status==='settled' && <><p>标准费用 {money(row.standardMicros)} · 输入 {row.inputTokens} · 缓存读取 {row.cachedTokens} · 输出 {row.outputTokens}</p>
           {row.ledgerDeltaMicros!==null && <p>账本已入账，扣除 {money(String(-BigInt(row.ledgerDeltaMicros)))}</p>}</>}
         {row.status==='review' && <p className="muted">这次请求的费用仍在核对，预留额度会在核对完成后更新。</p>}
-        <p className="muted">最近更新 {new Date(row.updatedAt).toLocaleString('zh-CN')}</p>
+        <p className="muted">最近更新 {new Date(row.updatedAt).toLocaleString('zh-CN',{timeZone:tz})}</p>
       </details>) : <p>没有符合条件的请求。可清空筛选，或在创建密钥后运行模拟调用。</p>}
       <p role="status">{copyNotice}</p>
       <div className="actions"><button disabled={!cursors.length} onClick={() => setCursors(cursors.slice(0,-1))}>上一页</button>
@@ -452,7 +449,7 @@ const paymentStatus:Record<string,string> = {
   canceled:'已取消',paused:'已暂停',
 };
 
-function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
+function TestBilling({refreshWallet,tz}:{refreshWallet:()=>void;tz:string}) {
   const [busy,setBusy] = useState(false);
   const [feedback,setFeedback] = useState('');
   const [returned,setReturned] = useState<string|null>(null);
@@ -511,14 +508,14 @@ function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
     {data.orders.length ? <div className="table-wrap"><table>
       <thead><tr><th>订单</th><th>金额</th><th>支付状态</th><th>订阅状态</th></tr></thead>
       <tbody>{data.orders.map(order=><tr key={order.id}>
-        <td>{order.kind==='credit'?'测试充值':'测试订阅'}<br/><small>{new Date(order.createdAt).toLocaleString('zh-CN')}</small></td>
+        <td>{order.kind==='credit'?'测试充值':'测试订阅'}<br/><small>{new Date(order.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</small></td>
         <td>{money(String(BigInt(order.amountCents)*10000n))}</td>
         <td>{paymentStatus[order.state] ?? '待确认'}
           {order.refundedCents>0 && <><br/><small>已退款 {centsLabel(order.refundedCents)}</small></>}
           {order.refundPending && <><br/><small>退款处理中</small></>}
         </td>
         <td>{order.subscriptionStatus ? paymentStatus[order.subscriptionStatus] ?? '待确认' : '—'}
-          {order.periodEnd && <><br/><small>账期截止 {new Date(order.periodEnd).toLocaleDateString('zh-CN')}</small></>}</td>
+          {order.periodEnd && <><br/><small>账期截止 {new Date(order.periodEnd).toLocaleDateString('zh-CN',{timeZone:tz})}</small></>}</td>
       </tr>)}</tbody>
     </table></div> : <p className="muted">还没有测试订单。</p>}
     {data.invoices.length>0 && <div className="table-wrap"><table>
@@ -526,13 +523,13 @@ function TestBilling({refreshWallet}:{refreshWallet:()=>void}) {
       <tbody>{data.invoices.map(invoice=><tr key={invoice.id}>
         <td>{invoice.reason==='subscription_cycle'?'续费':'开通'}</td>
         <td>{centsLabel(invoice.amountCents)}</td>
-        <td>{new Date(invoice.periodStart).toLocaleDateString('zh-CN')} 至 {new Date(invoice.periodEnd).toLocaleDateString('zh-CN')}</td>
+        <td>{new Date(invoice.periodStart).toLocaleDateString('zh-CN',{timeZone:tz})} 至 {new Date(invoice.periodEnd).toLocaleDateString('zh-CN',{timeZone:tz})}</td>
       </tr>)}</tbody>
     </table></div>}
   </section>;
 }
 
-export function Redeem() {
+export function Redeem({tz}:{tz:string}) {
   const wallet = useData<CreditReceipt['wallet']>('/api/dashboard');
   const field = useRef<HTMLInputElement>(null);
   const [code,setCode] = useState('');
@@ -577,7 +574,7 @@ export function Redeem() {
       <ErrorNote error={wallet.error} />
       {wallet.error && <button onClick={wallet.refresh}>刷新余额</button>}
     </section>
-    <TestBilling refreshWallet={()=>{wallet.refresh();history.refresh();}} />
+    <TestBilling tz={tz} refreshWallet={()=>{wallet.refresh();history.refresh();}} />
     <section className="panel" aria-labelledby="redeem-title"><h2 id="redeem-title">兑换额度</h2>
       <form onSubmit={submit} action="/api/redeem" method="post" aria-busy={busy}>
         <div className="filters">
@@ -592,7 +589,7 @@ export function Redeem() {
       <div role="status">{receipt && <>
         <p><strong>{receipt.replayed ? '该额度已到账' : '兑换成功'} · {money(receipt.receipt.amountMicros)}</strong></p>
         <p>收据编号 <code>{receipt.receipt.id}</code></p>
-        <p className="muted">到账时间 {new Date(receipt.receipt.createdAt).toLocaleString('zh-CN')}</p>
+        <p className="muted">到账时间 {new Date(receipt.receipt.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</p>
       </>}</div>
     </section>
     <section className="panel" aria-labelledby="wallet-history"><h2 id="wallet-history">钱包流水</h2>
@@ -604,7 +601,7 @@ export function Redeem() {
       {history.data ? history.data.items.length ? <>
         <div className="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>金额</th><th>编号</th></tr></thead>
           <tbody>{history.data.items.map(item=><tr key={item.id}>
-            <td>{new Date(item.createdAt).toLocaleString('zh-CN')}</td>
+            <td>{new Date(item.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</td>
             <td>{ledgerKind[item.kind]}</td>
             <td>{BigInt(item.deltaMicros)>0n ? '+'+money(item.deltaMicros) : '−'+money(String(-BigInt(item.deltaMicros)))}</td>
             <td>{item.requestId ? <a href={'/usage?request_id='+item.requestId}><code>{item.requestId}</code></a> : <code>{item.id}</code>}</td>

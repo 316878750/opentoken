@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import * as z from 'zod';
+import { readSettings, settingsChange, settingsPage, writeSettings, siteDisplay } from './admin-settings';
 import { adminAccess, hasRecentAdminAuth, recordLoginEvent, setRecentAdminAuth } from './admin';
 import { issueAdminRedeem, listAdminRedeem, voidAdminRedeem } from './admin-redeem';
 import { channelDraftInput, channelProbeInput, channelDisableInput, channelPublishInput, changeChannel,
@@ -16,11 +17,13 @@ import { accountRevision, appOrigin, endSession, loginSession, sealSession, sess
 import { redeemCredit, walletEntries } from './wallet';
 
 const date = z.iso.datetime({ offset:true });
+const localDay = z.iso.date().refine(value=>!value.startsWith('0000-'));
 const usageFilter = z.object({
   key_id:z.uuid().optional(), request_id:z.uuid().optional(), cursor:z.uuid().optional(),
   status:z.enum(['reserved','dispatched','review','settled','released']).optional(),
-  from:date.optional(), to:date.optional(),
-}).refine(f => !f.from || !f.to || new Date(f.from) < new Date(f.to));
+  from:date.optional(), to:date.optional(),fromDay:localDay.optional(),throughDay:localDay.optional(),
+}).refine(f => !f.from || !f.to || new Date(f.from) < new Date(f.to))
+  .refine(f=>!f.fromDay || !f.throughDay || f.fromDay<=f.throughDay);
 const keyInput = z.object({
   name:z.string().trim().min(1).max(80), groupId:z.uuid(), rpm:z.int().min(1).max(600),
   capMicros:z.string().regex(/^[1-9]\d{0,14}$/).nullish(),
@@ -81,8 +84,8 @@ async function body(req:NextRequest) {
   catch { throw new Fault(400,'invalid_json','请求体不是有效的 JSON。'); }
 }
 
-function timeZone(query:URLSearchParams) {
-  const tz = query.get('tz') || 'UTC';
+async function timeZone(query:URLSearchParams) {
+  const tz = query.get('tz') || (await siteDisplay()).timeZone;
   if (/^[+-]/.test(tz)) throw new Fault(400,'invalid_timezone','请使用 IANA 时区。');
   try { new Intl.DateTimeFormat('en',{timeZone:tz}); }
   catch { throw new Fault(400,'invalid_timezone','时区无效。'); }
@@ -166,6 +169,14 @@ export async function handle(req: NextRequest) {
     }
     const user = await sessionUser(token);
     if (!user) throw new Fault(401,'session_required','请先登录。');
+    if (route==='GET /api/admin/settings') {
+      const {before} = parse(settingsPage,Object.fromEntries(req.nextUrl.searchParams));
+      return json(await readSettings(user,before));
+    }
+    if (route==='POST /api/admin/settings') {
+      const result = await writeSettings(user,parse(settingsChange,await body(req)),hasRecentAdminAuth(req,token));
+      return json(result,200,result.requestId);
+    }
     if (route==='GET /api/admin/login-logs') {
       return json(await listAdminLogs(user,{kind:'login',filters:parse(loginLogFilter,Object.fromEntries(req.nextUrl.searchParams))}));
     }
@@ -265,13 +276,16 @@ export async function handle(req: NextRequest) {
       await updateKey(user,id,status);
       return json({ok:true});
     }
-    if (route === 'GET /api/dashboard') return json(await dashboard(user,timeZone(req.nextUrl.searchParams)));
+    if (route === 'GET /api/dashboard') return json(await dashboard(user,await timeZone(req.nextUrl.searchParams)));
     if (route === 'GET /api/usage-trend') {
       const query = req.nextUrl.searchParams;
       const days = parse(trendRange,query.get('days') ?? undefined);
-      return json(await usageTrend(user,timeZone(query),days==='30' ? 30 : 7));
+      return json(await usageTrend(user,await timeZone(query),days==='30' ? 30 : 7));
     }
-    if (route === 'GET /api/usage') return json(await usage(user,parse(usageFilter,Object.fromEntries(req.nextUrl.searchParams))));
+    if (route === 'GET /api/usage') {
+      const filters = parse(usageFilter,Object.fromEntries(req.nextUrl.searchParams));
+      return json(await usage(user,filters,filters.fromDay || filters.throughDay ? await timeZone(req.nextUrl.searchParams) : 'UTC'));
+    }
     throw new Fault(404,'not_found','该接口不在本次实现范围内。');
   } catch (error) {
     if (!(error instanceof Fault)) console.error('Local gateway operation failed',error instanceof Error ? error.name : 'unknown');

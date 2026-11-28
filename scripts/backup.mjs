@@ -53,6 +53,9 @@ export function backupTables(versions) {
       version==='["001","002","003","004","005","006","007","008","009","010","011","012","013","014"]') {
     return backupTables(versions.slice(0,-1));
   }
+  if (versions.length===15 && versions.at(-1)==='015') {
+    return [...backupTables(versions.slice(0,-1)),'gateway.setting_versions'].sort();
+  }
   throw new Error('Unsupported migration version for backup or restore');
 }
 const formats = `SET TIME ZONE 'UTC'; SET DateStyle TO 'ISO, YMD';

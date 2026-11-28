@@ -20,7 +20,7 @@ function decimal(micros:string|undefined) {
   return String(amount/1_000_000n)+(fractional ? '.'+fractional : '');
 }
 
-export function ModelManager() {
+export function ModelManager({timeZone}:{timeZone:string}) {
   const catalog = useData<AdminModelCatalog>(endpoint);
   const data = catalog.error ? undefined : catalog.data;
   const [selectedModel,setSelectedModel] = useState('');
@@ -163,7 +163,7 @@ export function ModelManager() {
         <tbody>{rates.map(rate=><tr key={rate.id}><td><code title={rate.id}>{rate.id.slice(0,8)}</code></td>
           <td>{rate.closedAt?'历史':'当前'}</td><td>{money(rate.inputMicros)}</td><td>{money(rate.cacheMicros)}</td>
           <td>{money(rate.outputMicros)}</td><td>{rate.multiplierBps/10000}×</td>
-          <td><time dateTime={rate.createdAt}>{new Date(rate.createdAt).toLocaleString('zh-CN')}</time></td>
+          <td><time dateTime={rate.createdAt}>{new Date(rate.createdAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
         </tr>)}</tbody>
       </table></div>}
     </section>}

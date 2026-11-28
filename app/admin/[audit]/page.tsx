@@ -1,3 +1,4 @@
+import { siteDisplay } from '@/lib/admin-settings';
 import { cookies } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
 import { adminAccess } from '@/lib/admin';
@@ -11,6 +12,7 @@ export default async function AuditPage({params}:{params:Promise<{audit:string}>
   if (!userId) redirect('/login?redirect=/admin/'+audit);
   const login = audit==='login-logs';
   if (!role || (login && role==='operator')) notFound();
+  const {timeZone} = await siteDisplay();
   return <div className="shell">
     <aside><a className="brand" href="/dashboard">OpenToken</a>
       <nav aria-label="管理员后台">
@@ -20,7 +22,7 @@ export default async function AuditPage({params}:{params:Promise<{audit:string}>
       </nav>
     </aside>
     <main><header className="top"><span>管理控制台</span><form action="/logout" method="post"><button>退出登录</button></form></header>
-      <div className="workspace"><AuditLog screen={audit} ownOnly={role==='operator'}/></div>
+      <div className="workspace"><AuditLog timeZone={timeZone} screen={audit} ownOnly={role==='operator'}/></div>
     </main>
   </div>;
 }

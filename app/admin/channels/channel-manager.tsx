@@ -24,7 +24,7 @@ function emptyDraft():Draft {
 }
 const tested = (version:Version,index:number)=>version.probes.find(probe=>probe.binding===index);
 
-export function ChannelManager() {
+export function ChannelManager({timeZone}:{timeZone:string}) {
   const channels = useData<ChannelData>(endpoint);
   const data = channels.error ? undefined : channels.data;
   const [search,setSearch] = useState('');
@@ -204,7 +204,7 @@ export function ChannelManager() {
         </div>
         {selected.enabled && <div className="filters"><label>回退版本<select value={rollbackId} onChange={e=>setRollbackId(e.target.value)}>
           <option value="">请选择</option>{selected.history.filter(v=>v.id!==selected.active?.id && v.credentialAvailable).map(v=>
-            <option key={v.id} value={v.id}>{v.name} · {v.id.slice(0,8)} · {new Date(v.publishedAt!).toLocaleString('zh-CN')}</option>)}</select></label>
+            <option key={v.id} value={v.id}>{v.name} · {v.id.slice(0,8)} · {new Date(v.publishedAt!).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</option>)}</select></label>
           <button disabled={busy || !rollbackId} onClick={()=>void change('rollback',rollbackId)}>回退</button></div>}
         {rollbackVersion && <ul>{rollbackVersion.bindings.map((item,index)=><li key={item.model+':'+item.group}>
           {item.model} · {item.group}{' '}<button disabled={busy} onClick={()=>void probe(rollbackVersion.id,index)}>重新测试回退绑定</button>

@@ -29,6 +29,9 @@ async function checkDatabase() {
     has_function_privilege(to_regprocedure('gateway.admin_begin_user_invite(uuid,uuid,uuid,text,bytea)'),'EXECUTE') AND
     has_function_privilege(to_regprocedure('gateway.admin_finish_user_invite(uuid,uuid,uuid,text)'),'EXECUTE') AND
     has_function_privilege(to_regprocedure('gateway.admin_list_login_events(uuid,jsonb)'),'EXECUTE') AND
+    has_function_privilege(to_regprocedure('gateway.site_display()'),'EXECUTE') AND
+    has_function_privilege(to_regprocedure('gateway.write_settings(uuid,integer,integer,jsonb,text,boolean,bigint,bigint)'),'EXECUTE') AND
+    has_function_privilege(to_regprocedure('gateway.admin_settings(uuid,bigint,bigint,integer)'),'EXECUTE') AND
     has_function_privilege(to_regprocedure('gateway.admin_list_operation_events(uuid,jsonb)'),'EXECUTE') AND
     EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('gateway.account_states')
       AND attname='deleted_at' AND NOT attisdropped) AS ready`);

@@ -17,7 +17,7 @@ const actions:Record<string,string> = {
   'model.group_state':'变更分组状态','model.rate_publish':'发布费率',
   'redeem.issue':'签发兑换码','redeem.void':'作废兑换码','redeem.credit':'兑换码入账','user.state':'变更账号状态','user.role':'变更用户角色',
   'user.delete':'删除账号','user.invite_started':'开始签发邀请','user.invite_finished':'邀请签发结果',
-  'user.invite_reconciled':'邀请核对','other':'其他操作',
+  'user.invite_reconciled':'邀请核对','settings.publish':'发布系统设置','settings.rollback':'回退系统设置','other':'其他操作',
 };
 const detailLabels:Record<string,string> = {before:'变更前',after:'变更后',codeId:'兑换码 ID',channelId:'渠道 ID',
   operationId:'操作编号',receiptId:'钱包收据 ID',modelId:'模型 ID',groupId:'分组 ID',rateId:'费率 ID',versionId:'版本 ID',amountMicros:'金额（微美元）',
@@ -34,7 +34,7 @@ function OperationDetails({event}:{event:OperationLog}) {
   </>;
 }
 
-export function AuditLog({screen,ownOnly}:{screen:'login-logs'|'operation-logs';ownOnly:boolean}) {
+export function AuditLog({screen,ownOnly,timeZone}:{timeZone:string;screen:'login-logs'|'operation-logs';ownOnly:boolean}) {
   const login = screen==='login-logs';
   const [filters,setFilters] = useState<Record<string,string>>({});
   const [cursors,setCursors] = useState<string[]>([]);
@@ -73,8 +73,8 @@ export function AuditLog({screen,ownOnly}:{screen:'login-logs'|'operation-logs';
     <h1>{login?'登录日志':'操作日志'}</h1>
     {ownOnly && <p>可查看当前账号执行的操作。</p>}
     <form className="filters" onSubmit={filter} onReset={()=>{setFilters({});setCursors([]);setRangeError('');}}>
-      <label>开始时间<input type="datetime-local" name="from"/></label>
-      <label>结束时间<input type="datetime-local" name="to"/></label>
+      <label>开始时间（浏览器本地）<input type="datetime-local" name="from"/></label>
+      <label>结束时间（浏览器本地）<input type="datetime-local" name="to"/></label>
       <label>结果<select name="outcome"><option value="">全部</option>
         {(login?['success','failure','rate_limited','unavailable']:['success','denied'])
           .map(value=><option key={value} value={value}>{outcomes[value]}</option>)}
@@ -96,10 +96,10 @@ export function AuditLog({screen,ownOnly}:{screen:'login-logs'|'operation-logs';
     {!data && !audit.error && <p>正在读取日志…</p>}
     {data?.items.length===0 && <p>没有符合条件的日志。</p>}
     {!!data?.items.length && <div className="table-wrap"><table>
-      <thead><tr><th>时间（本地）</th><th>{login?'用户与标识':'操作者'}</th>{!login && <th>动作</th>}
+      <thead><tr><th>时间（{timeZone}）</th><th>{login?'用户与标识':'操作者'}</th>{!login && <th>动作</th>}
         <th>结果</th><th>原因</th>{!login && <th>对象与变更</th>}<th>请求编号</th></tr></thead>
       <tbody>{data.items.map(event=><tr key={event.requestId}>
-        <td><time dateTime={event.occurredAt}>{new Date(event.occurredAt).toLocaleString('zh-CN')}</time></td>
+        <td><time dateTime={event.occurredAt}>{new Date(event.occurredAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
         {'identifier' in event ? <td>{event.userId && <><code>{event.userId}</code><br/></>}<code>{event.identifier}</code></td> :
           <><td>{event.source==='database'?'运维命令':<code>{event.actorId}</code>}</td><td>{actions[event.action]??event.action}</td></>}
         <td>{outcomes[event.outcome]??event.outcome}</td><td>{reasons[event.reason]??event.reason}</td>

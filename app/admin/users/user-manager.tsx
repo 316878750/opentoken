@@ -9,7 +9,7 @@ const roleNames = {system_admin:'系统管理员',operator:'运营人员',audito
 const statuses = {active:'正常',pending:'待验证',suspended:'已停用',auth_blocked:'身份服务已限制',deleted:'已删除'};
 type EditKind = 'state'|'role'|'delete';
 
-export function UserManager() {
+export function UserManager({timeZone}:{timeZone:string}) {
   const [filters,setFilters] = useState({search:'',status:''});
   const [cursors,setCursors] = useState<string[]>([]);
   const [editor,setEditor] = useState<{kind:EditKind;user:AdminUser}|null>(null);
@@ -102,7 +102,7 @@ export function UserManager() {
         <tbody>{data.items.map(user=><tr key={user.id}>
           <td>{user.email ?? '邮箱不可用'}<br/><code>{user.id}</code></td>
           <td>{statuses[user.status]}<br/>{user.deletedAt
-            ? <time dateTime={user.deletedAt}>{new Date(user.deletedAt).toLocaleString('zh-CN')}</time>
+            ? <time dateTime={user.deletedAt}>{new Date(user.deletedAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time>
             : user.emailConfirmed?'邮箱已验证':'邮箱待验证'}</td>
           <td>{user.role ? roleNames[user.role] : '普通用户'}</td>
           {data.canWrite && <><td>{user.wallet ? <>

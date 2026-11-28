@@ -48,7 +48,7 @@ export async function migrate(client) {
       ['004','004-trial-redemption.sql'],['005','005-stripe-sandbox.sql'],['006','006-stripe-reconciliation.sql'],
       ['007','007-paid-pilot-preparation.sql'],['008','008-admin-access.sql'],['009','009-admin-redeem-codes.sql'],
       ['010','010-managed-channels.sql'],['011','011-admin-models.sql'],['012','012-admin-users.sql'],
-      ['013','013-admin-user-deletion.sql'],['014','014-admin-log-queries.sql']]) {
+      ['013','013-admin-user-deletion.sql'],['014','014-admin-log-queries.sql'],['015','015-system-settings.sql']]) {
       if ((await client.query('SELECT 1 FROM gateway.schema_migrations WHERE version=$1',[version])).rowCount) continue;
       const source = await readFile(new URL('../replica/migrations/'+file,import.meta.url),'utf8');
       await client.query(source);
@@ -179,6 +179,11 @@ export async function check(client) {
     NOT has_table_privilege(current_user,'gateway.login_events','SELECT') AS login_events_private,
     has_function_privilege(current_user,'gateway.admin_list_login_events(uuid,jsonb)','EXECUTE') AS login_log_query,
     has_function_privilege(current_user,'gateway.admin_list_operation_events(uuid,jsonb)','EXECUTE') AS operation_log_query,
+    has_function_privilege(current_user,'gateway.write_settings(uuid,integer,integer,jsonb,text,boolean,bigint,bigint)','EXECUTE') AS settings_write,
+    has_function_privilege(current_user,'gateway.site_display()','EXECUTE') AS site_display,
+    has_function_privilege(current_user,'gateway.admin_settings(uuid,bigint,bigint,integer)','EXECUTE') AS settings_read,
+    NOT has_table_privilege(current_user,'gateway.setting_versions','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') AS settings_private,
+    NOT has_function_privilege(current_user,'gateway.issue_redeem_with_limits(uuid,uuid,bytea,bigint,timestamptz,bigint,bigint)','EXECUTE') AS quota_private,
     NOT has_table_privilege(current_user,'gateway.login_events','SELECT,UPDATE,DELETE,TRUNCATE') AS login_events_immutable,
     has_column_privilege(current_user,'gateway.login_events','request_id','INSERT') AS login_events_append,
     has_function_privilege(current_user,'gateway.admin_role_for(uuid)','EXECUTE') AS admin_role_lookup,
@@ -215,7 +220,7 @@ async function main() {
   const client = connection(action==='check' ? 'DATABASE_URL' : 'MIGRATION_DATABASE_URL');
   try {
     await client.connect();
-    if (action==='migrate') { await migrate(client); console.log('Migrations 001–014 ready.'); }
+    if (action==='migrate') { await migrate(client); console.log('Migrations 001–015 ready.'); }
     if (action==='seed') {
       await seed(client,process.env.PILOT_EMAIL?.trim());
       console.log(process.env.PILOT_EMAIL?.trim() ? 'Model catalog and one-time pilot credit ready.' : 'Model catalog ready.');

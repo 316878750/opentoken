@@ -8,7 +8,7 @@ const endpoint = '/api/admin/redeem-codes';
 const statuses: Record<RedeemCodeStatus,string> = {active:'可兑换',expired:'已过期',voided:'已作废',redeemed:'已核销'};
 type IssueInput = {amountUsd:string;expiresAt:string;operationId:string};
 
-export function RedeemCodes({actorId,canWrite}:{actorId:string;canWrite:boolean}) {
+export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId:string;canWrite:boolean}) {
   const [filter,setFilter] = useState('');
   const [cursor,setCursor] = useState('');
   const [pending,setPending] = useState<IssueInput>();
@@ -143,7 +143,7 @@ export function RedeemCodes({actorId,canWrite}:{actorId:string;canWrite:boolean}
           {canWrite && <th scope="col">操作</th>}</tr></thead>
         <tbody>{page.items.map(row=><tr key={row.id}>
           <td>{row.id}</td><td>{money(row.amountMicros)}</td><td>{statuses[row.status]}</td>
-          <td><time dateTime={row.expiresAt}>{new Date(row.expiresAt).toLocaleString('zh-CN')}</time></td>
+          <td><time dateTime={row.expiresAt}>{new Date(row.expiresAt).toLocaleString('zh-CN',{timeZone,timeZoneName:'short'})}</time></td>
           <td>{row.receiptId??'—'}</td>{canWrite && <td>{row.issuedBy??'—'}</td>}
           {canWrite && <td>{row.status==='active' && <button disabled={busy || !!voiding}
             onClick={()=>{setVoiding(row.id);setError('');setMessage('');}}>作废</button>}</td>}

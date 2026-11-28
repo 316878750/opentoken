@@ -29,7 +29,7 @@ const auditCreditUser = '30000000-0000-4000-8000-000000000014';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
   ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],['model@example.test',modelUser],
   ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],
-  ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser]]);
+  ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser],['settings-operator@example.test','30000000-0000-4000-8000-000000000015']]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -941,6 +941,9 @@ test('daily usage trends fill 7 and 30 local days, reconcile charges, and isolat
   const utcDay = new Date(past.created_at).toISOString().slice(0,10);
   const shanghaiDay = new Date(new Date(past.created_at).getTime()+8*3_600_000).toISOString().slice(0,10);
   assert.notEqual(utcDay,shanghaiDay);
+  const records = async day => (await request('/api/usage?tz=Asia%2FShanghai&fromDay='+day+'&throughDay='+day,{sessionOverride})).data.items;
+  assert.deepEqual((await records(shanghaiDay)).map(row=>row.id),[call.data.id]);
+  assert.deepEqual(await records(utcDay),[]);
   const trend = (days,tz,session=sessionOverride) => request('/api/usage-trend?days='+days+'&tz='+encodeURIComponent(tz),{sessionOverride:session});
   const utc = await trend(30,'UTC');
   assert.equal(utc.status,200);
@@ -1788,4 +1791,85 @@ test('a signed refund event updates a scoped order and the wallet once',async ()
   assert.equal(billing.orders.find(item=>item.id===order).refundedCents,200);
   const another=(await request('/api/session/login',loginPayload('pilot-a@example.test'))).headers.get('set-cookie').split(';')[0];
   assert.equal((await request('/api/billing',{sessionOverride:another})).data.orders.some(item=>item.id===order),false);
+});
+test('system settings publish atomically, enforce operator limits, and roll back by appending an audited version',async ()=>{
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(auditStaff,'auditor');
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.getSetCookie().map(v=>v.split(';')[0]).join('; ');
+  await changeAdminRole(identities.get('settings-operator@example.test'),'operator');
+  const admin = await signIn('owner@example.test'), operator = await signIn('settings-operator@example.test');
+  const auditor = await signIn('auditor@example.test'), member = await signIn('pilot-b@example.test');
+  const endpoint = '/api/admin/settings';
+  const read = sessionOverride => request(endpoint,{sessionOverride});
+  const initial = await read(admin);
+  assert.equal(initial.status,200);
+  const original = initial.data.current;
+  const settingsScreen = cookie=>fetch(base+'/admin/settings',{headers:{cookie}});
+  assert.match(await (await settingsScreen(admin)).text(),/发布设置/);
+  assert.doesNotMatch(await (await settingsScreen(operator)).text(),/发布设置/);
+  assert.equal((await settingsScreen(member)).status,404);
+  assert.equal(original.version,0);
+  assert.equal(original.singleMicros,'2000000');
+  assert.equal((await read(operator)).data.history,undefined);
+  for (const session of [auditor,member]) assert.equal((await read(session)).status,403);
+  assert.equal((await request(endpoint,{session:false,token:'fixture-gateway-key'})).status,401);
+  for (const query of ['fromDay=2026-11-02&throughDay=2026-11-01','fromDay=0000-01-01']) {
+    assert.equal((await request('/api/usage?'+query,{sessionOverride:member})).status,400);
+  }
+  const settings = {announcement:'测试服务公告',supportUrl:'https://support.example.test/help',timeZone:'Asia/Shanghai',
+    singleMicros:'1',dailyMicros:'2'};
+  const change = {expectedVersion:0,settings,reason:'试点调整'};
+  const send = (sessionOverride,body) => request(endpoint,{method:'POST',sessionOverride,body});
+  await withDatabaseOwner(()=>database.exec("ALTER TABLE gateway.admin_audit_events ADD CONSTRAINT fixture_settings_audit CHECK (action<>'settings.publish') NOT VALID"));
+  try {
+    assert.equal((await send(admin,change)).status,500);
+    assert.equal((await read(admin)).data.current.version,0);
+  } finally {
+    await withDatabaseOwner(()=>database.exec('ALTER TABLE gateway.admin_audit_events DROP CONSTRAINT fixture_settings_audit'));
+  }
+  assert.equal((await send(operator,change)).status,403);
+  assert.equal((await send(admin.split('; ')[0],change)).status,403);
+  for (const invalid of [{stripeLive:true},{timeZone:'Invalid/Zone'},{supportUrl:'javascript:alert(1)'},{dailyMicros:'-1'}])
+    assert.equal((await send(admin,{...change,settings:{...settings,...invalid}})).status,400);
+  const race = await Promise.all([send(admin,change),send(admin,change)]);
+  assert.deepEqual(race.map(r=>r.status).sort(),[200,409]);
+  const published = race.find(r=>r.status===200);
+  const page = await fetch(base+'/dashboard',{headers:{cookie:member}});
+  assert.match(await page.text(),/测试服务公告/);
+  const issue = await request('/api/admin/redeem-codes',{method:'POST',sessionOverride:operator,body:{
+    operationId:crypto.randomUUID(),amountUsd:'1',expiresAt:new Date(Date.now()+3600000).toISOString()}});
+  assert.equal(issue.data.error.code,'operator_single_limit');
+  const small = () => request('/api/admin/redeem-codes',{method:'POST',sessionOverride:operator,body:{
+    operationId:crypto.randomUUID(),amountUsd:'0.000001',expiresAt:new Date(Date.now()+3600000).toISOString()}});
+  assert.equal((await small()).status,201);
+  assert.equal((await small()).status,201);
+  assert.equal((await small()).data.error.code,'operator_daily_limit');
+  const rollback = await send(admin,{expectedVersion:1,restoreVersion:0,reason:'回到原设置'});
+  assert.equal(rollback.status,200);
+  assert.equal((await small()).status,201);
+  const after = (await read(admin)).data;
+  assert.deepEqual(after.current,{...original,version:2});
+  assert.deepEqual(after.history.map(row=>row.version),[2,1,0]);
+  for (const [res,action,before,afterVersion] of [[published,'settings.publish',0,1],[rollback,'settings.rollback',1,2]]) {
+    const {data:{items:[event]}} = await request('/api/admin/operation-logs?requestId='+res.headers.get('x-request-id'),{sessionOverride:auditor});
+    assert.deepEqual([event.action,event.details.before,event.details.after],[action,before,afterVersion]);
+  }
+  await assert.rejects(database.query('SELECT * FROM gateway.setting_versions'),{code:'42501'});
+});
+
+test('readiness detects missing console display privileges',async ()=>{
+  await withDatabaseOwner(()=>database.exec('REVOKE EXECUTE ON FUNCTION gateway.site_display() FROM opentoken_app'));
+  try {
+    await assert.rejects(check(admin),/privileges/);
+    const deadline = Date.now()+17_000;
+    let response = await request('/api/health',{session:false});
+    while (response.status===200 && Date.now()<deadline) {
+      await sleep(250);
+      response = await request('/api/health',{session:false});
+    }
+    assert.equal(response.status,503);
+  } finally {
+    await withDatabaseOwner(()=>database.exec('GRANT EXECUTE ON FUNCTION gateway.site_display() TO opentoken_app'));
+  }
 });

@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import type { TrendDay } from '@/lib/reports';
+import type { TrendDay, UsageDay } from '@/lib/reports';
 import { catalogPrice, guidePath, type CatalogSelection } from '@/lib/catalog-display';
 
 type Rate = {groupId:string;groupName:string;model:string;maxOutputTokens:number;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
@@ -12,7 +12,7 @@ type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMi
 type Wallet = {balanceMicros:string;heldMicros:string;refundHeldMicros?:string;availableMicros:string;asOf:string;activeKeys:number;
   requests:number;todayRequests:number;tokens:string;todayTokens:string;chargedMicros:string;standardMicros:string;
   todayChargedMicros:string;reviewCount:number};
-type UsagePage = {items:RequestRow[];nextCursor:string|null};
+type UsagePage = {items:RequestRow[];nextCursor:string|null;days:UsageDay[]};
 type WalletEntry = {id:string;kind:'redemption'|'usage'|'stripe_refund'|'stripe_refund_reversal';deltaMicros:string;requestId:string|null;createdAt:string};
 const ledgerKind:Record<WalletEntry['kind'],string> = {
   redemption:'额度到账',usage:'模型扣费',stripe_refund:'充值退款',stripe_refund_reversal:'退款失败返还',
@@ -574,25 +574,75 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
   </>;
 }
 
-export function Usage({tz}:{tz:string}) {
-  const [filter,setFilter] = useState({key_id:'',request_id:'',status:'',from:'',to:''});
+const recordMetrics = {requests:'请求数',inputTokens:'输入 Token',cachedTokens:'其中缓存读取',outputTokens:'输出 Token',
+  tokens:'总 Token',chargedMicros:'实际扣费',heldMicros:'在途预占'} as const;
+const emptyUsageFilter = {key_id:'',request_id:'',model:'',status:'',from:'',to:''};
+
+function RecordTrend({data,from,to,tz}:{data?:UsageDay[];from:string;to:string;tz:string}) {
+  const [metric,setMetric] = useState<keyof typeof recordMetrics>('requests');
+  const days = data??[];
+  const values = days.map(day=>BigInt(day[metric]));
+  const peak = values.reduce((max,n)=>n>max?n:max,0n);
+  const total = values.reduce((sum,n)=>sum+n,0n);
+  const format = (n:bigint)=>metric==='chargedMicros'||metric==='heldMicros'?money(String(n)):n.toLocaleString('zh-CN');
+  const start = from||days[0]?.date||'', end = to||days.at(-1)?.date||'';
+  const dayNumber = (day:string)=>Date.parse(day+'T00:00:00Z')/86_400_000;
+  const span = days.length ? dayNumber(end)-dayNumber(start) : 0;
+  const x = (offset:number)=>span ? 8+984*offset/span : 500;
+  const points = days.map((day,i)=>({offset:dayNumber(day.date)-dayNumber(start),
+    y:96-(peak ? Number(values[i]*9200n/peak)/100 : 0)}));
+  const line:string[] = [];
+  let nextDay=0;
+  for (const point of points) {
+    if (point.offset>nextDay) line.push(x(nextDay)+',96',x(point.offset-1)+',96');
+    line.push(x(point.offset)+','+point.y);
+    nextDay=point.offset+1;
+  }
+  if (nextDay<=span) line.push(x(nextDay)+',96',x(span)+',96');
+  return <section className="panel"><h2>筛选结果趋势</h2>
+    <label>趋势指标<select value={metric} onChange={e=>setMetric(e.target.value as keyof typeof recordMetrics)}>
+      {Object.entries(recordMetrics).map(([id,label])=><option key={id} value={id}>{label}</option>)}</select></label>
+    {days.length ? <>
+      <p className="trend-summary">全部匹配记录 · {recordMetrics[metric]}合计 <strong>{format(total)}</strong></p>
+      <svg className="usage-day-chart" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
+        <polyline points={line.join(' ')} fill="none" stroke="currentColor" strokeWidth="2" vectorEffect="non-scaling-stroke"/>
+        {points.map((point,i)=><circle key={days[i].date} cx={x(point.offset)} cy={point.y} r="3">
+          <title>{days[i].date} · {format(values[i])}</title></circle>)}
+      </svg>
+      <div className="trend-dates"><span>{start}</span><span>{end}</span></div>
+      <p className="muted">按 {tz} 自然日统计。输入已包含缓存读取，总 Token 为输入加输出。实际扣费仅含已结算请求。</p>
+      <details className="trend-details"><summary>查看按日明细</summary><table aria-label="筛选结果按日明细"><thead><tr>
+        <th scope="col">有请求的日期</th><th scope="col">{recordMetrics[metric]}</th></tr></thead><tbody>
+        {days.map((day,i)=><tr key={day.date}><th scope="row">{day.date}</th><td>{format(values[i])}</td></tr>)}
+      </tbody></table></details>
+    </> : <p className="muted">{data?'没有符合条件的趋势数据。':'等待请求明细…'}</p>}
+  </section>;
+}
+
+export function Usage({tz:siteZone}:{tz:string}) {
+  const [tz,setZone] = useState(siteZone);
+  const [deviceZone,setDeviceZone] = useState('');
+  const [filter,setFilter] = useState(emptyUsageFilter);
   const [requestInput,setRequestInput] = useState('');
   const [cursors,setCursors] = useState<string[]>([]);
   const [copyNotice,setCopyNotice] = useState('');
-  const query = new URLSearchParams();
+  const query = new URLSearchParams({trend:'1',tz});
   if (filter.key_id) query.set('key_id',filter.key_id);
   if (filter.request_id) query.set('request_id',filter.request_id);
   if (filter.status) query.set('status',filter.status);
+  if (filter.model) query.set('model',filter.model);
   if (filter.from) query.set('fromDay',filter.from);
   if (filter.to) query.set('throughDay',filter.to);
-  if (filter.from || filter.to) query.set('tz',tz);
   if (cursors.length) query.set('cursor',cursors.at(-1)!);
   const keys = useData<{items:KeyRow[]}>('/api/keys');
-  const records = useData<UsagePage>('/api/usage?'+query,1200);
+  const models = useData<{models:string[]}>('/api/usage/models');
+  const records = useData<UsagePage>('/api/usage?'+query,5000);
   useEffect(() => {
     const initial = new URLSearchParams(location.search);
     setRequestInput(initial.get('request_id') || '');
-    setFilter(f => ({...f,key_id:initial.get('key_id')||'',request_id:initial.get('request_id')||'',status:initial.get('status')||''}));
+    setDeviceZone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    setFilter({key_id:initial.get('key_id')||'',request_id:initial.get('request_id')||'',status:initial.get('status')||'',
+      model:initial.get('model')||'',from:initial.get('fromDay')||'',to:initial.get('throughDay')||''});
   },[]);
   function update(name:keyof typeof filter,value:string) {
     setFilter(f => ({...f,[name]:value}));setCursors([]);
@@ -600,7 +650,7 @@ export function Usage({tz}:{tz:string}) {
   return <><Heading title="使用记录" description="按密钥和日期核对单次请求的预占、费用及 Token。" />
     <form className="request-search filters" onSubmit={e=>{
       e.preventDefault();
-      setFilter({key_id:'',request_id:requestInput.trim(),status:'',from:'',to:''});
+      setFilter({...emptyUsageFilter,request_id:requestInput.trim()});
       setCursors([]); setCopyNotice('');
     }}>
       <label>按 OpenToken 请求 ID 查询<input type="search" value={requestInput} required
@@ -611,14 +661,19 @@ export function Usage({tz}:{tz:string}) {
     <div className="filters">
       <label>密钥<select value={filter.key_id} onChange={e => update('key_id',e.target.value)}><option value="">全部密钥</option>
         {keys.data?.items.map(k => <option key={k.id} value={k.id}>{k.name} · {k.prefix}…</option>)}</select></label>
+      <label>模型<select value={filter.model} onChange={e=>update('model',e.target.value)}><option value="">全部模型</option>
+        {[...new Set([...(models.data?.models??[]),filter.model].filter(Boolean))].map(model=><option key={model}>{model}</option>)}</select></label>
       <label>状态<select value={filter.status} onChange={e => update('status',e.target.value)}><option value="">全部状态</option>
-        {['dispatched','review','settled','released'].map(s => <option key={s} value={s}>{statusLabel(s)}</option>)}</select></label>
+        {['reserved','dispatched','review','settled','released'].map(s => <option key={s} value={s}>{s==='reserved'?'已预占':s==='dispatched'?'已发送':statusLabel(s)}</option>)}</select></label>
+      <label>统计时区<select value={tz} onChange={e=>{setZone(e.target.value);setCursors([]);}}>
+        {[...new Set([siteZone,deviceZone,'UTC','Asia/Shanghai'].filter(Boolean))].map(zone=><option key={zone}>{zone}</option>)}</select></label>
       <label>开始日期（{tz}）<input type="date" value={filter.from} max={filter.to||undefined} onChange={e => update('from',e.target.value)} /></label>
       <label>结束日期<input type="date" value={filter.to} min={filter.from||undefined} onChange={e => update('to',e.target.value)} /></label>
-      <button onClick={records.refresh}>刷新</button>
-      <button onClick={() => {setFilter({key_id:'',request_id:'',status:'',from:'',to:''});setRequestInput('');setCopyNotice('');setCursors([]);}}>清空筛选</button>
+      <button onClick={()=>{records.refresh();models.refresh();keys.refresh();}}>刷新</button>
+      <button onClick={() => {setFilter(emptyUsageFilter);setZone(siteZone);setRequestInput('');setCopyNotice('');setCursors([]);}}>清空筛选</button>
     </div>
-    <ErrorNote error={records.error || keys.error} />
+    <ErrorNote error={records.error || keys.error || models.error} />
+    <RecordTrend data={records.data?.days} from={filter.from} to={filter.to} tz={tz}/>
     {records.data ? <section className="panel"><h2>请求明细</h2>
       {filter.request_id && <p className="muted">当前查询 <code>{filter.request_id}</code></p>}
       {records.data.items.length ? records.data.items.map(row => <details key={row.id} open={filter.request_id ? true : undefined} className="request-row">

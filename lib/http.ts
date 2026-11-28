@@ -12,7 +12,7 @@ import { inviteAdminUser, listAdminUsers, userChangeInput, userInviteInput, user
 import { ensureWallet } from './data';
 import { catalog, complete, createKey, editKey, Fault, keyOptions, keyPage, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
-import { dashboard, usage, usageTrend } from './reports';
+import { dashboard, usage, usageModels, usageTrend } from './reports';
 import { accountRevision, appOrigin, endSession, loginSession, sealSession, sessionCookie, sessionUser, setSession } from './session';
 import { redeemCredit, walletEntries } from './wallet';
 
@@ -20,6 +20,7 @@ const date = z.iso.datetime({ offset:true });
 const localDay = z.iso.date().refine(value=>!value.startsWith('0000-'));
 const usageFilter = z.object({
   key_id:z.uuid().optional(), request_id:z.uuid().optional(), cursor:z.uuid().optional(),
+  model:z.string().min(1).max(128).optional(),trend:z.literal('1').optional(),
   status:z.enum(['reserved','dispatched','review','settled','released']).optional(),
   from:date.optional(), to:date.optional(),fromDay:localDay.optional(),throughDay:localDay.optional(),
 }).refine(f => !f.from || !f.to || new Date(f.from) < new Date(f.to))
@@ -297,9 +298,10 @@ export async function handle(req: NextRequest) {
       const days = parse(trendRange,query.get('days') ?? undefined);
       return json(await usageTrend(user,await timeZone(query),days==='30' ? 30 : 7));
     }
+    if (route === 'GET /api/usage/models') return json({models:await usageModels(user)});
     if (route === 'GET /api/usage') {
       const filters = parse(usageFilter,Object.fromEntries(req.nextUrl.searchParams));
-      return json(await usage(user,filters,filters.fromDay || filters.throughDay ? await timeZone(req.nextUrl.searchParams) : 'UTC'));
+      return json(await usage(user,filters,filters.trend || filters.fromDay || filters.throughDay ? await timeZone(req.nextUrl.searchParams) : 'UTC'));
     }
     throw new Fault(404,'not_found','该接口不在本次实现范围内。');
   } catch (error) {

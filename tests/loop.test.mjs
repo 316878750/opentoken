@@ -31,7 +31,8 @@ const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.t
   ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],
   ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser],['settings-operator@example.test','30000000-0000-4000-8000-000000000015'],
   ['release-fixture@example.test','30000000-0000-4000-8000-000000000016'],
-  ['key-manager@example.test','30000000-0000-4000-8000-000000000017']]);
+  ['key-manager@example.test','30000000-0000-4000-8000-000000000017'],
+  ['usage-report@example.test','30000000-0000-4000-8000-000000000018']]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -1059,6 +1060,77 @@ test('daily usage trends fill 7 and 30 local days, reconcile charges, and isolat
   assert.ok(other.data.items.every(day=>day.requests===0 && day.tokens==='0' && day.chargedMicros==='0'));
   assert.equal((await trend(8,'UTC')).status,400);
   assert.equal((await trend(7,'Invalid/Timezone')).status,400);
+});
+
+test('filtered usage trend reconciles every detail page, cached input, held funds and ledger debits',async()=>{
+  const login=await request('/api/session/login',loginPayload('usage-report@example.test'));
+  const sessionOverride=login.headers.get('set-cookie').split(';')[0];
+  const mine=(path,options={})=>request(path,{sessionOverride,...options});
+  const credit=await withDatabaseOwner(()=>redeemCommand(admin,['issue','3',new Date(Date.now()+3600000).toISOString()]));
+  assert.equal((await mine('/api/redeem',{method:'POST',body:{code:credit.code}})).status,200);
+  const {groupId,model}=(await mine('/api/catalog')).data.rates.find(r=>r.model==='compatible-chat');
+  const makeKey=async name=>(await mine('/api/keys',{method:'POST',body:{name,groupId,rpm:60}})).data;
+  const key=await makeKey('report'),otherKey=await makeKey('separate key');
+  const call=(key,model,content)=>request('/v1/chat/completions',{method:'POST',token:key.secret,session:false,
+    body:{model,messages:[{role:'user',content}],max_completion_tokens:16}});
+  for(let i=0;i<21;i++) assert.equal((await call(key,model,'report fixture')).status,200);
+  assert.equal((await call(key,model,'fixture uncertain')).status,503);
+  assert.equal((await call(otherKey,model,'separate key')).status,200);
+  assert.equal((await call(key,'mock-text','separate model')).status,200);
+  // Shanghai midnight has different UTC and local dates. Identical timestamps exercise the cursor tie-breaker.
+  await database.query("UPDATE gateway.usage_requests SET created_at='2025-03-04 20:00:00Z' WHERE key_id IN ($1,$2)",[key.id,otherKey.id]);
+  const params={key_id:key.id,model,fromDay:'2025-03-05',throughDay:'2025-03-05',tz:'Asia/Shanghai',trend:'1'};
+  const report=async change=>{
+    const result=await mine('/api/usage?'+new URLSearchParams({...params,...change}));
+    assert.equal(result.status,200);
+    return result.data;
+  };
+  const first=await report({});
+  assert.equal(first.items.length,20);
+  const second=await report({cursor:first.nextCursor});
+  assert.equal(second.items.length,2);
+  assert.equal(second.nextCursor,null);
+  assert.deepEqual(first.days,second.days);
+  const rows=[...first.items,...second.items],paid=rows.filter(r=>r.status==='settled');
+  assert.equal(new Set(rows.map(r=>r.id)).size,22);
+  assert.ok(rows.every(r=>r.model===model && r.keyId===key.id));
+  const sum=field=>String(paid.reduce((n,r)=>n+BigInt(r[field]),0n));
+  const [day]=first.days;
+  assert.equal(first.days.length,1);
+  assert.deepEqual(day,{date:'2025-03-05',requests:22,inputTokens:sum('inputTokens'),cachedTokens:sum('cachedTokens'),
+    outputTokens:sum('outputTokens'),tokens:'336',chargedMicros:sum('chargedMicros'),heldMicros:'1648'});
+  assert.deepEqual([day.inputTokens,day.cachedTokens,day.outputTokens,day.chargedMicros],['294','84','42','84']);
+  const review=rows.find(r=>r.status==='review');
+  assert.deepEqual([review.reservedMicros,review.chargedMicros,review.releasedMicros,review.ledgerDeltaMicros],['1648',null,null,null]);
+  assert.equal((await mine('/api/dashboard')).data.heldMicros,day.heldMicros);
+  const entries=new Map();
+  let cursor='';
+  do {
+    const {data}=await mine('/api/wallet/entries?kind=usage'+(cursor?'&cursor='+cursor:''));
+    data.items.forEach(e=>entries.set(e.requestId,e.deltaMicros));
+    cursor=data.nextCursor;
+  }while(cursor);
+  for(const r of paid) assert.equal(entries.get(r.id),String(-BigInt(r.chargedMicros)));
+  assert.ok(!entries.has(review.id));
+  const reviewed=await report({status:'review'}),settled=await report({status:'settled'});
+  assert.deepEqual(reviewed.items.map(r=>r.id),[review.id]);
+  assert.deepEqual([reviewed.days[0].requests,reviewed.days[0].tokens,reviewed.days[0].chargedMicros,reviewed.days[0].heldMicros],[1,'0','0','1648']);
+  assert.deepEqual([settled.days[0].requests,settled.days[0].heldMicros],[21,'0']);
+  assert.equal((await report({model:'mock-text'})).days[0].requests,1);
+  assert.equal((await report({key_id:otherKey.id})).days[0].requests,1);
+  assert.deepEqual((await report({tz:'UTC'})),{items:[],nextCursor:null,days:[]});
+  assert.equal((await report({tz:'UTC',fromDay:'2025-03-04',throughDay:'2025-03-04'})).days[0].date,'2025-03-04');
+  assert.deepEqual((await report({request_id:review.id})).days,reviewed.days);
+  assert.deepEqual((await mine('/api/usage/models')).data.models,[model,'mock-text'].sort());
+  const otherLogin=await request('/api/session/login',loginPayload('audit-credit@example.test'));
+  const other={sessionOverride:otherLogin.headers.get('set-cookie').split(';')[0]};
+  assert.deepEqual((await request('/api/usage?'+new URLSearchParams(params),other)).data,{items:[],nextCursor:null,days:[]});
+  assert.deepEqual((await request('/api/usage/models',other)).data.models,[]);
+  await database.query("UPDATE gateway.usage_requests SET created_at=created_at-interval '1 day' WHERE id=$1",[paid[0].id]);
+  const spanning=await report({fromDay:'2025-03-04'});
+  assert.deepEqual(spanning.days.map(d=>[d.date,d.requests,d.tokens,d.chargedMicros,d.heldMicros]),[
+    ['2025-03-04',1,'16','4','0'],['2025-03-05',21,'320','80','1648'],
+  ]);
 });
 
 async function stripeEvent(type,object,{id='evt_'+crypto.randomUUID().replaceAll('-',''),live=false,valid=true}={}) {

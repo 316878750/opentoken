@@ -29,7 +29,8 @@ const auditCreditUser = '30000000-0000-4000-8000-000000000014';
 const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.test',secondary],['pilot-c@example.test',trial],
   ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],['model@example.test',modelUser],
   ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],
-  ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser],['settings-operator@example.test','30000000-0000-4000-8000-000000000015']]);
+  ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser],['settings-operator@example.test','30000000-0000-4000-8000-000000000015'],
+  ['release-fixture@example.test','30000000-0000-4000-8000-000000000016']]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -1872,4 +1873,46 @@ test('readiness detects missing console display privileges',async ()=>{
   } finally {
     await withDatabaseOwner(()=>database.exec('GRANT EXECUTE ON FUNCTION gateway.site_display() TO opentoken_app'));
   }
+});
+
+test('release rehearsal reconciles a managed credit and both call modes to the same account',async ()=>{
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(auditStaff,'auditor');
+  const signIn = async email => (await request('/api/session/login',loginPayload(email))).headers.getSetCookie().map(value=>value.split(';')[0]).join('; ');
+  const operator = await signIn('owner@example.test'), auditor = await signIn('auditor@example.test');
+  const user = await signIn('release-fixture@example.test');
+  const account = path => request(path,{sessionOverride:user});
+  const issue = await request('/api/admin/redeem-codes',{method:'POST',sessionOverride:operator,body:{
+    amountUsd:'3',operationId:crypto.randomUUID(),expiresAt:new Date(Date.now()+3600000).toISOString()}});
+  assert.equal(issue.status,201);
+  const redemption = await request('/api/redeem',{method:'POST',sessionOverride:user,body:{code:issue.data.code}});
+  assert.equal(redemption.data.wallet.balanceMicros,'3000000');
+  const groupId = (await account('/api/catalog')).data.rates.find(rate=>rate.model==='mock-text').groupId;
+  const key = await request('/api/keys',{method:'POST',sessionOverride:user,body:{name:'release rehearsal',groupId,rpm:10}});
+  assert.equal(key.status,201);
+  assert.equal((await request('/api/admin/settings',{session:false,token:key.data.secret})).status,401);
+  const ids = [];
+  for (const stream of [false,true]) {
+    const response = await fetch(base+'/v1/chat/completions',{method:'POST',headers:{
+      'content-type':'application/json',authorization:'Bearer '+key.data.secret},
+      body:JSON.stringify({model:'mock-text',messages:[{role:'user',content:'Release rehearsal'}],stream,max_completion_tokens:128})});
+    assert.equal(response.status,200);
+    if (stream) assert.match(await response.text(),/data: \[DONE\]/);
+    else assert.ok((await response.json()).choices[0].message.content);
+    const id = response.headers.get('x-request-id');
+    const row = (await account('/api/usage?request_id='+id)).data.items[0];
+    assert.deepEqual([row.status,row.reservedMicros,row.chargedMicros,row.releasedMicros,row.ledgerDeltaMicros],
+      ['settled','2000000','750000','1250000','-750000']);
+    ids.push(id);
+  }
+  const wallet = (await account('/api/dashboard')).data;
+  assert.deepEqual([wallet.balanceMicros,wallet.heldMicros,wallet.chargedMicros],['1500000','0','1500000']);
+  const ledger = (await account('/api/wallet/entries')).data.items;
+  assert.equal(ledger.length,3);
+  assert.equal(ledger.find(row=>row.kind==='redemption').id,redemption.data.receipt.id);
+  assert.deepEqual(ledger.filter(row=>row.kind==='usage').map(row=>row.requestId).sort(),ids.sort());
+  const audit = (await request('/api/admin/operation-logs?action=redeem.credit&object='+issue.data.id,{sessionOverride:auditor})).data.items;
+  assert.equal(audit[0].details.receiptId,redemption.data.receipt.id);
+  const visible = JSON.stringify([ledger,audit,(await account('/api/keys')).data]);
+  for (const secret of [key.data.secret,issue.data.code]) assert.equal(visible.includes(secret),false);
 });

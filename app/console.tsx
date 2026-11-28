@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import type { TrendDay, UsageDay } from '@/lib/reports';
+import type { DashboardTrend, TrendDay, UsageDay } from '@/lib/reports';
 import { catalogPrice, guidePath, type CatalogSelection } from '@/lib/catalog-display';
 
 type Rate = {groupId:string;groupName:string;model:string;maxOutputTokens:number;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
@@ -119,15 +119,44 @@ export function Login({selection}:{selection?:CatalogSelection}) {
 
 const trendMetrics = {requests:'请求数',tokens:'计费 Token',chargedMicros:'实际扣费'} as const;
 
+function CostSources({data,tz}:{data:DashboardTrend;tz:string}) {
+  const fromDay=data.items[0].date, throughDay=data.items[data.items.length-1].date;
+  const charged=data.items.reduce((sum,day)=>sum+BigInt(day.chargedMicros),0n);
+  return <>
+    <section className="panel" aria-labelledby="model-costs"><h2 id="model-costs">模型费用来源</h2>
+      <p>{fromDay} 至 {throughDay}（{tz}） · 同期实际扣费 <strong>{money(String(charged))}</strong></p>
+      {data.models.length ? <div className="table-wrap"><table className="phone-records" aria-label="各模型用量和费用">
+        <thead><tr>{['模型','请求数','输入 Token','其中缓存读取','输出 Token','总 Token','实际扣费','在途预占'].map(label=><th key={label} scope="col">{label}</th>)}</tr></thead>
+        <tbody>{data.models.map(row=><tr key={row.model}>
+          <th scope="row"><a href={'/usage?'+new URLSearchParams({model:row.model,fromDay,throughDay,tz})}>{row.model}</a></th>
+          <td data-label="请求数">{row.requests}</td><td data-label="输入 Token">{row.inputTokens}</td>
+          <td data-label="其中缓存读取">{row.cachedTokens}</td><td data-label="输出 Token">{row.outputTokens}</td>
+          <td data-label="总 Token">{row.tokens}</td><td data-label="实际扣费">{money(row.chargedMicros)}</td>
+          <td data-label="在途预占">{money(row.heldMicros)}</td>
+        </tr>)}</tbody></table></div> : <p className="muted">所选日期范围内没有模型调用。</p>}
+    </section>
+    <section className="panel" aria-labelledby="recent-usage"><h2 id="recent-usage">最近请求</h2>
+      {data.recent.length ? <div className="table-wrap"><table className="phone-records" aria-label="最近请求">
+        <thead><tr>{['请求编号','模型','时间','状态','实际扣费'].map(label=><th key={label} scope="col">{label}</th>)}</tr></thead>
+        <tbody>{data.recent.map(row=><tr key={row.id}>
+          <th scope="row"><a href={'/usage?'+new URLSearchParams({request_id:row.id,tz})+'#bill-'+row.id}>{row.id}</a></th>
+          <td data-label="模型">{row.model}</td><td data-label="时间">{new Date(row.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</td>
+          <td data-label="状态">{statusLabel(row.status)}</td>
+          <td data-label="实际扣费">{row.status==='released'?'无扣费':money(row.chargedMicros)}</td>
+        </tr>)}</tbody></table></div> : <p className="muted">这段时间没有请求明细。</p>}
+    </section>
+  </>;
+}
+
 function UsageTrend({tz}:{tz:string}) {
   const [days,setDays] = useState<'7'|'30'>('7');
   const [metric,setMetric] = useState<keyof typeof trendMetrics>('requests');
-  const {data,error,refresh} = useData<{items:TrendDay[]}>('/api/usage-trend?days='+days+'&tz='+encodeURIComponent(tz),15000);
+  const {data,error,refresh} = useData<DashboardTrend>('/api/usage-trend?sources=1&days='+days+'&tz='+encodeURIComponent(tz),15000);
   const value = (day:TrendDay) => BigInt(day[metric]);
   const peak = data?.items.reduce((max,day)=>value(day)>max ? value(day) : max,0n) ?? 0n;
   const format = (amount:bigint) => metric==='chargedMicros' ? money(amount.toString()) : amount.toLocaleString('zh-CN');
   const hasRequests = data?.items.some(day=>day.requests>0);
-  return <section className="panel" aria-labelledby="trend-title">
+  return <><section className="panel" aria-labelledby="trend-title">
     <h2 id="trend-title">用量趋势</h2>
     <div className="filters">
       <label>时间范围<select value={days} onChange={e=>setDays(e.target.value==='30' ? '30' : '7')}>
@@ -157,7 +186,7 @@ function UsageTrend({tz}:{tz:string}) {
       </details>
     </> : <p className="muted trend-summary">这段时间没有请求。</p> :
       !error && <p className="muted trend-summary">正在读取趋势…</p>}
-  </section>;
+  </section>{data && <CostSources data={data} tz={tz}/>}</>;
 }
 
 export function Dashboard({tz}:{tz:string}) {
@@ -637,13 +666,25 @@ export function Usage({tz:siteZone}:{tz:string}) {
   const keys = useData<{items:KeyRow[]}>('/api/keys');
   const models = useData<{models:string[]}>('/api/usage/models');
   const records = useData<UsagePage>('/api/usage?'+query,5000);
+  const openedBill = useRef('');
   useEffect(() => {
     const initial = new URLSearchParams(location.search);
     setRequestInput(initial.get('request_id') || '');
     setDeviceZone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    const linkedZone=initial.get('tz');
+    if (linkedZone && !/^[+-]/.test(linkedZone)) {
+      try { new Intl.DateTimeFormat('en',{timeZone:linkedZone}); setZone(linkedZone); }
+      catch { /* Keep the configured time zone for an invalid link. */ }
+    }
     setFilter({key_id:initial.get('key_id')||'',request_id:initial.get('request_id')||'',status:initial.get('status')||'',
       model:initial.get('model')||'',from:initial.get('fromDay')||'',to:initial.get('throughDay')||''});
   },[]);
+  useEffect(()=>{
+    const id=filter.request_id;
+    if (!id || openedBill.current===id || location.hash!=='#bill-'+id) return;
+    const summary=document.getElementById('bill-'+id)?.querySelector('summary');
+    if (summary && records.data?.items.some(row=>row.id===id)) { summary.focus(); summary.scrollIntoView({block:'start'}); openedBill.current=id; }
+  },[filter.request_id,records.data]);
   function update(name:keyof typeof filter,value:string) {
     setFilter(f => ({...f,[name]:value}));setCursors([]);
   }
@@ -666,7 +707,7 @@ export function Usage({tz:siteZone}:{tz:string}) {
       <label>状态<select value={filter.status} onChange={e => update('status',e.target.value)}><option value="">全部状态</option>
         {['reserved','dispatched','review','settled','released'].map(s => <option key={s} value={s}>{s==='reserved'?'已预占':s==='dispatched'?'已发送':statusLabel(s)}</option>)}</select></label>
       <label>统计时区<select value={tz} onChange={e=>{setZone(e.target.value);setCursors([]);}}>
-        {[...new Set([siteZone,deviceZone,'UTC','Asia/Shanghai'].filter(Boolean))].map(zone=><option key={zone}>{zone}</option>)}</select></label>
+        {[...new Set([siteZone,deviceZone,tz,'UTC','Asia/Shanghai'].filter(Boolean))].map(zone=><option key={zone}>{zone}</option>)}</select></label>
       <label>开始日期（{tz}）<input type="date" value={filter.from} max={filter.to||undefined} onChange={e => update('from',e.target.value)} /></label>
       <label>结束日期<input type="date" value={filter.to} min={filter.from||undefined} onChange={e => update('to',e.target.value)} /></label>
       <button onClick={()=>{records.refresh();models.refresh();keys.refresh();}}>刷新</button>
@@ -676,7 +717,7 @@ export function Usage({tz:siteZone}:{tz:string}) {
     <RecordTrend data={records.data?.days} from={filter.from} to={filter.to} tz={tz}/>
     {records.data ? <section className="panel"><h2>请求明细</h2>
       {filter.request_id && <p className="muted">当前查询 <code>{filter.request_id}</code></p>}
-      {records.data.items.length ? records.data.items.map(row => <details key={row.id} open={filter.request_id ? true : undefined} className="request-row">
+      {records.data.items.length ? records.data.items.map(row => <details key={row.id} id={'bill-'+row.id} open={filter.request_id ? true : undefined} className="request-row">
         <summary><span>{new Date(row.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</span><code>{row.model} · {row.prefix}…</code>
           <span className="badge" data-status={row.status}>{statusLabel(row.status)}</span>
           <strong data-testid="request-fee">{row.status==='released'?'无扣费':row.status==='settled'?money(row.chargedMicros):

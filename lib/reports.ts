@@ -25,8 +25,7 @@ export async function dashboard(user: string, tz: string) {
 
 export type TrendDay = {date:string;requests:number;tokens:string;chargedMicros:string};
 
-export async function usageTrend(user:string,tz:string,days:7|30) {
-  const {db} = await store();
+async function trendDays(db:Pool|PoolClient,user:string,tz:string,days:7|30) {
   const {rows} = await db.query<TrendDay>(`WITH calendar AS (
     SELECT (now() AT TIME ZONE $2)::date AS today
   ), bounds AS (
@@ -46,11 +45,40 @@ export async function usageTrend(user:string,tz:string,days:7|30) {
   FROM bounds CROSS JOIN generate_series(0,$3::int-1) AS dates(day_offset)
   LEFT JOIN totals ON totals.day=bounds.first_day+dates.day_offset
   ORDER BY dates.day_offset`,[user,tz,days]);
-  return {items:rows};
+  return rows;
 }
 
 export type UsageFilter = { key_id?:string; request_id?:string; model?:string; status?:string; from?:string; to?:string; fromDay?:string; throughDay?:string; cursor?:string; trend?:'1' };
 export type UsageDay = TrendDay & {inputTokens:string;cachedTokens:string;outputTokens:string;heldMicros:string};
+type ModelUsage = Omit<UsageDay,'date'> & {model:string};
+type RecentUsage = {id:string;model:string;status:string;createdAt:string;chargedMicros:string|null};
+export type DashboardTrend = {items:TrendDay[];models:ModelUsage[];recent:RecentUsage[]};
+
+const usageMetrics = `count(*)::int AS requests,
+  coalesce(sum(u.input_tokens) FILTER (WHERE u.status='settled'),0)::text AS "inputTokens",
+  coalesce(sum(u.cached_input_tokens) FILTER (WHERE u.status='settled'),0)::text AS "cachedTokens",
+  coalesce(sum(u.output_tokens) FILTER (WHERE u.status='settled'),0)::text AS "outputTokens",
+  coalesce(sum(u.input_tokens::bigint+u.output_tokens) FILTER (WHERE u.status='settled'),0)::text AS tokens,
+  coalesce(sum(u.charged_micros) FILTER (WHERE u.status='settled'),0)::text AS "chargedMicros",
+  coalesce(sum(u.reserved_micros) FILTER (WHERE u.status IN ('reserved','dispatched','review')),0)::text AS "heldMicros"`;
+
+export async function usageTrend(user:string,tz:string,days:7|30,sources=false) {
+  if (!sources) return {items:await trendDays(store().db,user,tz,days)};
+  return transaction(async tx=>{
+    await tx.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+    const items = await trendDays(tx,user,tz,days);
+    const args = [user,tz,items[0].date,items[items.length-1].date];
+    const period = `FROM gateway.usage_requests u JOIN gateway.models m ON m.id=u.model_id
+      WHERE u.user_id=$1 AND u.created_at >= ($3::date::timestamp AT TIME ZONE $2)
+        AND u.created_at < (($4::date+1)::timestamp AT TIME ZONE $2)`;
+    const {rows:models} = await tx.query<ModelUsage>(`SELECT m.code AS model,${usageMetrics}
+      ${period} GROUP BY m.code ORDER BY coalesce(sum(u.charged_micros),0) DESC,m.code`,args);
+    const {rows:recent} = await tx.query<RecentUsage>(`SELECT u.id,m.code AS model,u.status,u.created_at AS "createdAt",
+      u.charged_micros::text AS "chargedMicros" ${period}
+      ORDER BY u.created_at DESC,u.id DESC LIMIT 5`,args);
+    return {items,models,recent} satisfies DashboardTrend;
+  });
+}
 
 export async function usageModels(user:string) {
   const {rows} = await store().db.query<{model:string}>(`SELECT DISTINCT m.code AS model
@@ -88,13 +116,7 @@ export async function usage(user: string, f: UsageFilter,tz:string) {
     await tx.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
     const records = await page(tx);
     const {rows:days} = await tx.query<UsageDay>(`SELECT to_char(u.created_at AT TIME ZONE $10,'YYYY-MM-DD') AS date,
-      count(*)::int AS requests,
-      coalesce(sum(u.input_tokens) FILTER (WHERE u.status='settled'),0)::text AS "inputTokens",
-      coalesce(sum(u.cached_input_tokens) FILTER (WHERE u.status='settled'),0)::text AS "cachedTokens",
-      coalesce(sum(u.output_tokens) FILTER (WHERE u.status='settled'),0)::text AS "outputTokens",
-      coalesce(sum(u.input_tokens::bigint+u.output_tokens) FILTER (WHERE u.status='settled'),0)::text AS tokens,
-      coalesce(sum(u.charged_micros) FILTER (WHERE u.status='settled'),0)::text AS "chargedMicros",
-      coalesce(sum(u.reserved_micros) FILTER (WHERE u.status IN ('reserved','dispatched','review')),0)::text AS "heldMicros"
+      ${usageMetrics}
       ${scope} GROUP BY 1 ORDER BY 1`,args);
     return {...records,days};
   });

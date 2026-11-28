@@ -32,7 +32,8 @@ const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.t
   ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser],['settings-operator@example.test','30000000-0000-4000-8000-000000000015'],
   ['release-fixture@example.test','30000000-0000-4000-8000-000000000016'],
   ['key-manager@example.test','30000000-0000-4000-8000-000000000017'],
-  ['usage-report@example.test','30000000-0000-4000-8000-000000000018']]);
+  ['usage-report@example.test','30000000-0000-4000-8000-000000000018'],
+  ['cost-sources@example.test','30000000-0000-4000-8000-000000000019']]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -1131,6 +1132,60 @@ test('filtered usage trend reconciles every detail page, cached input, held fund
   assert.deepEqual(spanning.days.map(d=>[d.date,d.requests,d.tokens,d.chargedMicros,d.heldMicros]),[
     ['2025-03-04',1,'16','4','0'],['2025-03-05',21,'320','80','1648'],
   ]);
+});
+
+test('dashboard model costs and recent bills reconcile to usage for the selected local days',async()=>{
+  const login=await request('/api/session/login',loginPayload('cost-sources@example.test'));
+  const sessionOverride=login.headers.get('set-cookie').split(';')[0];
+  const mine=(path,options={})=>request(path,{sessionOverride,...options});
+  const tz='Asia/Shanghai';
+  const sources=async days=>{
+    const r=await mine('/api/usage-trend?'+new URLSearchParams({tz,days,sources:'1'}));
+    assert.equal(r.status,200);return r.data;
+  };
+  const empty=await sources(7);
+  assert.deepEqual(empty.models,[]);assert.deepEqual(empty.recent,[]);
+  assert.ok(empty.items.every(d=>d.requests===0 && d.chargedMicros==='0'));
+  const credit=await withDatabaseOwner(()=>redeemCommand(admin,['issue','3',new Date(Date.now()+3600000).toISOString()]));
+  assert.equal((await mine('/api/redeem',{method:'POST',body:{code:credit.code}})).status,200);
+  const price=(await mine('/api/catalog')).data.rates.find(r=>r.model==='compatible-chat');
+  const key=(await mine('/api/keys',{method:'POST',body:{name:'cost sources',rpm:20,groupId:price.groupId}})).data;
+  const call=(model,content,max_completion_tokens)=>request('/v1/chat/completions',{method:'POST',session:false,token:key.secret,
+    body:{model,messages:[{role:'user',content}],max_completion_tokens}});
+  const mock=await call('mock-text','cost sources',128);
+  assert.equal(mock.status,200);
+  await database.query("UPDATE gateway.usage_requests SET created_at=now()-interval '9 days' WHERE id=$1",[mock.data.id]);
+  for(let i=0;i<4;i++) assert.equal((await call(price.model,'report fixture',16)).status,200);
+  const pending=await call(price.model,'fixture uncertain',16);
+  assert.equal(pending.status,503);
+  const seven=await sources(7),month=await sources(30);
+  assert.deepEqual(seven.models.map(r=>r.model),[price.model]);
+  assert.deepEqual(month.models.map(r=>r.model),['mock-text',price.model]);
+  const {items:ledger}=(await mine('/api/wallet/entries?kind=usage')).data;
+  const debits=new Map(ledger.map(r=>[r.requestId,r.deltaMicros]));
+  for(const report of [seven,month]){
+    const range={fromDay:report.items[0].date,throughDay:report.items.at(-1).date,tz};
+    const details=(await mine('/api/usage?'+new URLSearchParams(range))).data.items;
+    assert.deepEqual(report.recent.map(r=>r.id),details.slice(0,5).map(r=>r.id));
+    assert.equal(report.recent[0].id,pending.data.error.request_id);
+    assert.equal(report.recent[0].chargedMicros,null);
+    for(const metric of ['requests','tokens','chargedMicros']){
+      const sum=rows=>rows.reduce((n,r)=>n+BigInt(r[metric]),0n);
+      assert.equal(sum(report.models),sum(report.items));
+    }
+    for(const model of report.models){
+      const detail=(await mine('/api/usage?'+new URLSearchParams({...range,model:model.model,trend:'1'}))).data;
+      assert.equal(detail.items.length,model.requests);
+      for(const metric of ['tokens','inputTokens','cachedTokens','outputTokens','chargedMicros','heldMicros']){
+        assert.equal(detail.days.reduce((n,d)=>n+BigInt(d[metric]),0n),BigInt(model[metric]));
+      }
+      assert.equal(detail.items.reduce((n,r)=>n-BigInt(debits.get(r.id)??'0'),0n),BigInt(model.chargedMicros));
+    }
+  }
+  assert.deepEqual(seven.models[0],{model:price.model,requests:5,inputTokens:'56',cachedTokens:'16',outputTokens:'8',
+    tokens:'64',chargedMicros:'16',heldMicros:'1648'});
+  assert.equal(month.models[0].chargedMicros,'750000');
+  assert.equal(month.recent.length,5);
 });
 
 async function stripeEvent(type,object,{id='evt_'+crypto.randomUUID().replaceAll('-',''),live=false,valid=true}={}) {

@@ -296,7 +296,7 @@ export async function handle(req: NextRequest) {
     if (route === 'GET /api/usage-trend') {
       const query = req.nextUrl.searchParams;
       const days = parse(trendRange,query.get('days') ?? undefined);
-      return json(await usageTrend(user,await timeZone(query),days==='30' ? 30 : 7));
+      return json(await usageTrend(user,await timeZone(query),days==='30' ? 30 : 7,query.get('sources')==='1'));
     }
     if (route === 'GET /api/usage/models') return json({models:await usageModels(user)});
     if (route === 'GET /api/usage') {

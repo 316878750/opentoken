@@ -3,11 +3,11 @@ feature,area,priority,original,clone,notes
 账户余额和启用密钥数总览,仪表盘,must,yes,yes,S01 展示账面余额 可用余额 预占与启用密钥数
 请求数及今日和累计用量汇总,仪表盘,must,yes,yes,S01 展示今日和累计请求与已结算 Token
 费用总览并列实际和标准口径,仪表盘,must,yes,yes,S01 展示累计实际扣费与标准费
-模型分布与 Token 趋势,仪表盘,should,yes,no,S01 已见对应区域
+模型分布与 Token 趋势,仪表盘,should,yes,yes,S01 每日 Token 趋势已上线 11.3 按模型展示请求 用量 实扣与预占 支持携带日期和时区进入模型使用记录 已通过隔离验收 待发布
 时间范围和统计粒度,仪表盘,should,yes,no,S01 已见近 7 天与按天控件 未逐个切换
 RPM TPM 与平均响应指标,仪表盘,should,yes,no,S01 已见有数据
 平台限额用量,仪表盘,could,yes,no,S01 已见未配置态
-最近使用区域,仪表盘,should,yes,no,S01 已见标题
+最近使用区域,仪表盘,should,yes,yes,S01 11.3 按所选期间显示最近五笔请求 点击编号直达该笔账单 已通过隔离验收 待发布
 核心业务快捷入口,仪表盘,should,yes,yes,S01 可前往密钥管理 使用记录和兑换页
 按模型查看计费方式和输入输出缓存读取单价,模型与计费,must,yes,yes,S03 显示已启用的模拟与官方 OpenAI 模型的三项单价
 按分组查看平台和倍率,模型与计费,must,yes,yes,S03 10.3 已通过跨分组比价隔离验收 可切换基础与含倍率单价 已上线

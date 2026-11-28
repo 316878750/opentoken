@@ -10,7 +10,7 @@ import { listAdminModels, modelAdminInput, writeAdminModel } from './admin-model
 import { listAdminLogs, loginLogFilter, operationLogFilter } from './admin-logs';
 import { inviteAdminUser, listAdminUsers, userChangeInput, userInviteInput, userListInput, writeAdminUser } from './admin-users';
 import { ensureWallet } from './data';
-import { catalog, complete, createKey, Fault, listKeys, models, streamCompletion, updateKey } from './gateway';
+import { catalog, complete, createKey, editKey, Fault, keyOptions, keyPage, listKeys, models, streamCompletion, updateKey } from './gateway';
 import { billing, receiveStripeWebhook, startCheckout, startPortal } from './payments';
 import { dashboard, usage, usageTrend } from './reports';
 import { accountRevision, appOrigin, endSession, loginSession, sealSession, sessionCookie, sessionUser, setSession } from './session';
@@ -28,6 +28,14 @@ const keyInput = z.object({
   name:z.string().trim().min(1).max(80), groupId:z.uuid(), rpm:z.int().min(1).max(600),
   capMicros:z.string().regex(/^[1-9]\d{0,14}$/).nullish(),
 });
+const keyFilter = z.strictObject({
+  q:z.string().trim().max(80).optional(),status:z.enum(['active','disabled','revoked']).optional(),
+  groupId:z.uuid().optional(),cursor:z.uuid().optional(),limit:z.coerce.number().int().min(1).max(100).default(10),
+});
+const keyPatch = z.union([
+  z.strictObject({status:z.enum(['active','disabled'])}),
+  keyInput.omit({groupId:true}).partial().strict().refine(edit=>Object.keys(edit).length>0),
+]);
 const ledgerFilter = z.object({kind:z.enum(['redemption','usage','stripe_refund','stripe_refund_reversal']).optional(),cursor:z.uuid().optional()});
 const trendRange = z.enum(['7','30']).default('7');
 const checkoutInput = z.discriminatedUnion('kind',[
@@ -264,16 +272,23 @@ export async function handle(req: NextRequest) {
       return json(await walletEntries(user,parse(ledgerFilter,Object.fromEntries(req.nextUrl.searchParams))));
     }
     if (route === 'GET /api/catalog') return json({rates:await catalog()});
-    if (route === 'GET /api/keys') return json({items:await listKeys(user)});
+    if (route === 'GET /api/keys/options') return json(await keyOptions(user));
+    if (route === 'GET /api/keys') {
+      const query = req.nextUrl.searchParams;
+      return json(query.size ? await keyPage(user,parse(keyFilter,Object.fromEntries(query))) : {items:await listKeys(user)});
+    }
     if (route === 'POST /api/keys') {
       const input = parse(keyInput,await body(req));
       return json(await createKey(user,input.name,input.groupId,input.rpm,input.capMicros ?? null),201);
     }
     if (path.startsWith('/api/keys/') && (method === 'PATCH' || method === 'DELETE')) {
       const id = parse(z.uuid(),path.slice('/api/keys/'.length));
-      const status = method === 'DELETE' ? 'revoked' :
-        parse(z.object({status:z.enum(['active','disabled'])}),await body(req)).status;
-      await updateKey(user,id,status);
+      if (method==='DELETE') await updateKey(user,id,'revoked');
+      else {
+        const edit = parse(keyPatch,await body(req));
+        if ('status' in edit) await updateKey(user,id,edit.status);
+        else await editKey(user,id,edit);
+      }
       return json({ok:true});
     }
     if (route === 'GET /api/dashboard') return json(await dashboard(user,await timeZone(req.nextUrl.searchParams)));

@@ -90,13 +90,50 @@ export async function createKey(user: string, name: string, groupId: string, rpm
   return { id:rows[0].id, name, prefix, secret };
 }
 
+const keyListQuery = `SELECT k.id,k.name,k.public_prefix AS prefix,k.status,g.id AS "groupId",g.name AS "groupName",
+    k.rpm_limit AS rpm,k.spend_cap_micros::text AS "capMicros",k.spent_micros::text AS "spentMicros",k.held_micros::text AS "heldMicros"
+    FROM gateway.api_keys k JOIN gateway.pricing_groups g ON g.id=k.group_id
+    WHERE k.user_id=$1`;
+const keyOrder = ' ORDER BY k.created_at DESC,k.id DESC';
+
 export async function listKeys(user: string) {
   const { db } = await store();
-  const { rows } = await db.query(`SELECT k.id,k.name,k.public_prefix AS prefix,k.status,g.id AS "groupId",g.name AS "groupName",
-    k.rpm_limit AS rpm,k.spend_cap_micros::text AS "capMicros"
-    FROM gateway.api_keys k JOIN gateway.pricing_groups g ON g.id=k.group_id
-    WHERE k.user_id=$1 ORDER BY k.created_at DESC,k.id DESC`,[user]);
+  const { rows } = await db.query(keyListQuery+keyOrder,[user]);
   return rows;
+}
+
+export async function keyOptions(user:string) {
+  const {db} = await store();
+  const active = await db.query(`SELECT k.id,k.name,k.public_prefix AS prefix,g.id AS "groupId",g.name AS "groupName"
+    FROM gateway.api_keys k JOIN gateway.pricing_groups g ON g.id=k.group_id WHERE k.user_id=$1 AND k.status='active'`+keyOrder,[user]);
+  const groups = await db.query(`SELECT DISTINCT g.id,g.name FROM gateway.pricing_groups g
+    JOIN gateway.api_keys k ON k.group_id=g.id WHERE k.user_id=$1 ORDER BY g.name,g.id`,[user]);
+  return {active:active.rows,groups:groups.rows};
+}
+
+export async function keyPage(user:string,filter:{q?:string;status?:string;groupId?:string;cursor?:string;limit:number}) {
+  const {db} = await store();
+  const {rows} = await db.query(keyListQuery+`
+    AND ($2::text IS NULL OR strpos(lower(k.name),lower($2))>0 OR strpos(lower(k.public_prefix),lower($2))=1)
+    AND ($3::text IS NULL OR k.status=$3) AND ($4::uuid IS NULL OR k.group_id=$4)
+    AND ($5::uuid IS NULL OR (k.created_at,k.id)<(SELECT created_at,id FROM gateway.api_keys WHERE user_id=$1 AND id=$5))`
+    +keyOrder+' LIMIT $6',[user,filter.q,filter.status,filter.groupId,filter.cursor,filter.limit+1]);
+  const items = rows.slice(0,filter.limit);
+  return {items,nextCursor:rows.length>filter.limit ? items[items.length-1].id : null};
+}
+
+export async function editKey(user:string,id:string,edit:{name?:string;rpm?:number;capMicros?:string|null}) {
+  await transaction(async tx=>{
+    const {rows:[key]} = await tx.query<{minimum:string}>(`SELECT (spent_micros+held_micros)::text AS minimum
+      FROM gateway.api_keys WHERE user_id=$1 AND id=$2 AND status<>'revoked' FOR UPDATE`,[user,id]);
+    if (!key) throw new Fault(404,'key_not_found','找不到可操作的密钥。');
+    if (edit.capMicros!=null && BigInt(edit.capMicros)<BigInt(key.minimum)) {
+      throw new Fault(409,'key_cap_too_low','累计额度不能低于已消费金额与在途预占之和。');
+    }
+    await tx.query(`UPDATE gateway.api_keys SET name=coalesce($3,name),rpm_limit=coalesce($4,rpm_limit),
+      spend_cap_micros=CASE WHEN $5 THEN $6::bigint ELSE spend_cap_micros END,updated_at=now()
+      WHERE user_id=$1 AND id=$2`,[user,id,edit.name,edit.rpm,edit.capMicros!==undefined,edit.capMicros]);
+  });
 }
 
 export async function updateKey(user: string, id: string, status: 'active' | 'disabled' | 'revoked') {

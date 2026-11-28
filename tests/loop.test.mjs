@@ -30,7 +30,8 @@ const identities = new Map([['pilot-a@example.test',primary],['pilot-b@example.t
   ['owner@example.test',owner],['staff@example.test',staff],['member@example.test',member],['channel@example.test',channelUser],['model@example.test',modelUser],
   ['auditor@example.test',auditStaff],['credit-a@example.test',creditUserA],['credit-b@example.test',creditUserB],
   ['delete@example.test',deleteUser],['audit-credit@example.test',auditCreditUser],['settings-operator@example.test','30000000-0000-4000-8000-000000000015'],
-  ['release-fixture@example.test','30000000-0000-4000-8000-000000000016']]);
+  ['release-fixture@example.test','30000000-0000-4000-8000-000000000016'],
+  ['key-manager@example.test','30000000-0000-4000-8000-000000000017']]);
 const trialCodes = {contest:'',funding:'',expired:'otc_'+'C'.repeat(32),voided:''};
 const upstreamEnv = {
   ENABLE_OPENAI:'1',UPSTREAM_MODE:'compatible',OPENAI_BASE_URL:'https://provider.example/v1',
@@ -233,6 +234,99 @@ async function request(path, { method = 'GET', body, token, retry, session = tru
 }
 
 const loginPayload = (email,password='fixture-test-password') => ({method:'POST',body:{email,password}});
+
+test('key management searches public metadata, combines filters and pages only the owner’s keys',async()=>{
+  const session = async email=>(await request('/api/session/login',loginPayload(email))).headers.get('set-cookie').split(';')[0];
+  const sessionOverride = await session('key-manager@example.test');
+  const foreign = await session('member@example.test');
+  const mine = (path,options={})=>request(path,{sessionOverride,...options});
+  const groups = [...new Set((await mine('/api/catalog')).data.rates.map(rate=>rate.groupId))];
+  assert.ok(groups.length>=2);
+  const create = async (name,groupId)=>{
+    const result = await mine('/api/keys',{method:'POST',body:{name,groupId,rpm:12}});
+    assert.equal(result.status,201);
+    return result.data;
+  };
+  const first = await create('Search_One',groups[0]), second = await create('Search_Two',groups[1]);
+  const patch = (key,body)=>mine('/api/keys/'+key.id,{method:'PATCH',body});
+  assert.equal((await patch(second,{status:'disabled'})).status,200);
+  const third = await create('SearchXThree',groups[0]);
+  const list = async params=>(await mine('/api/keys?'+new URLSearchParams(params))).data;
+  const page1 = await list({q:'sEaRcH',limit:'2'});
+  assert.deepEqual(page1.items.map(row=>row.id),[third.id,second.id]);
+  const page2 = await list({q:'sEaRcH',limit:'2',cursor:page1.nextCursor});
+  assert.deepEqual(page2.items.map(row=>row.id),[first.id]);
+  assert.equal(page2.nextCursor,null);
+  assert.deepEqual((await list({q:'search_',groupId:groups[1],status:'disabled'})).items.map(row=>row.id),[second.id]);
+  assert.deepEqual((await list({q:'search_',groupId:groups[0]})).items.map(row=>row.id),[first.id]);
+  assert.deepEqual((await list({q:first.prefix})).items.map(row=>row.id),[first.id]);
+  assert.equal((await mine('/api/keys?status=invalid')).status,400);
+  assert.equal((await patch(second,{name:'Renamed',rpm:37,capMicros:'1250000'})).status,200);
+  assert.equal((await patch(second,{groupId:groups[0]})).status,400);
+  assert.equal((await patch(second,{rpm:601})).status,400);
+  const edited = (await list({q:'renamed'})).items[0];
+  assert.deepEqual([edited.name,edited.rpm,edited.capMicros,edited.status],['Renamed',37,'1250000','disabled']);
+  const foreignPage = await request('/api/keys?q='+first.prefix,{sessionOverride:foreign});
+  assert.deepEqual(foreignPage.data.items,[]);
+  assert.equal((await request('/api/keys/'+first.id,{method:'PATCH',sessionOverride:foreign,body:{name:'other'}})).status,404);
+  const options = (await mine('/api/keys/options')).data;
+  assert.deepEqual(options.active.map(row=>row.id),[third.id,first.id]);
+  assert.deepEqual(new Set(options.groups.map(row=>row.id)),new Set(groups.slice(0,2)));
+  const revoked = await mine('/api/keys/'+second.id,{method:'DELETE'});
+  assert.equal(revoked.status,200);
+  assert.equal((await patch(second,{name:'Revived'})).status,404);
+  assert.deepEqual((await list({status:'revoked'})).items.map(row=>row.id),[second.id]);
+  const publicData = JSON.stringify([options,page1,page2,edited,(await mine('/api/keys')).data,revoked.data]);
+  for (const key of [first,second,third]) assert.equal(publicData.includes(key.secret),false);
+  assert.doesNotMatch(publicData,/secret_digest|"secret":/);
+});
+
+test('key limit edits respect spent plus in-flight holds and govern the next gateway admission',async()=>{
+  const login = await request('/api/session/login',loginPayload('key-manager@example.test'));
+  const sessionOverride = login.headers.get('set-cookie').split(';')[0];
+  const mine = (path,options={})=>request(path,{sessionOverride,...options});
+  const credit = await withDatabaseOwner(()=>redeemCommand(admin,['issue','8.00',new Date(Date.now()+3600000).toISOString()]));
+  assert.equal((await mine('/api/redeem',{method:'POST',body:{code:credit.code}})).status,200);
+  const groupId = (await mine('/api/catalog')).data.rates.find(rate=>rate.model==='mock-text').groupId;
+  const created = await mine('/api/keys',{method:'POST',body:{name:'Admission',groupId,rpm:10}});
+  assert.equal(created.status,201);
+  const {id,secret,prefix} = created.data;
+  const call = ()=>request('/v1/chat/completions',{method:'POST',session:false,token:secret,
+    body:{model:'mock-text',messages:[{role:'user',content:'Verify key admission'}],max_completion_tokens:128}});
+  const patch = body=>mine('/api/keys/'+id,{method:'PATCH',body});
+  const read = async ()=>(await mine('/api/keys?q='+prefix)).data.items[0];
+  assert.equal((await call()).status,200);
+  const pending = call();
+  let row;
+  for(let i=0;i<60;i++){
+    row=await read();
+    if(row.heldMicros!=='0') break;
+    await sleep(50);
+  }
+  assert.deepEqual([row.spentMicros,row.heldMicros],['750000','2000000']);
+  const denied = await patch({name:'Should roll back',rpm:1,capMicros:'2749999'});
+  assert.equal(denied.status,409);
+  assert.equal(denied.data.error.code,'key_cap_too_low');
+  row=await read();
+  assert.deepEqual([row.name,row.rpm,row.capMicros],['Admission',10,null]);
+  assert.equal((await patch({capMicros:'2750000'})).status,200);
+  const budget = await call();
+  assert.deepEqual([budget.status,budget.data.error.code],[402,'key_budget_exceeded']);
+  assert.equal((await pending).status,200);
+  assert.equal((await patch({rpm:1,capMicros:null})).status,200);
+  const limited = await call();
+  assert.deepEqual([limited.status,limited.data.error.code],[429,'rate_limit']);
+  assert.equal((await patch({rpm:3})).status,200);
+  assert.equal((await call()).status,200);
+  row=await read();
+  assert.deepEqual([row.spentMicros,row.heldMicros,row.capMicros,row.rpm],['2250000','0',null,3]);
+  const records=(await mine('/api/usage?key_id='+id)).data.items;
+  assert.equal(records.length,3);
+  for (const receipt of records) assert.deepEqual([receipt.reservedMicros,receipt.chargedMicros,receipt.releasedMicros,receipt.ledgerDeltaMicros],
+    ['2000000','750000','1250000','-750000']);
+  const wallet=(await mine('/api/dashboard')).data;
+  assert.deepEqual([wallet.balanceMicros,wallet.heldMicros],['5750000','0']);
+});
 
 test('public readiness checks PostgreSQL and Auth without disclosing service configuration', async () => {
   const health = await request('/api/health',{session:false});

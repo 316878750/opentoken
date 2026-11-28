@@ -5,7 +5,8 @@ import type { TrendDay } from '@/lib/reports';
 import { catalogPrice, guidePath, type CatalogSelection } from '@/lib/catalog-display';
 
 type Rate = {groupId:string;groupName:string;model:string;maxOutputTokens:number;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
-type KeyRow = {id:string;name:string;prefix:string;status:string;groupId:string;groupName:string;rpm:number;capMicros:string|null};
+type KeyRow = {id:string;name:string;prefix:string;status:string;groupId:string;groupName:string;rpm:number;capMicros:string|null;spentMicros:string;heldMicros:string};
+type KeyOptions = {active:Pick<KeyRow,'id'|'name'|'prefix'|'groupId'|'groupName'>[];groups:{id:string;name:string}[]};
 type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;releasedMicros:string|null;standardMicros:string|null;
   chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string;upstreamRequestId:string|null};
 type Wallet = {balanceMicros:string;heldMicros:string;refundHeldMicros?:string;availableMicros:string;asOf:string;activeKeys:number;
@@ -293,8 +294,31 @@ function CallExample({endpoint,rate}:{endpoint:string;rate:Rate}) {
   </>;
 }
 
+function readKeyCap(form:FormData) {
+  const cap = String(form.get('cap') || '').trim();
+  if (!cap) return null;
+  if (!/^\d{1,9}(\.\d{1,6})?$/.test(cap) || Number(cap)<=0) throw new Error('累计额度必须大于零，且最多六位小数。');
+  const [whole,dec=''] = cap.split('.');
+  return String(BigInt(whole)*1_000_000n+BigInt(dec.padEnd(6,'0')));
+}
+
 export function Keys({selection}:{selection?:CatalogSelection}) {
-  const keys = useData<{items:KeyRow[]}>('/api/keys');
+  const keys = useData<KeyOptions>('/api/keys/options');
+  const [search,setSearch] = useState('');
+  const [filters,setFilters] = useState({q:'',status:'',groupId:''});
+  const [cursors,setCursors] = useState<string[]>([]);
+  const query = new URLSearchParams({limit:'10'});
+  for (const [name,value] of Object.entries(filters)) if (value) query.set(name,value);
+  if (cursors.length) query.set('cursor',cursors.at(-1)!);
+  const page = useData<{items:KeyRow[];nextCursor:string|null}>('/api/keys?'+query);
+  const [editing,setEditing] = useState<KeyRow>();
+  const [editError,setEditError] = useState('');
+  const [saving,setSaving] = useState(false);
+  const editDialog = useRef<HTMLDialogElement>(null);
+  function refreshKeys() { keys.refresh(); page.refresh(); }
+  function filterBy(change:Partial<typeof filters>) {
+    setFilters(previous=>({...previous,...change})); setCursors([]);
+  }
   const catalog = useData<{rates:Rate[]}>('/api/catalog');
   const dialog = useRef<HTMLDialogElement>(null);
   const title = useRef<HTMLHeadingElement>(null);
@@ -322,7 +346,7 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
   const guideTitle = useRef<HTMLHeadingElement>(null);
   const focusGuideOnClose = useRef(false);
   const targetRate = selection && catalog.data?.rates.find(rate=>rate.groupId===selection.groupId && rate.model===selection.model);
-  const activeKeys = keys.data?.items.filter(key=>key.status==='active' && (!selection || key.groupId===targetRate?.groupId)) ?? [];
+  const activeKeys = keys.data?.active.filter(key=>!selection || key.groupId===targetRate?.groupId) ?? [];
   const guideKey = activeKeys.find(key=>key.id===guideKeyId) ?? activeKeys[0];
   const guideRates = catalog.data?.rates.filter(rate=>rate.groupId===guideKey?.groupId && (!selection || rate.model===selection.model)) ?? [];
   const guideRate = guideRates.find(rate=>rate.model===guideModel) ?? guideRates[0];
@@ -371,14 +395,13 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
     event.preventDefault();
     if (creating || unknown) return;
     const form = new FormData(event.currentTarget);
-    const cap = String(form.get('cap') || '').trim();
-    if (cap && (!/^\d{1,9}(\.\d{1,6})?$/.test(cap) || Number(cap)<=0)) {
-      setFormError('累计额度必须大于零，且最多六位小数。');
+    let capMicros;
+    try { capMicros = readKeyCap(form); }
+    catch (error) {
+      setFormError((error as Error).message);
       (event.currentTarget.elements.namedItem('cap') as HTMLInputElement).focus();
       return;
     }
-    const [whole,dec=''] = cap.split('.');
-    const capMicros = cap ? String(BigInt(whole)*1_000_000n+BigInt(dec.padEnd(6,'0'))) : null;
     const controller = new AbortController();
     const groupId = String(form.get('groupId'));
     request.current = controller;
@@ -389,7 +412,7 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
       }),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(12000)])});
       if (!controller.signal.aborted) {
         setCreated({...result,groupId,groupName:groups.find(rate=>rate.groupId===groupId)?.groupName || ''});
-        setStep('secret'); keys.refresh();
+        setStep('secret'); setCursors([]); refreshKeys();
       }
     } catch (error) {
       if (controller.signal.aborted) return;
@@ -420,13 +443,32 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
     try {
       await api('/api/keys/'+row.id,remove ? {method:'DELETE'} : {method:'PATCH',
         body:JSON.stringify({status:row.status==='active'?'disabled':'active'})});
-      keys.refresh();
+      refreshKeys();
     } catch (error) { setPageError(error instanceof ApiError ? error.message : '暂时无法更新密钥。'); }
+  }
+  async function saveKey(event:FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!editing || saving) return;
+    const form = new FormData(event.currentTarget);
+    const edit:{name?:string;rpm?:number;capMicros?:string|null} = {};
+    setSaving(true); setEditError('');
+    try {
+      const name = String(form.get('name')).trim(), rpm = Number(form.get('rpm')), cap = readKeyCap(form);
+      if (name!==editing.name) edit.name=name;
+      if (rpm!==editing.rpm) edit.rpm=rpm;
+      if (cap!==editing.capMicros) edit.capMicros=cap;
+      if (Object.keys(edit).length) {
+        await api('/api/keys/'+editing.id,{method:'PATCH',body:JSON.stringify(edit)});
+        refreshKeys(); setNotice('密钥设置已保存。');
+      }
+      editDialog.current?.close();
+    } catch (error) { setEditError(error instanceof Error ? error.message : '暂时无法保存密钥。'); }
+    finally { setSaving(false); }
   }
   return <><Heading title="API 密钥" description="创建分组密钥，将模型接入本地兼容客户端。" />
     <div className="actions">
       <button ref={open} className="primary" disabled={!groups.length} onClick={startCreate}>创建密钥</button>
-      <button onClick={() => {keys.refresh();catalog.refresh();}}>刷新列表</button>
+      <button onClick={() => {refreshKeys();catalog.refresh();}}>刷新列表</button>
     </div>
     <ErrorNote error={keys.error || catalog.error || pageError} />
     <section className="panel"><h2>接入地址</h2><p><code>{endpoint}</code></p>
@@ -451,13 +493,41 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
         {guideRate && endpoint ? <CallExample key={guideKey.id+guideRate.model} endpoint={endpoint} rate={guideRate} /> :
           <p>当前分组暂无可调用模型，请查看<a href="/pricing">模型价格</a>或选择其他密钥。</p>}</>}
     </section>
-    {keys.data ? <section className="panel table-wrap"><h2>密钥列表</h2>
-      {keys.data.items.length ? <table className="phone-records" aria-label="密钥列表"><thead><tr><th scope="col">名称与前缀</th><th scope="col">分组</th><th scope="col">状态</th><th scope="col">额度 / RPM</th><th scope="col">操作</th></tr></thead>
-        <tbody>{keys.data.items.map(row => <tr key={row.id}><td data-label="名称与前缀" className="record-wide">{row.name}<br/><code>{row.prefix}…</code></td><td data-label="分组">{row.groupName}</td>
+    <section className="panel table-wrap"><h2>密钥列表</h2>
+      <form className="filters" onSubmit={e=>{e.preventDefault();const term=search.trim();
+        const q=/^mg_[A-Za-z0-9_-]{43}$/.test(term)?term.slice(0,12):term;
+        setSearch(q);filterBy({q});}}>
+        <label>名称或公开前缀<input type="search" maxLength={80} value={search} onChange={e=>setSearch(e.target.value)} /></label>
+        <button type="submit">搜索</button>
+        <label>密钥状态<select value={filters.status} onChange={e=>filterBy({status:e.target.value})}>
+          <option value="">全部状态</option>{['active','disabled','revoked'].map(s=><option key={s} value={s}>{statusLabel(s)}</option>)}</select></label>
+        <label>所属分组<select value={filters.groupId} onChange={e=>filterBy({groupId:e.target.value})}>
+          <option value="">全部分组</option>{keys.data?.groups.map(g=><option key={g.id} value={g.id}>{g.name}</option>)}</select></label>
+        <button type="button" onClick={()=>{setSearch('');filterBy({q:'',status:'',groupId:''});}}>重置筛选</button>
+      </form>
+      <ErrorNote error={page.error}/>
+      {!page.data ? <Placeholder error={page.error}/> : page.data.items.length ? <table className="phone-records" aria-label="密钥列表"><thead><tr><th scope="col">名称与前缀</th><th scope="col">分组</th><th scope="col">状态</th><th scope="col">额度 / RPM</th><th scope="col">操作</th></tr></thead>
+        <tbody>{page.data.items.map(row => <tr key={row.id}><td data-label="名称与前缀" className="record-wide">{row.name}<br/><code>{row.prefix}…</code></td><td data-label="分组">{row.groupName}</td>
           <td data-label="状态"><span className="badge">{statusLabel(row.status)}</span></td><td data-label="额度 / RPM">{row.capMicros===null?'不限':money(row.capMicros)} / {row.rpm}</td>
-          <td data-label="操作" className="record-wide">{row.status!=='revoked' && <div className="actions"><button onClick={() => void changeKey(row)}>{row.status==='active'?'停用':'恢复'}</button>
+          <td data-label="操作" className="record-wide">{row.status!=='revoked' && <div className="actions"><button onClick={()=>{setEditing(row);setEditError('');editDialog.current?.showModal();}}>编辑</button>
+            <button onClick={() => void changeKey(row)}>{row.status==='active'?'停用':'恢复'}</button>
             <button onClick={e => { revokeTrigger.current=e.currentTarget; setRevoke(row); revokeDialog.current?.showModal(); }}>撤销</button></div>}</td></tr>)}</tbody></table>
-        : <p>还没有密钥。创建一把密钥即可发起第一次调用。</p>}</section> : <Placeholder error={keys.error} />}
+        : <p>{Object.values(filters).some(Boolean)||cursors.length?'没有匹配的密钥。':'还没有密钥。创建一把密钥即可发起第一次调用。'}</p>}
+      <div className="actions"><button disabled={!cursors.length} onClick={()=>setCursors(cursors.slice(0,-1))}>上一页</button>
+        <span>第 {cursors.length+1} 页</span><button disabled={!page.data?.nextCursor} onClick={()=>setCursors([...cursors,page.data!.nextCursor!])}>下一页</button></div>
+    </section>
+    <dialog ref={editDialog} aria-labelledby="edit-key-title" onClose={()=>setEditing(undefined)} onCancel={e=>{if(saving)e.preventDefault();}}>
+      <h2 id="edit-key-title">编辑密钥</h2>{editing && <form key={editing.id} onSubmit={saveKey}>
+        <p>{editing.groupName} · <code>{editing.prefix}…</code></p>
+        <label>名称<input name="name" required maxLength={80} defaultValue={editing.name}/></label>
+        <label>累计额度（USD，可选）<input name="cap" inputMode="decimal" placeholder="留空表示不限"
+          defaultValue={editing.capMicros===null?'':money(editing.capMicros).slice(4).replaceAll(',','')}/></label>
+        <p className="muted">已消费 {money(editing.spentMicros)}，在途预占 {money(editing.heldMicros)}。保存时按最新金额核对下限。</p>
+        <label>每分钟请求上限<input name="rpm" type="number" min={1} max={600} required defaultValue={editing.rpm}/></label>
+        <ErrorNote error={editError}/><div className="actions"><button className="primary" disabled={saving}>{saving?'正在保存…':'保存'}</button>
+          <button type="button" disabled={saving} onClick={()=>editDialog.current?.close()}>取消</button></div>
+      </form>}
+    </dialog>
     <dialog ref={dialog} aria-labelledby="key-title" onCancel={event => {event.preventDefault();close();}}
       onClose={() => {
         clear();
@@ -475,7 +545,7 @@ export function Keys({selection}:{selection?:CatalogSelection}) {
         <label>每分钟请求上限<input name="rpm" type="number" min={1} max={600} defaultValue={20} required /></label>
         <ErrorNote error={formError} />
         <div className="actions">
-          {unknown ? <button type="button" onClick={() => {keys.refresh();dialog.current?.close();}}>刷新列表</button> :
+          {unknown ? <button type="button" onClick={() => {refreshKeys();dialog.current?.close();}}>刷新列表</button> :
             <button className="primary" disabled={creating}>{creating?'正在创建…':'创建'}</button>}
           <button type="button" disabled={creating} onClick={close}>取消</button>
         </div>

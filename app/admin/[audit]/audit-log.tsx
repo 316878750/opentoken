@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from 'react';
 import type { AuditPage, OperationLog } from '@/lib/admin-logs';
 import { useData } from '../../console';
+import { ListPager } from '../list-controls';
 
 const outcomes:Record<string,string> = {success:'成功',failure:'失败',rate_limited:'限流',unavailable:'身份服务不可用',denied:'拒绝或失败'};
 const reasons:Record<string,string> = {authenticated:'身份已验证',credentials_or_account:'凭据或账号校验未通过',
@@ -90,12 +91,12 @@ export function AuditLog({screen,ownOnly,timeZone}:{timeZone:string;screen:'logi
         <label>操作对象<input name="object" maxLength={64} pattern={'[a-zA-Z0-9][a-zA-Z0-9\\-]{0,63}'} placeholder="ID、模型或分组代号"/></label>
       </>}
       <label>请求编号<input name="requestId" maxLength={36} pattern={uuidPattern}/></label>
-      <button className="primary">查询</button><button type="reset">重置</button><button type="button" onClick={audit.refresh}>刷新</button>
+      <button className="primary">查询</button><button type="reset">重置筛选</button><button type="button" onClick={audit.refresh}>刷新</button>
     </form>
     {(rangeError || audit.error) && <p className="error" role="alert">{rangeError || audit.error}</p>}
-    {!data && !audit.error && <p>正在读取日志…</p>}
-    {data?.items.length===0 && <p>没有符合条件的日志。</p>}
-    {!!data?.items.length && <div className="table-wrap"><table>
+    {!data && !audit.error && <p role="status">正在读取日志…</p>}
+    {data?.items.length===0 && <p className="list-empty">{Object.keys(filters).length?'没有符合条件的日志，可重置筛选。':'暂无日志记录。'}</p>}
+    {!!data?.items.length && <div className="table-wrap"><table aria-label={login?'登录日志列表':'操作日志列表'}>
       <thead><tr><th>时间（{timeZone}）</th><th>{login?'用户与标识':'操作者'}</th>{!login && <th>动作</th>}
         <th>结果</th><th>原因</th>{!login && <th>对象与变更</th>}<th>请求编号</th></tr></thead>
       <tbody>{data.items.map(event=><tr key={event.requestId}>
@@ -107,12 +108,8 @@ export function AuditLog({screen,ownOnly,timeZone}:{timeZone:string;screen:'logi
         <td><code>{event.requestId}</code></td>
       </tr>)}</tbody>
     </table></div>}
-    <div className="actions">
-      <button disabled={!cursors.length} onClick={()=>setCursors(old=>old.slice(0,-1))}>上一页</button>
-      <button disabled={!data?.nextCursor} onClick={()=>{
-        const next = data?.nextCursor;
-        if (next) setCursors(old=>[...old,next]);
-      }}>下一页</button>
-    </div>
+    <ListPager page={cursors.length+1} count={data?.items.length}
+      onPrevious={cursor?()=>setCursors(cursors.slice(0,-1)):undefined}
+      onNext={data?.nextCursor?()=>setCursors([...cursors,data.nextCursor!]):undefined}/>
   </section>;
 }

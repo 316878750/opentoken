@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { AdminRedeemIssue, AdminRedeemPage, RedeemCodeStatus } from '@/lib/admin-redeem';
 import { api, ApiError, money, useData } from '../console';
+import { ActionFeedback, ListPager } from './list-controls';
 
 const endpoint = '/api/admin/redeem-codes';
 const statuses: Record<RedeemCodeStatus,string> = {active:'可兑换',expired:'已过期',voided:'已作废',redeemed:'已核销'};
@@ -10,7 +11,8 @@ type IssueInput = {amountUsd:string;expiresAt:string;operationId:string};
 
 export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId:string;canWrite:boolean}) {
   const [filter,setFilter] = useState('');
-  const [cursor,setCursor] = useState('');
+  const [cursors,setCursors] = useState<string[]>([]);
+  const cursor = cursors.at(-1);
   const [pending,setPending] = useState<IssueInput>();
   const [restored,setRestored] = useState(false);
   const [secret,setSecret] = useState('');
@@ -75,7 +77,7 @@ export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId
       if (controller.signal.aborted) return;
       clearPending();
       form.current?.reset();
-      setFilter(''); setCursor(''); codes.refresh();
+      setFilter(''); setCursors([]); codes.refresh();
       if (result.code) setSecret(result.code);
       else setMessage(`签发记录 ${result.id} 已存在，当前状态为${statuses[result.status]}。`);
     } catch (failure) {
@@ -111,7 +113,7 @@ export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId
   }
 
   return <section className="panel" aria-labelledby="redeem-codes-title">
-    <h2 id="redeem-codes-title">兑换码管理</h2>
+    <h1 id="redeem-codes-title">兑换码管理</h1>
     {canWrite && <form ref={form} className="filters" onSubmit={submit}>
       <label>面额（美元）<input name="amountUsd" required inputMode="decimal" maxLength={20} disabled={busy || !!pending}/></label>
       <label>有效期（本地时间）<input type="datetime-local" name="expiresAt" required disabled={busy || !!pending}/></label>
@@ -119,25 +121,25 @@ export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId
         ? <button type="button" disabled={busy} onClick={()=>void issue(pending)}>核对签发结果</button>
         : <button className="primary" disabled={!restored || busy}>签发兑换码</button>}
     </form>}
-    {error && <p className="error" role="alert">{error}</p>}
-    {message && <p role="status">{message}</p>}
+    <ActionFeedback busy={busy} error={error} message={message}/>
     {voiding && <div role="group" aria-label="确认作废">
       <p>作废兑换码 {voiding} 后，持有人将无法兑换。</p>
       <button disabled={busy} onClick={()=>void confirmVoid()}>确认作废</button>{' '}
       <button disabled={busy} onClick={()=>setVoiding('')}>取消</button>
     </div>}
     <div className="filters">
-      <label>状态<select value={filter} onChange={event=>{setFilter(event.target.value);setCursor('');}}>
+      <label>状态<select value={filter} disabled={busy} onChange={event=>{setFilter(event.target.value);setCursors([]);setVoiding('');}}>
         <option value="">全部</option>
         {Object.entries(statuses).map(([value,label])=><option key={value} value={value}>{label}</option>)}
       </select></label>
-      <button onClick={codes.refresh}>刷新</button>
+      <button disabled={busy || !filter} onClick={()=>{setFilter('');setCursors([]);setVoiding('');}}>重置筛选</button>
+      <button disabled={busy} onClick={codes.refresh}>刷新</button>
     </div>
-    {codes.error && <p role="alert">{codes.error}</p>}
+    {codes.error && <p className="error" role="alert">{codes.error}</p>}
     {!codes.error && !page && <p role="status">正在读取兑换码…</p>}
-    {page && page.items.length===0 && <p>没有符合条件的兑换码。</p>}
+    {page && page.items.length===0 && <p className="list-empty">{filter?'没有符合条件的兑换码，可重置筛选。':'暂无兑换码记录。'}</p>}
     {page && page.items.length>0 && <div className="table-wrap">
-      <table>
+      <table aria-label="兑换码记录">
         <thead><tr><th scope="col">记录编号</th><th scope="col">面额</th><th scope="col">状态</th>
           <th scope="col">有效期</th><th scope="col">核销收据</th>{canWrite && <th scope="col">签发账号</th>}
           {canWrite && <th scope="col">操作</th>}</tr></thead>
@@ -150,8 +152,10 @@ export function RedeemCodes({actorId,canWrite,timeZone}:{timeZone:string;actorId
         </tr>)}</tbody>
       </table>
     </div>}
-    {cursor && <button onClick={()=>setCursor('')}>回到第一页</button>}{' '}
-    {page?.nextCursor && <button onClick={()=>setCursor(page.nextCursor??'')}>下一页</button>}
+    <ListPager page={cursors.length+1} count={page?.items.length} disabled={busy}
+      onPrevious={cursor?()=>{setVoiding('');setCursors(cursors.slice(0,-1));}:undefined}
+      onNext={page?.nextCursor?()=>{setVoiding('');setCursors([...cursors,page.nextCursor!]);}:undefined}/>
+    {cursors.length>1 && <button disabled={busy} onClick={()=>{setVoiding('');setCursors([]);}}>回到第一页</button>}
     <dialog ref={secretDialog} aria-labelledby="new-redeem-code-title" onClose={()=>setSecret('')}>
       {secret && <><h3 id="new-redeem-code-title">兑换码已签发</h3><p>明文只显示这一次。关闭前请复制保存。</p>
         <label>兑换码<input ref={secretField} value={secret} readOnly onFocus={event=>event.currentTarget.select()}/></label>

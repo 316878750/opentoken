@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from 'react';
 import type { AdminModelCatalog } from '@/lib/admin-models';
 import { api, ApiError, money, useData } from '../../console';
+import { ActionFeedback } from '../list-controls';
 
 const endpoint = '/api/admin/models';
 const slug = '[a-z0-9][a-z0-9\\-]*';
@@ -98,7 +99,7 @@ export function ModelManager({timeZone}:{timeZone:string}) {
         <button disabled={busy} onClick={catalog.refresh}>刷新</button>
       </div>
       {catalog.error && <p className="error" role="alert">{catalog.error}</p>}
-      {!data && !catalog.error && <p>正在读取模型…</p>}
+      {!data && !catalog.error && <p role="status">正在读取模型…</p>}
       {data && !data.canWrite && <p>当前账号可查看模型、分组和费率。</p>}
       {model && <>
         <h2>{model.code}</h2>
@@ -122,8 +123,7 @@ export function ModelManager({timeZone}:{timeZone:string}) {
         </div>}
       </>}
     </section>
-    {notice && <p role="status">{notice}</p>}
-    {error && <p className="error" role="alert">{error}</p>}
+    <ActionFeedback busy={busy} message={notice} error={error}/>
     {data?.canWrite && editor && <form className="panel" key={editor.kind} onSubmit={submit}>
       <fieldset disabled={busy}>
         <legend>{{create:'新增模型','group-create':'新增分组','group-rename':'修改分组名称',state:'确认模型状态',
@@ -157,7 +157,7 @@ export function ModelManager({timeZone}:{timeZone:string}) {
     </form>}
     {model && group && <section className="panel">
       <h2>费率版本</h2>
-      {rates.length===0 ? <p>暂无费率。</p> : <div className="table-wrap"><table>
+      {rates.length===0 ? <p className="list-empty">所选模型与分组暂无费率版本。</p> : <div className="table-wrap"><table>
         <caption>每百万 Token 的基础价格</caption>
         <thead><tr><th>版本</th><th>状态</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th><th>发布时间</th></tr></thead>
         <tbody>{rates.map(rate=><tr key={rate.id}><td><code title={rate.id}>{rate.id.slice(0,8)}</code></td>

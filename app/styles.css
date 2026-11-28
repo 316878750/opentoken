@@ -98,6 +98,26 @@ td { overflow-wrap: anywhere; }
 .request-search input { width: min(100%,25rem); }
 .review-note { padding: .75rem; background: var(--zc-color-warning-surface); color: var(--zc-color-warning); }
 
+.admin-shell main, .admin-shell fieldset { min-width: 0; }
+.admin-shell .console-return { color: var(--zc-color-text-muted); }
+.admin-shell .panel { overflow-wrap: anywhere; }
+.admin-shell .panel h1 { margin-bottom: 1rem; }
+.admin-shell .panel > .filters { padding-block: .5rem 1rem; }
+.admin-shell .filters label { max-width: 100%; min-width: 0; }
+.admin-shell .table-wrap { margin-block: .75rem; border: thin solid var(--zc-color-border); border-radius: var(--zc-radius-md); }
+.admin-shell table { min-width: 40rem; font-variant-numeric: tabular-nums; }
+.admin-shell caption { text-align: start; padding: .75rem; }
+.admin-shell th { background: var(--zc-color-bg); font-size: var(--zc-type-sm-size); white-space: nowrap; }
+.admin-shell td { vertical-align: top; }
+.admin-shell tbody tr:last-child td { border-bottom: 0; }
+.admin-shell textarea { max-width: 100%; font: inherit; }
+.list-pager { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .5rem; padding-top: .75rem; }
+.list-pager > span, .list-empty { color: var(--zc-color-text-muted); }
+.list-empty { padding: 1rem; border: thin dashed var(--zc-color-border); border-radius: var(--zc-radius-sm); }
+.feedback-result, .feedback-pending { margin-block: .75rem; padding: .75rem 1rem; border-radius: var(--zc-radius-sm); }
+.feedback-result { color: var(--zc-color-success); background: var(--zc-color-success-surface); }
+.feedback-pending { color: var(--zc-color-text-muted); background: var(--zc-color-bg); }
+
 /* Match the lg and sm breakpoints in design/tokens.json. */
 @media (max-width: 63.99rem) {
   .shell { display: block; }

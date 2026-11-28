@@ -1546,6 +1546,32 @@ test('user invitations generate one link, preserve uncertain outcomes and use th
   });
 });
 
+test('admin navigation on each module matches the current role and page', async()=>{
+  await changeAdminRole(owner,'system_admin','initial_setup');
+  await changeAdminRole(staff,'operator');
+  await changeAdminRole(auditStaff,'auditor');
+  const all = ['/admin','/admin/channels','/admin/models','/admin/users','/admin/login-logs','/admin/operation-logs','/admin/settings'];
+  for (const [email,visible] of [
+    ['owner@example.test',all],
+    ['staff@example.test',all.filter(path=>path!=='/admin/login-logs')],
+    ['auditor@example.test',['/admin','/admin/login-logs','/admin/operation-logs']],
+  ]) {
+    const login = await request('/api/session/login',loginPayload(email));
+    const headers = {cookie:login.headers.get('set-cookie').split(';')[0]};
+    for (const path of visible) {
+      const page = await fetch(base+path,{headers});
+      assert.equal(page.status,200);
+      const nav = (await page.text()).match(/<nav aria-label="管理员后台">([\s\S]*?)<\/nav>/)?.[1];
+      assert.ok(nav);
+      const links = [...nav.matchAll(/<a\b([^>]+)>/g)].map(([,attrs])=>({
+        href:attrs.match(/href="([^"]+)"/)?.[1],current:attrs.includes('aria-current="page"'),
+      }));
+      assert.deepEqual(links.map(link=>link.href),[...visible,'/dashboard']);
+      assert.deepEqual(links.filter(link=>link.current).map(link=>link.href),[path]);
+    }
+  }
+});
+
 test('login logs are read-only, scoped and filterable without exposing login inputs',async ()=>{
   await changeAdminRole(owner,'system_admin','initial_setup');
   await changeAdminRole(staff,'operator');

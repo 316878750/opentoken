@@ -2,6 +2,7 @@
 import { useState, type FormEvent } from 'react';
 import type { SettingsRead, SettingVersion } from '@/lib/admin-settings';
 import { api } from '../../console';
+import { ActionFeedback } from '../list-controls';
 
 const endpoint = '/api/admin/settings';
 const labels = {announcement:'站点公告',supportUrl:'支持链接（HTTPS）',timeZone:'默认展示时区',
@@ -27,14 +28,15 @@ export function SettingsManager({initial}:{initial:SettingsRead}) {
   const [restore,setRestore] = useState<number|null>(null);
   const [busy,setBusy] = useState(false);
   const [notice,setNotice] = useState('');
+  const [error,setError] = useState('');
   const editable = !!page.history;
   async function refresh() {
     const next = await api<SettingsRead>(endpoint);
     setPage(next);setFields(formValues(next.current));setReason('');setRestore(null);
   }
   async function run(work:()=>Promise<void>) {
-    setBusy(true);setNotice('');
-    try { await work(); } catch(error) { setNotice(error instanceof Error?error.message:'操作失败，请刷新。'); }
+    setBusy(true);setNotice('');setError('');
+    try { await work(); } catch(error) { setError(error instanceof Error?error.message:'结果暂未确认，请重新加载。'); }
     finally { setBusy(false); }
   }
   function save(event:FormEvent) {
@@ -44,7 +46,8 @@ export function SettingsManager({initial}:{initial:SettingsRead}) {
         singleMicros:toMicros(fields.singleMicros),dailyMicros:toMicros(fields.dailyMicros)}};
       const saved = await api<{version:number}>(endpoint,{method:'POST',
         body:JSON.stringify({...change,expectedVersion:page.current.version,reason})});
-      await refresh();setNotice('版本 '+saved.version+' 已生效。');
+      setNotice('版本 '+saved.version+' 已生效。');
+      await refresh();
     });
   }
   return <><section className="panel"><h1>系统设置</h1><p>当前版本 {page.current.version}</p>
@@ -61,8 +64,8 @@ export function SettingsManager({initial}:{initial:SettingsRead}) {
         {restore!==null && <p>将恢复版本 {restore} 的全部设置，并生成新版本。</p>}
         <button disabled={busy} className="primary">{restore===null?'发布设置':'确认回退到版本 '+restore}</button>
         {restore!==null && <button type="button" onClick={()=>setRestore(null)}>取消回退</button>}</>}
-      <button type="button" disabled={busy} onClick={()=>void run(refresh)}>重新加载</button>
-    </form><p role="status">{notice}</p></section>
+      <button type="button" disabled={busy} onClick={()=>void run(async()=>{await refresh();setNotice('已重新加载当前版本。');})}>重新加载</button>
+    </form><ActionFeedback busy={busy} message={notice} error={error}/></section>
     {page.history && <section className="panel"><h2>设置版本</h2>{page.history.map(row=><details key={row.version}>
       <summary>版本 {row.version}</summary><dl>{Object.entries(formValues(row)).map(([key,value])=><div key={key}>
         <dt>{labels[key as keyof typeof labels]}</dt><dd>{value||'未设置'}</dd></div>)}</dl>

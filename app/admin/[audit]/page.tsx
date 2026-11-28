@@ -1,3 +1,4 @@
+import { AdminShell } from '../admin-shell';
 import { siteDisplay } from '@/lib/admin-settings';
 import { cookies } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
@@ -13,16 +14,7 @@ export default async function AuditPage({params}:{params:Promise<{audit:string}>
   const login = audit==='login-logs';
   if (!role || (login && role==='operator')) notFound();
   const {timeZone} = await siteDisplay();
-  return <div className="shell">
-    <aside><a className="brand" href="/dashboard">OpenToken</a>
-      <nav aria-label="管理员后台">
-        <a href="/admin">管理员后台</a>
-        {role!=='operator' && <a href="/admin/login-logs" aria-current={login?'page':undefined}>登录日志</a>}
-        <a href="/admin/operation-logs" aria-current={!login?'page':undefined}>操作日志</a>
-      </nav>
-    </aside>
-    <main><header className="top"><span>管理控制台</span><form action="/logout" method="post"><button>退出登录</button></form></header>
-      <div className="workspace"><AuditLog timeZone={timeZone} screen={audit} ownOnly={role==='operator'}/></div>
-    </main>
-  </div>;
+  return <AdminShell role={role} path={login?'/admin/login-logs':'/admin/operation-logs'}>
+    <AuditLog timeZone={timeZone} screen={audit} ownOnly={role==='operator'}/>
+  </AdminShell>;
 }

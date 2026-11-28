@@ -1,3 +1,4 @@
+import { AdminShell } from '../admin-shell';
 import { siteDisplay } from '@/lib/admin-settings';
 import { cookies } from 'next/headers';
 import { notFound, redirect } from 'next/navigation';
@@ -12,13 +13,7 @@ export default async function ChannelsPage() {
   if (!userId) redirect('/login?redirect=/admin/channels');
   if (role!=='system_admin' && role!=='operator') notFound();
   const {timeZone} = await siteDisplay();
-  return <div className="shell">
-    <aside><a className="brand" href="/dashboard">OpenToken</a><nav aria-label="管理员后台">
-      <a href="/admin">管理员后台</a><a href="/admin/channels" aria-current="page">渠道管理</a><a href="/admin/models">模型管理</a>
-      <a href="/admin/users">用户管理</a>
-    </nav></aside>
-    <main><header className="top"><span>管理控制台</span><form action="/logout" method="post"><button>退出登录</button></form></header>
-      <div className="workspace"><ChannelManager timeZone={timeZone} /></div>
-    </main>
-  </div>;
+  return <AdminShell role={role} path="/admin/channels">
+    <ChannelManager timeZone={timeZone}/>
+  </AdminShell>;
 }

@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from 'react';
 import type { AdminUser, AdminUserPage } from '@/lib/admin-users';
 import { api, ApiError, money, useData } from '../../console';
+import { ActionFeedback, ListPager } from '../list-controls';
 
 const endpoint = '/api/admin/users';
 const roleNames = {system_admin:'系统管理员',operator:'运营人员',auditor:'审计员'};
@@ -81,13 +82,14 @@ export function UserManager({timeZone}:{timeZone:string}) {
   return <>
     <section className="panel">
       <h1>用户管理</h1>
-      <form className="filters" onSubmit={filter}>
+      <form className="filters" onSubmit={filter} onReset={()=>{setFilters({search:'',status:''});setCursors([]);setEditor(null);}}>
         <label>{data?.canWrite ? '邮箱前缀或用户 ID' : '用户 ID'}<input name="search" maxLength={254}/></label>
         <label>账号状态<select name="status"><option value="">在册账号</option>
           {Object.entries(statuses).filter(([value])=>value!=='deleted' || data?.canWrite || filters.status==='deleted')
             .map(([value,label])=><option key={value} value={value}>{label}</option>)}
         </select></label>
-        <button disabled={busy}>查询</button>
+        <button className="primary" disabled={busy}>查询</button>
+        <button type="reset" disabled={busy}>重置筛选</button>
         <button type="button" disabled={busy} onClick={users.refresh}>刷新</button>
         {data?.canInvite && <button type="button" className="primary" disabled={busy} onClick={()=>{
           setEditor(null); setInviting(true); setError(''); setNotice('');
@@ -95,9 +97,9 @@ export function UserManager({timeZone}:{timeZone:string}) {
       </form>
       {data && !data.canInvite && <p>此环境尚未配置邀请服务。</p>}
       {users.error && <p className="error" role="alert">{users.error}</p>}
-      {!data && !users.error && <p>正在读取用户…</p>}
-      {data?.items.length===0 && <p>没有符合条件的用户。</p>}
-      {!!data?.items.length && <div className="table-wrap"><table>
+      {!data && !users.error && <p role="status">正在读取用户…</p>}
+      {data?.items.length===0 && <p className="list-empty">{filters.search || filters.status?'没有符合条件的用户，可重置筛选。':'暂无在册用户。'}</p>}
+      {!!data?.items.length && <div className="table-wrap"><table aria-label="用户列表">
         <thead><tr><th>账号</th><th>状态</th><th>后台角色</th>{data.canWrite && <><th>钱包</th><th>操作</th></>}</tr></thead>
         <tbody>{data.items.map(user=><tr key={user.id}>
           <td>{user.email ?? '邮箱不可用'}<br/><code>{user.id}</code></td>
@@ -116,15 +118,11 @@ export function UserManager({timeZone}:{timeZone:string}) {
           </>}</td></>}
         </tr>)}</tbody>
       </table></div>}
-      <div className="actions">
-        <button disabled={busy || !cursors.length} onClick={()=>{setCursors(old=>old.slice(0,-1));setEditor(null);}}>上一页</button>
-        <button disabled={busy || !data?.nextCursor} onClick={()=>{
-          if (data?.nextCursor) { setCursors(old=>[...old,data.nextCursor!]);setEditor(null); }
-        }}>下一页</button>
-      </div>
+      <ListPager page={cursors.length+1} count={data?.items.length} disabled={busy}
+        onPrevious={cursor?()=>{setCursors(cursors.slice(0,-1));setEditor(null);}:undefined}
+        onNext={data?.nextCursor?()=>{setCursors([...cursors,data.nextCursor!]);setEditor(null);}:undefined}/>
     </section>
-    {notice && <p role="status">{notice}</p>}
-    {error && <p role="alert" className="error">{error}</p>}
+    <ActionFeedback busy={busy} message={notice} error={error}/>
     {data?.canWrite && editor && <form className="panel" key={editor.kind+editor.user.id} onSubmit={submit}>
       <h2>{editor.kind==='delete' ? '删除 OpenToken 账号' : editor.kind==='role' ? '变更后台角色'
         : editor.user.suspended ? '恢复账号' : '停用账号'}</h2>

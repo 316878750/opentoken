@@ -2,6 +2,7 @@
 
 import { useState, type FormEvent } from 'react';
 import { api, ApiError, useData } from '../../console';
+import { ActionFeedback } from '../list-controls';
 
 const endpoint = '/api/admin/channels';
 const statusLabels:Record<string,string> = {pending:'测试中',passed:'通过',auth_failed:'鉴权失败',model_unavailable:'模型不可用',
@@ -75,7 +76,11 @@ export function ChannelManager({timeZone}:{timeZone:string}) {
 
   async function probe(versionId:string,binding:number) {
     const result = await post<{status:string;elapsedMs:number}>('/'+selectedId+'/test',{versionId,binding});
-    if (result) setNotice(`连接测试${statusLabels[result.status]} · ${result.elapsedMs} ms`);
+    if (result) {
+      const report = `连接测试${statusLabels[result.status]} · ${result.elapsedMs} ms`;
+      if (result.status==='passed') setNotice(report);
+      else setError(report);
+    }
   }
 
   async function change(action:'enable'|'disable'|'rollback',versionId?:string) {
@@ -102,12 +107,13 @@ export function ChannelManager({timeZone}:{timeZone:string}) {
         <label>状态<select value={status} onChange={event=>setStatus(event.target.value)}><option value="">全部</option>
           <option value="draft">草稿</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></label>
         {data?.canWrite && <button className="primary" disabled={busy} onClick={()=>openDraft()}>新增渠道</button>}
-        <button onClick={channels.refresh}>刷新</button>
+        <button disabled={!search && !type && !status} onClick={()=>{setSearch('');setType('');setStatus('');}}>重置筛选</button>
+        <button disabled={busy} onClick={channels.refresh}>刷新</button>
       </div>
       {channels.error && <p className="error" role="alert">{channels.error}</p>}
-      {!data && !channels.error && <p>正在读取渠道…</p>}
-      {filtered?.length===0 && <p>没有符合条件的渠道。</p>}
-      {!!filtered?.length && <div className="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>生效绑定</th><th>操作</th></tr></thead>
+      {!data && !channels.error && <p role="status">正在读取渠道…</p>}
+      {filtered?.length===0 && <p className="list-empty">{search || type || status?'没有符合条件的渠道，可重置筛选。':'暂无已登记的渠道。'}</p>}
+      {!!filtered?.length && <div className="table-wrap"><table aria-label="渠道列表"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>生效绑定</th><th>操作</th></tr></thead>
         <tbody>{filtered.map(channel=>{const version=channel.active??channel.draft;return <tr key={channel.id}>
           <td>{version?.name}</td><td>{version?.type==='official'?'官方 OpenAI':'OpenAI 兼容'}</td>
           <td>{channel.enabled?'已启用':channel.active?'已停用':'草稿'}</td><td>{channel.enabled ? channel.active?.bindings.length : 0}</td>
@@ -117,8 +123,7 @@ export function ChannelManager({timeZone}:{timeZone:string}) {
         {item.model} · {item.group} · {{managed:'已接管',ready:'模型与费率一致',mismatch:'模型或费率有差异'}[item.status]} ·
         {item.credentialRegistered?'已登记同一密钥引用':'待登记匹配的密钥引用'}</li>)}</ul></details>}
     </section>
-    {error && <p className="error" role="alert">{error}</p>}
-    {notice && <p role="status">{notice}</p>}
+    <ActionFeedback busy={busy} message={notice} error={error}/>
 
     {editing!==null && data?.canWrite && <form className="panel" onSubmit={save}>
       <h2>{editing?'编辑渠道草稿':'新增渠道'}</h2>

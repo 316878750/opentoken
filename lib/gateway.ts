@@ -92,7 +92,7 @@ export async function createKey(user: string, name: string, groupId: string, rpm
 
 export async function listKeys(user: string) {
   const { db } = await store();
-  const { rows } = await db.query(`SELECT k.id,k.name,k.public_prefix AS prefix,k.status,g.name AS "groupName",
+  const { rows } = await db.query(`SELECT k.id,k.name,k.public_prefix AS prefix,k.status,g.id AS "groupId",g.name AS "groupName",
     k.rpm_limit AS rpm,k.spend_cap_micros::text AS "capMicros"
     FROM gateway.api_keys k JOIN gateway.pricing_groups g ON g.id=k.group_id
     WHERE k.user_id=$1 ORDER BY k.created_at DESC,k.id DESC`,[user]);

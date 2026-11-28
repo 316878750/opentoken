@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { TrendDay } from '@/lib/reports';
 
-type Rate = {groupId:string;groupName:string;model:string;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
-type KeyRow = {id:string;name:string;prefix:string;status:string;groupName:string;rpm:number;capMicros:string|null};
+type Rate = {groupId:string;groupName:string;model:string;maxOutputTokens:number;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
+type KeyRow = {id:string;name:string;prefix:string;status:string;groupId:string;groupName:string;rpm:number;capMicros:string|null};
 type RequestRow = {id:string;prefix:string;model:string;status:string;reservedMicros:string;releasedMicros:string|null;standardMicros:string|null;
   chargedMicros:string|null;ledgerDeltaMicros:string|null;inputTokens:number|null;cachedTokens:number|null;outputTokens:number|null;createdAt:string;updatedAt:string;upstreamRequestId:string|null};
 type Wallet = {balanceMicros:string;heldMicros:string;refundHeldMicros?:string;availableMicros:string;asOf:string;activeKeys:number;
@@ -104,7 +104,7 @@ export function Login() {
     }
   }
   return <main className="login"><form className="panel" action="/api/session/login" method="post" onSubmit={submit}>
-    <span className="badge">OpenToken</span><Heading title="登录控制台" description="使用受邀账号查看模型接入和请求费用。" />
+    <span className="brand">OpenToken</span><Heading title="登录控制台" description="使用受邀账号登录，创建 API 密钥并查看每笔调用费用。" />
     <label>邮箱<input type="email" name="email" autoComplete="username" required /></label>
     <label>密码<input type="password" name="password" autoComplete="current-password" required /></label>
     <ErrorNote error={error} /><button className="primary" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
@@ -172,6 +172,17 @@ export function Dashboard({tz}:{tz:string}) {
       <small className="muted">更新于 {new Date(data.asOf).toLocaleTimeString('zh-CN',{timeZone:tz})}</small>
       {data.reviewCount>0 && <p><a href="/usage?status=review">查看 {data.reviewCount} 笔待核对请求</a></p>}
     </section>
+    {data.requests===0 && <section className="panel first-call" aria-labelledby="first-call-title">
+      <h2 id="first-call-title">发起第一次调用</h2>
+      <ol className="setup-steps">
+        <li><strong>准备额度</strong><p>{BigInt(data.availableMicros)>0n ? '已有可用余额，可用于请求预占。' : '可用余额为零。有兑换码时可先兑换试点额度。'}</p>
+          <a href="/redeem">查看额度与流水</a></li>
+        <li><strong>保存分组密钥</strong><p>{data.activeKeys>0 ? '已有启用的密钥，可使用已保存的完整值。' : '创建一把 API 密钥，并保存仅显示一次的完整值。'}</p>
+          <a href="/keys">{data.activeKeys>0 ? '管理密钥' : '创建第一把密钥'}</a></li>
+        <li><strong>运行示例并查账</strong><p>使用密钥所属分组的模型调用一次，再用响应里的请求 ID 查账。</p>
+          <a href="/keys#connection-guide">查看接入示例</a></li>
+      </ol>
+    </section>}
     <section className="panel"><h2>用量与已结算费用</h2><p>统计时区 {tz}</p>
       <dl className="metrics">
         <div><dt>今日 / 累计请求</dt><dd>{data.todayRequests} / {data.requests}</dd></div>
@@ -202,6 +213,38 @@ export function Pricing() {
 type NewKey = {id:string;secret:string;name:string;groupId:string;groupName:string};
 type Step = 'form' | 'secret' | 'confirm';
 
+function CallExample({endpoint,rate}:{endpoint:string;rate:Rate}) {
+  const [notice,setNotice] = useState('');
+  const example = [
+    '& {',
+    "  $secret = Read-Host 'OpenToken API key' -AsSecureString",
+    "  $credential = [System.Net.NetworkCredential]::new('', $secret)",
+    '  $headers = @{ Authorization = "Bearer $($credential.Password)" }',
+    '  $body = @{',
+    `    model = '${rate.model}'`,
+    "    messages = @(@{ role = 'user'; content = 'Hello' })",
+    `    max_completion_tokens = ${Math.min(64,rate.maxOutputTokens)}`,
+    '    stream = $false',
+    '  } | ConvertTo-Json -Depth 4',
+    `  $result = Invoke-RestMethod -Method Post -Uri '${endpoint}/chat/completions' \``,
+    "    -Headers $headers -ContentType 'application/json' -Body $body -ErrorAction Stop",
+    '  $result.choices[0].message.content',
+    '  "OpenToken request ID: $($result.id)"',
+    '}',
+  ].join('\n');
+  async function copy() {
+    try { await navigator.clipboard.writeText(example); setNotice('已复制 PowerShell 示例。'); }
+    catch { setNotice('请选中下方示例，手动复制。'); }
+  }
+  return <>
+    <p>将整段粘贴到 PowerShell，按提示输入已保存的密钥。运行一次会发起一笔{rate.upstream==='mock'?'模拟':'上游'}调用，并按所选分组费率结算。</p>
+    <div className="example-bar"><strong>PowerShell · 非流式</strong><button onClick={copy}>复制示例</button></div>
+    <pre className="call-example" tabIndex={0} aria-label="PowerShell 调用示例"><code>{example}</code></pre>
+    <p role="status">{notice}</p>
+    <p>复制输出末尾的 OpenToken request ID，到<a href="/usage">使用记录</a>查询本次扣费。</p>
+  </>;
+}
+
 export function Keys() {
   const keys = useData<{items:KeyRow[]}>('/api/keys');
   const catalog = useData<{rates:Rate[]}>('/api/catalog');
@@ -226,6 +269,14 @@ export function Keys() {
   const revokeDialog = useRef<HTMLDialogElement>(null);
   const revokeTrigger = useRef<HTMLButtonElement>(null);
   const [endpoint,setEndpoint] = useState('');
+  const [guideKeyId,setGuideKeyId] = useState('');
+  const [guideModel,setGuideModel] = useState('');
+  const guideTitle = useRef<HTMLHeadingElement>(null);
+  const focusGuideOnClose = useRef(false);
+  const activeKeys = keys.data?.items.filter(key=>key.status==='active') ?? [];
+  const guideKey = activeKeys.find(key=>key.id===guideKeyId) ?? activeKeys[0];
+  const guideRates = catalog.data?.rates.filter(rate=>rate.groupId===guideKey?.groupId) ?? [];
+  const guideRate = guideRates.find(rate=>rate.model===guideModel) ?? guideRates[0];
   const groups = [...new Map(catalog.data?.rates.map(rate => [rate.groupId,rate])).values()];
   const demoAllowed = catalog.data?.rates.some(rate=>rate.groupId===created?.groupId && rate.model==='mock-text');
   const clear = useCallback(() => {
@@ -250,6 +301,12 @@ export function Keys() {
   function dismiss() {
     clear();
     dialog.current?.close();
+  }
+  function showGuide() {
+    if (!created || !saved) return;
+    setGuideKeyId(created.id); setGuideModel('');
+    focusGuideOnClose.current = true;
+    dismiss();
   }
   function close() {
     if (creating) return;
@@ -326,6 +383,19 @@ export function Keys() {
       <p className="muted">密钥只能使用所属分组的模型。可用模型及流式支持见 <a href="/pricing">模型价格</a>。</p>
       {!created && notice && <p role="status">{notice}</p>}
     </section>
+    <section id="connection-guide" className="panel connection-guide">
+      <h2 ref={guideTitle} tabIndex={-1}>首次调用示例</h2>
+      {!keys.data || !catalog.data ? <p>{keys.error || catalog.error ? '无法读取分组或密钥，请刷新列表。' : '正在读取分组与密钥…'}</p> :
+        !guideKey ? <p>请先创建或恢复一把密钥。保存完整值后，这里会显示所属分组的调用示例。</p> :
+        <><div className="filters"><label>使用密钥<select value={guideKey.id} onChange={e=>{setGuideKeyId(e.target.value);setGuideModel('');}}>
+          {activeKeys.map(key=><option key={key.id} value={key.id}>{key.name} · {key.prefix}… · {key.groupName}</option>)}
+        </select></label>
+        {guideRate && <label>调用模型<select value={guideRate.model} onChange={e=>setGuideModel(e.target.value)}>
+          {guideRates.map(rate=><option key={rate.model} value={rate.model}>{rate.model}</option>)}
+        </select></label>}</div>
+        {guideRate && endpoint ? <CallExample key={guideKey.id+guideRate.model} endpoint={endpoint} rate={guideRate} /> :
+          <p>当前分组暂无可调用模型，请查看<a href="/pricing">模型价格</a>或选择其他密钥。</p>}</>}
+    </section>
     {keys.data ? <section className="panel table-wrap"><h2>密钥列表</h2>
       {keys.data.items.length ? <table><thead><tr><th>名称与前缀</th><th>分组</th><th>状态</th><th>额度 / RPM</th><th>操作</th></tr></thead>
         <tbody>{keys.data.items.map(row => <tr key={row.id}><td>{row.name}<br/><code>{row.prefix}…</code></td><td>{row.groupName}</td>
@@ -334,7 +404,11 @@ export function Keys() {
             <button onClick={e => { revokeTrigger.current=e.currentTarget; setRevoke(row); revokeDialog.current?.showModal(); }}>撤销</button></div>}</td></tr>)}</tbody></table>
         : <p>还没有密钥。创建一把密钥即可发起第一次调用。</p>}</section> : <Placeholder error={keys.error} />}
     <dialog ref={dialog} aria-labelledby="key-title" onCancel={event => {event.preventDefault();close();}}
-      onClose={() => {clear();open.current?.focus();}}>
+      onClose={() => {
+        clear();
+        (focusGuideOnClose.current ? guideTitle.current : open.current)?.focus();
+        focusGuideOnClose.current = false;
+      }}>
       <h2 id="key-title" tabIndex={-1} ref={title}>{step==='form'?'创建密钥':step==='secret'?'保存 API 密钥':'关闭密钥窗口？'}</h2>
       <form onSubmit={create} hidden={step!=='form'}>
         <p>完整密钥只在创建成功后显示一次。</p>
@@ -360,7 +434,7 @@ export function Keys() {
           <a href={'/usage?key_id='+created.id} target="_blank" rel="noreferrer">在新标签页看请求</a></div>
         <p role="status">{notice}</p>
         <label className="check"><input type="checkbox" checked={saved} onChange={e => setSaved(e.target.checked)} />我已保存密钥</label>
-        <div className="actions"><button className="primary" disabled={!saved} onClick={dismiss}>完成</button>
+        <div className="actions"><button className="primary" disabled={!saved} onClick={showGuide}>查看调用示例</button>
           <button onClick={close}>关闭</button></div>
       </div>}
       {step==='confirm' && <div><p>关闭后无法再次查看这把密钥的完整值。</p><div className="actions">
@@ -377,6 +451,7 @@ export function Keys() {
 
 export function Usage({tz}:{tz:string}) {
   const [filter,setFilter] = useState({key_id:'',request_id:'',status:'',from:'',to:''});
+  const [requestInput,setRequestInput] = useState('');
   const [cursors,setCursors] = useState<string[]>([]);
   const [copyNotice,setCopyNotice] = useState('');
   const query = new URLSearchParams();
@@ -391,13 +466,23 @@ export function Usage({tz}:{tz:string}) {
   const records = useData<UsagePage>('/api/usage?'+query,1200);
   useEffect(() => {
     const initial = new URLSearchParams(location.search);
+    setRequestInput(initial.get('request_id') || '');
     setFilter(f => ({...f,key_id:initial.get('key_id')||'',request_id:initial.get('request_id')||'',status:initial.get('status')||''}));
   },[]);
   function update(name:keyof typeof filter,value:string) {
     setFilter(f => ({...f,[name]:value}));setCursors([]);
   }
   return <><Heading title="使用记录" description="按密钥和日期核对单次请求的预占、费用及 Token。" />
-    {filter.request_id && <p className="muted">已定位请求 <code>{filter.request_id}</code></p>}
+    <form className="request-search filters" onSubmit={e=>{
+      e.preventDefault();
+      setFilter({key_id:'',request_id:requestInput.trim(),status:'',from:'',to:''});
+      setCursors([]); setCopyNotice('');
+    }}>
+      <label>按 OpenToken 请求 ID 查询<input type="search" value={requestInput} required
+        placeholder="粘贴响应中的请求 ID" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+        title="请输入完整的 OpenToken 请求 ID（UUID）" onChange={e=>setRequestInput(e.target.value.trim())} /></label>
+      <button className="primary">查询请求</button>
+    </form>
     <div className="filters">
       <label>密钥<select value={filter.key_id} onChange={e => update('key_id',e.target.value)}><option value="">全部密钥</option>
         {keys.data?.items.map(k => <option key={k.id} value={k.id}>{k.name} · {k.prefix}…</option>)}</select></label>
@@ -406,11 +491,12 @@ export function Usage({tz}:{tz:string}) {
       <label>开始日期（{tz}）<input type="date" value={filter.from} max={filter.to||undefined} onChange={e => update('from',e.target.value)} /></label>
       <label>结束日期<input type="date" value={filter.to} min={filter.from||undefined} onChange={e => update('to',e.target.value)} /></label>
       <button onClick={records.refresh}>刷新</button>
-      <button onClick={() => {setFilter({key_id:'',request_id:'',status:'',from:'',to:''});setCursors([]);}}>清空筛选</button>
+      <button onClick={() => {setFilter({key_id:'',request_id:'',status:'',from:'',to:''});setRequestInput('');setCopyNotice('');setCursors([]);}}>清空筛选</button>
     </div>
     <ErrorNote error={records.error || keys.error} />
     {records.data ? <section className="panel"><h2>请求明细</h2>
-      {records.data.items.length ? records.data.items.map(row => <details key={row.id} className="request-row">
+      {filter.request_id && <p className="muted">当前查询 <code>{filter.request_id}</code></p>}
+      {records.data.items.length ? records.data.items.map(row => <details key={row.id} open={filter.request_id ? true : undefined} className="request-row">
         <summary><span>{new Date(row.createdAt).toLocaleString('zh-CN',{timeZone:tz})}</span><code>{row.model} · {row.prefix}…</code>
           <span className="badge" data-status={row.status}>{statusLabel(row.status)}</span>
           <strong data-testid="request-fee">{row.status==='released'?'无扣费':row.status==='settled'?money(row.chargedMicros):
@@ -422,13 +508,19 @@ export function Usage({tz}:{tz:string}) {
           try {await navigator.clipboard.writeText(row.id);setCopyNotice('已复制请求编号。');}
           catch {setCopyNotice('复制失败，可选中编号后手动复制。');}
         }}>复制请求编号</button>
-        <p>{row.status==='settled' || row.status==='released' ? '原预占' : '预占'} {money(row.reservedMicros)}</p>
-        {row.releasedMicros!==null && <p>释放预占 {money(row.releasedMicros)}</p>}
+        <dl className="metrics settlement">
+          <div><dt>请求预占</dt><dd>{money(row.reservedMicros)}</dd></div>
+          <div><dt>实际扣费</dt><dd>{row.status==='released' ? money('0') : money(row.chargedMicros)}</dd></div>
+          <div><dt>释放预占</dt><dd>{money(row.releasedMicros)}</dd></div>
+        </dl>
         {row.status==='settled' && <><p>标准费用 {money(row.standardMicros)} · 输入 {row.inputTokens} · 缓存读取 {row.cachedTokens} · 输出 {row.outputTokens}</p>
           {row.ledgerDeltaMicros!==null && <p>账本已入账，扣除 {money(String(-BigInt(row.ledgerDeltaMicros)))}</p>}</>}
-        {row.status==='review' && <p className="muted">这次请求的费用仍在核对，预留额度会在核对完成后更新。</p>}
+        {row.status==='review' && <p className="review-note">费用待核对。预占额度暂时保留，核对完成后会显示最终扣费和释放金额。</p>}
+        {(row.status==='reserved' || row.status==='dispatched') && <p className="muted">请求处理中，结算后会显示实际扣费和释放金额。</p>}
+        {row.status==='released' && <p>本次请求已结束，预占额度已全部释放。</p>}
         <p className="muted">最近更新 {new Date(row.updatedAt).toLocaleString('zh-CN',{timeZone:tz})}</p>
-      </details>) : <p>没有符合条件的请求。可清空筛选，或在创建密钥后运行模拟调用。</p>}
+      </details>) : <p>{filter.request_id ? '没有找到这笔请求。请核对当前账号和响应中的 OpenToken 请求 ID。' :
+        <>没有符合条件的请求。可清空筛选，或按<a href="/keys#connection-guide">接入示例</a>发起首次调用。</>}</p>}
       <p role="status">{copyNotice}</p>
       <div className="actions"><button disabled={!cursors.length} onClick={() => setCursors(cursors.slice(0,-1))}>上一页</button>
         <button disabled={!records.data.nextCursor} onClick={() => setCursors([...cursors,records.data!.nextCursor!])}>下一页</button></div>

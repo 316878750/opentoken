@@ -97,6 +97,15 @@ td { overflow-wrap: anywhere; }
 .request-search { margin-bottom: 1rem; }
 .request-search input { width: min(100%,25rem); }
 .review-note { padding: .75rem; background: var(--zc-color-warning-surface); color: var(--zc-color-warning); }
+.catalog .filters { align-items: center; }
+.catalog .filters label { max-width: 100%; }
+.catalog-basis { margin-block: 1rem; border-top: thin solid var(--zc-color-border); padding-top: .75rem; }
+.catalog table { min-width: 52rem; font-variant-numeric: tabular-nums; }
+.catalog caption { text-align: start; color: var(--zc-color-text-muted); padding-bottom: .5rem; }
+.catalog thead { background: var(--zc-color-bg); }
+.catalog tbody th { font-weight: 600; }
+.catalog td:last-child a, .catalog td:last-child button { display: block; white-space: nowrap; }
+.catalog td:last-child button { margin-top: .35rem; }
 
 .admin-shell main, .admin-shell fieldset { min-width: 0; }
 .admin-shell .console-return { color: var(--zc-color-text-muted); }

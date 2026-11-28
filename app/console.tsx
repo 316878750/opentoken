@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { TrendDay } from '@/lib/reports';
+import { catalogPrice, guidePath, type CatalogSelection } from '@/lib/catalog-display';
 
 type Rate = {groupId:string;groupName:string;model:string;maxOutputTokens:number;inputMicros:string;cacheMicros:string;outputMicros:string;multiplierBps:number;upstream:'mock'|'openai'|'compatible';streaming:boolean};
 type KeyRow = {id:string;name:string;prefix:string;status:string;groupId:string;groupName:string;rpm:number;capMicros:string|null};
@@ -30,7 +31,10 @@ export async function api<T>(url:string, options:RequestInit = {}): Promise<T> {
   const data = await response.json();
   if (!response.ok) {
     if (response.status===401 && url.startsWith('/api/') && url!=='/api/session/login') {
-      location.replace('/login?redirect='+location.pathname);
+      const params = new URLSearchParams(location.search);
+      const selection = location.pathname==='/keys' && (params.has('model') || params.has('groupId'))
+        ? new URLSearchParams({model:params.get('model')??'',groupId:params.get('groupId')??''}) : undefined;
+      location.replace('/login?redirect='+location.pathname+(selection?'&'+selection:''));
     }
     throw new ApiError(response.status,data.error?.message || '暂时无法完成操作。',data.error?.request_id,data.error?.code);
   }
@@ -84,7 +88,7 @@ function Heading({title,description}:{title:string;description:string}) {
 function ErrorNote({error}:{error:string}) { return error ? <p className="error" role="alert">{error}</p> : null; }
 function Placeholder({error}:{error:string}) { return <p className="panel muted">{error ? '暂时无法读取数据。' : '正在读取数据…'}</p>; }
 
-export function Login() {
+export function Login({selection}:{selection?:CatalogSelection}) {
   const [error,setError] = useState('');
   const [busy,setBusy] = useState(false);
   async function submit(event:FormEvent<HTMLFormElement>) {
@@ -97,7 +101,8 @@ export function Login() {
       const destination = new URLSearchParams(location.search).get('redirect');
       const destinations = ['/dashboard','/pricing','/keys','/usage','/redeem','/admin','/admin/channels','/admin/models',
         '/admin/users','/admin/settings','/admin/login-logs','/admin/operation-logs'];
-      location.replace(destination && destinations.includes(destination) ? destination : '/dashboard');
+      location.replace(destination==='/keys' && selection ? guidePath(selection) :
+        destination && destinations.includes(destination) ? destination : '/dashboard');
     } catch (error) {
       setError(error instanceof ApiError ? error.message : '登录请求暂时无法完成。');
       setBusy(false);
@@ -199,14 +204,57 @@ export function Dashboard({tz}:{tz:string}) {
 
 export function Pricing() {
   const {data,error,refresh} = useData<{rates:Rate[]}>('/api/catalog');
-  return <><Heading title="模型价格" description="当前分组费率。单价按每百万 Token 计。" />
-    <ErrorNote error={error} />{error && <button onClick={refresh}>重试</button>}
-    {data ? <section className="panel table-wrap"><table><thead><tr>
-      <th>模型</th><th>分组</th><th>输入</th><th>缓存读取</th><th>输出</th><th>倍率</th><th>请求方式</th>
-    </tr></thead><tbody>{data.rates.map(r => <tr key={r.groupId+r.model}><td><code>{r.model}</code> · {r.upstream==='mock'?'模拟':r.upstream==='compatible'?'兼容上游':'OpenAI'}</td><td>{r.groupName}</td>
-      <td>{money(r.inputMicros)}</td><td>{money(r.cacheMicros)}</td><td>{money(r.outputMicros)}</td><td>{r.multiplierBps/10000}×</td>
-      <td>{r.streaming?'流式 / 非流式':'非流式'}</td></tr>)}</tbody></table></section>
-      : <Placeholder error={error} />}
+  const [search,setSearch] = useState('');
+  const [group,setGroup] = useState('');
+  const [provider,setProvider] = useState('');
+  const [streaming,setStreaming] = useState(false);
+  const [compare,setCompare] = useState('');
+  const [basis,setBasis] = useState('group');
+  const providers = {mock:'模拟',compatible:'兼容上游',openai:'OpenAI'};
+  const rates = data?.rates ?? [];
+  const groups = new Map(rates.map(rate=>[rate.groupId,rate.groupName]));
+  const modelCounts = new Map<string,number>();
+  for (const rate of rates) modelCounts.set(rate.model,(modelCounts.get(rate.model)??0)+1);
+  const rows = rates.filter(rate=>compare ? rate.model===compare :
+    rate.model.toLowerCase().includes(search.trim().toLowerCase()) && (!group || rate.groupId===group) &&
+    (!provider || rate.upstream===provider) && (!streaming || rate.streaming))
+    .sort((a,b)=>a.model.localeCompare(b.model) || a.groupName.localeCompare(b.groupName,'zh-CN'));
+  return <><Heading title="模型价格" description="按模型与分组比较每百万 Token 的单价，选择后查看接入示例。" />
+    <section className="panel catalog" aria-label="模型目录">
+      {compare ? <div className="actions"><h2>{compare} · 分组比价</h2>
+        <button onClick={()=>setCompare('')}>返回筛选结果</button></div> :
+        <div className="filters">
+          <label>模型名称<input type="search" value={search} onChange={e=>setSearch(e.target.value)} /></label>
+          <label>分组<select value={group} onChange={e=>setGroup(e.target.value)}><option value="">全部分组</option>
+            {[...groups].map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></label>
+          <label>上游<select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">全部上游</option>
+            {Object.entries(providers).map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></label>
+          <label className="check"><input type="checkbox" checked={streaming} onChange={e=>setStreaming(e.target.checked)}/>支持流式</label>
+          <button disabled={!search && !group && !provider && !streaming} onClick={()=>{
+            setSearch('');setGroup('');setProvider('');setStreaming(false);
+          }}>重置筛选</button>
+        </div>}
+      <div className="filters catalog-basis">
+        <label>价格口径<select value={basis} onChange={e=>setBasis(e.target.value)}>
+          <option value="group">分组单价（已计倍率）</option><option value="base">基础单价（乘倍率前）</option>
+        </select></label><button onClick={refresh}>刷新目录</button>
+      </div>
+      <ErrorNote error={error}/>
+      {!data ? <p role="status">{error?'暂时无法读取目录，请刷新重试。':'正在读取目录…'}</p> :
+        !rows.length ? <p className="list-empty">{!rates.length?'暂无可用模型。':compare?'该模型已退出目录。':'没有符合条件的模型，可重置筛选。'}</p> :
+        <div className="table-wrap" role="region" aria-label="费率表格" tabIndex={0}><table aria-label={compare?'模型分组比价':'模型费率'}>
+          <caption>{basis==='group'?'分组单价':'基础单价'} · 美元 / 百万 Token</caption>
+          <thead><tr>{['模型','分组','输入','缓存读取','输出','倍率','请求方式','接入'].map(label=><th key={label} scope="col">{label}</th>)}</tr></thead>
+          <tbody>{rows.map(rate=>{
+            const multiplier = basis==='group'?rate.multiplierBps:10000;
+            return <tr key={rate.groupId+rate.model}><th scope="row"><code>{rate.model}</code><br/><small>{providers[rate.upstream]}</small></th>
+              <td>{rate.groupName}</td><td>{catalogPrice(rate.inputMicros,multiplier)}</td><td>{catalogPrice(rate.cacheMicros,multiplier)}</td>
+              <td>{catalogPrice(rate.outputMicros,multiplier)}</td><td>{rate.multiplierBps/10000}×</td><td>{rate.streaming?'流式 / 非流式':'非流式'}</td>
+              <td><a href={guidePath({model:rate.model,groupId:rate.groupId})}>接入此模型</a>
+                {!compare && (modelCounts.get(rate.model)??0)>1 && <button onClick={()=>setCompare(rate.model)}>比较分组</button>}</td>
+            </tr>;
+          })}</tbody></table></div>}
+    </section>
   </>;
 }
 
@@ -245,7 +293,7 @@ function CallExample({endpoint,rate}:{endpoint:string;rate:Rate}) {
   </>;
 }
 
-export function Keys() {
+export function Keys({selection}:{selection?:CatalogSelection}) {
   const keys = useData<{items:KeyRow[]}>('/api/keys');
   const catalog = useData<{rates:Rate[]}>('/api/catalog');
   const dialog = useRef<HTMLDialogElement>(null);
@@ -273,12 +321,14 @@ export function Keys() {
   const [guideModel,setGuideModel] = useState('');
   const guideTitle = useRef<HTMLHeadingElement>(null);
   const focusGuideOnClose = useRef(false);
-  const activeKeys = keys.data?.items.filter(key=>key.status==='active') ?? [];
+  const targetRate = selection && catalog.data?.rates.find(rate=>rate.groupId===selection.groupId && rate.model===selection.model);
+  const activeKeys = keys.data?.items.filter(key=>key.status==='active' && (!selection || key.groupId===targetRate?.groupId)) ?? [];
   const guideKey = activeKeys.find(key=>key.id===guideKeyId) ?? activeKeys[0];
-  const guideRates = catalog.data?.rates.filter(rate=>rate.groupId===guideKey?.groupId) ?? [];
+  const guideRates = catalog.data?.rates.filter(rate=>rate.groupId===guideKey?.groupId && (!selection || rate.model===selection.model)) ?? [];
   const guideRate = guideRates.find(rate=>rate.model===guideModel) ?? guideRates[0];
-  const groups = [...new Map(catalog.data?.rates.map(rate => [rate.groupId,rate])).values()];
-  const demoAllowed = catalog.data?.rates.some(rate=>rate.groupId===created?.groupId && rate.model==='mock-text');
+  const groups = selection ? (targetRate?[targetRate]:[]) : [...new Map(catalog.data?.rates.map(rate => [rate.groupId,rate])).values()];
+  const demoAllowed = (!selection || selection.model==='mock-text') &&
+    catalog.data?.rates.some(rate=>rate.groupId===created?.groupId && rate.model==='mock-text');
   const clear = useCallback(() => {
     request.current?.abort();
     if (keyField.current) keyField.current.value = '';
@@ -301,6 +351,9 @@ export function Keys() {
   function dismiss() {
     clear();
     dialog.current?.close();
+  }
+  function startCreate() {
+    clear(); dialog.current?.showModal(); nameField.current?.focus();
   }
   function showGuide() {
     if (!created || !saved) return;
@@ -372,8 +425,7 @@ export function Keys() {
   }
   return <><Heading title="API 密钥" description="创建分组密钥，将模型接入本地兼容客户端。" />
     <div className="actions">
-      <button ref={open} className="primary" disabled={!catalog.data?.rates.length}
-        onClick={() => { clear(); dialog.current?.showModal(); nameField.current?.focus(); }}>创建密钥</button>
+      <button ref={open} className="primary" disabled={!groups.length} onClick={startCreate}>创建密钥</button>
       <button onClick={() => {keys.refresh();catalog.refresh();}}>刷新列表</button>
     </div>
     <ErrorNote error={keys.error || catalog.error || pageError} />
@@ -385,8 +437,11 @@ export function Keys() {
     </section>
     <section id="connection-guide" className="panel connection-guide">
       <h2 ref={guideTitle} tabIndex={-1}>首次调用示例</h2>
+      {targetRate && <p>当前选择 <strong>{targetRate.model}</strong> · {targetRate.groupName}。<a href="/pricing">更换模型或分组</a></p>}
       {!keys.data || !catalog.data ? <p>{keys.error || catalog.error ? '无法读取分组或密钥，请刷新列表。' : '正在读取分组与密钥…'}</p> :
-        !guideKey ? <p>请先创建或恢复一把密钥。保存完整值后，这里会显示所属分组的调用示例。</p> :
+        selection && !targetRate ? <p className="list-empty">所选模型与分组当前不可用，请<a href="/pricing">返回模型目录</a>重新选择。</p> :
+        !guideKey ? <><p>{targetRate?'该分组暂无启用的密钥。':'请先创建或恢复一把密钥。'}保存完整值后即可查看调用示例。</p>
+          {targetRate && <button onClick={startCreate}>为此分组创建密钥</button>}</> :
         <><div className="filters"><label>使用密钥<select value={guideKey.id} onChange={e=>{setGuideKeyId(e.target.value);setGuideModel('');}}>
           {activeKeys.map(key=><option key={key.id} value={key.id}>{key.name} · {key.prefix}… · {key.groupName}</option>)}
         </select></label>

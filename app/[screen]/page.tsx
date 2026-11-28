@@ -4,16 +4,24 @@ import { siteDisplay } from '@/lib/admin-settings';
 import { adminRole } from '@/lib/admin';
 import { sessionCookie, sessionUser } from '@/lib/session';
 import { Dashboard, Keys, Login, Pricing, Redeem, Usage } from '../console';
+import { guidePath } from '@/lib/catalog-display';
 
 const screens = ['dashboard','pricing','keys','usage','redeem'] as const;
 const labels = ['概览','模型价格','API 密钥','使用记录','兑换与流水'];
 
-export default async function Screen({ params }: { params:Promise<{screen:string}> }) {
+export default async function Screen({ params,searchParams }: {
+  params:Promise<{screen:string}>;searchParams:Promise<Record<string,string|string[]|undefined>>;
+}) {
   const { screen } = await params;
   if (screen !== 'login' && !screens.some(item => item === screen)) notFound();
   const user = await sessionUser((await cookies()).get(sessionCookie)?.value);
-  if (screen === 'login') return user ? redirect('/dashboard') : <Login />;
-  if (!user) redirect('/login?redirect=/' + screen);
+  const query = await searchParams;
+  const selection = (screen==='keys' || (screen==='login' && query.redirect==='/keys')) &&
+    (query.model!==undefined || query.groupId!==undefined) ? {
+      model:typeof query.model==='string'?query.model:'',groupId:typeof query.groupId==='string'?query.groupId:'',
+    } : undefined;
+  if (screen === 'login') return user ? redirect(selection?guidePath(selection):'/dashboard') : <Login selection={selection}/>;
+  if (!user) redirect('/login?redirect=/' + screen+(selection?'&'+new URLSearchParams(selection):''));
   const [role,display] = await Promise.all([adminRole(user),siteDisplay()]);
   return <div className="shell">
     <aside>
@@ -30,7 +38,7 @@ export default async function Screen({ params }: { params:Promise<{screen:string
         {display.announcement && <section className="panel" aria-label="站点公告">{display.announcement}</section>}
         {display.supportUrl && <a href={display.supportUrl} rel="noreferrer">联系支持</a>}
         {screen==='dashboard' && <Dashboard tz={display.timeZone} />}
-        {screen==='keys' && <Keys />}
+        {screen==='keys' && <Keys selection={selection}/>}
         {screen==='pricing' && <Pricing />}
         {screen==='usage' && <Usage tz={display.timeZone} />}
         {screen==='redeem' && <Redeem tz={display.timeZone} />}
